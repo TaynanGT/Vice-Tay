@@ -28,16 +28,7 @@ const ALLOWED_NAMES: &[&str] = &[
     "LICENSE-APACHE",
 ];
 // The benchmark documentation still goes through every content check below.
-const ALLOWED_DOCUMENTATION: &[&str] = &[
-    "docs/.nojekyll",
-    "docs/benchmark-dashboard.css",
-    "docs/benchmark-dashboard.js",
-    "docs/benchmark-data.js",
-    "docs/charts/profile-frame-rate.svg",
-    "docs/charts/profile-frame-timing.svg",
-    "docs/index.html",
-    "scripts/generate-benchmark-charts.mjs",
-];
+const ALLOWED_DOCUMENTATION: &[&str] = &["docs/.nojekyll", "docs/index.html"];
 
 /// Paths explicitly exempted, with a reason. Keep this empty if at all possible.
 const EXCEPTIONS: &[(&str, &str)] = &[(
@@ -257,7 +248,7 @@ mod tests {
             assert!(check(path, b"original documentation").is_empty());
             assert!(!check(path, b"DDS \0").is_empty());
         }
-        assert!(!check("docs/charts/other.svg", svg).is_empty());
+        assert!(!check("docs/charts/profile-frame-rate.svg", svg).is_empty());
         assert!(!check("docs/unrelated.js", b"let data = 0;").is_empty());
     }
 

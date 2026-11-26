@@ -68,17 +68,6 @@ part of a frame, are in [docs/measurements.md](docs/measurements.md).
 What these runs found and fixed on this PC is in
 [docs/findings-rtx4090.md](docs/findings-rtx4090.md).
 
-### Benchmark charts
-
-The charts show the latest completed Series S benchmark on an RTX 4090.
-Select a chart to explore the readings, adjust the FPS target and project a reduction in frame time.
-
-[![Explore frame rate, 1% low and percentile range](docs/charts/profile-frame-rate.svg)](https://taynangt.github.io/Vice-Tay/#fps)
-
-[![Explore frame timing and data transferred per frame](docs/charts/profile-frame-timing.svg)](https://taynangt.github.io/Vice-Tay/#timing)
-
-<!-- Refresh the charts with node scripts/generate-benchmark-charts.mjs after editing the source tables. -->
-
 ## Known problems
 
 - **Frame rate.** Below 30 fps in the world. Most of a frame goes to preparing the

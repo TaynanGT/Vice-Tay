@@ -303,7 +303,26 @@ pub(crate) fn card_room_kept() -> u64 {
     // no texture was made any more with 5 GB of the card free (session
     // play-1125-0127: 1,453 passes refused, the ground and people black).
     const SEEN: u64 = 1 << 30;
-    card_limits().1.min(SEEN).saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
+    // Honor explicit budgets in full; otherwise textures can consume the
+    // extra room before buffers arrive and permanently leave them on PCIe.
+    static EXPLICIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let buffer_budget = if *EXPLICIT.get_or_init(|| std::env::var_os("VICTORY_CARD_BUFFERS_MB").is_some()) {
+        card_limits().1
+    } else {
+        card_limits().1.min(SEEN)
+    };
+    remaining_card_room(
+        buffer_budget,
+        CARD_BYTES[0].load(Ordering::Relaxed),
+        CARD_REFUSED[1].load(Ordering::Relaxed),
+        window_card_most(),
+        WINDOW_CARD_BYTES.load(Ordering::Relaxed),
+    )
+}
+
+fn remaining_card_room(buffers: u64, used: u64, refused: u64, windows: u64, window_used: u64) -> u64 {
+    buffers.saturating_sub(used.saturating_add(refused))
+        .saturating_add(windows.saturating_sub(window_used))
 }
 
 /// The copies in the card's memory.
@@ -543,8 +562,10 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
     if !host.card_ready() {
         return None;
     }
+    // Texture admission now reserves these windows as well as title buffers.
+    let hundredths = if card_room_kept_on() { 97 } else { 80 };
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used.saturating_add(size) > budget / 100 * hundredths
     {
         return None;
     }
@@ -5699,6 +5720,15 @@ mod window_tests {
         WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
         tail_of, window_of, window_victims,
     };
+
+    #[test]
+    fn texture_admission_reserves_buffers_and_windows_independently() {
+        use super::remaining_card_room;
+        const MIB: u64 = 1 << 20;
+        assert_eq!(remaining_card_room(1536 * MIB, 512 * MIB, 0, 1024 * MIB, 256 * MIB), 1792 * MIB);
+        assert_eq!(remaining_card_room(512 * MIB, 256 * MIB, 1024 * MIB, 1024 * MIB, 256 * MIB), 768 * MIB);
+        assert_eq!(remaining_card_room(0, u64::MAX, 1, 0, 0), 0);
+    }
 
     #[test]
     fn window_budget_evicts_oldest_only_until_it_fits() {

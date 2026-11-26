@@ -5,7 +5,7 @@
 # -Windowed     a window instead of the whole screen (full screen is the default)
 # -Console      series-x (the default) or series-s: the console the title takes this PC for
 # -Build        target\diag (the default, the build all measurements are of) or target\release
-# -Machine      auto (the default: by the graphics card), 7900xtx or 4090
+# -Machine      auto (by graphics card), 7900xtx, 4070 or 4090
 # -More         other settings: -More @{VICTORY_PANEL='1'}
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
@@ -15,7 +15,7 @@ param(
     [switch]$Windowed,
     [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x',
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
-    [ValidateSet('auto', '7900xtx', '4090')][string]$Machine = 'auto',
+    [ValidateSet('auto', '7900xtx', '4070', '4090')][string]$Machine = 'auto',
     [hashtable]$More = @{}
 )
 $settings = @{
@@ -25,9 +25,9 @@ $settings = @{
     VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = 'light'
 }
 if ($Machine -eq 'auto') {
-    # An NVIDIA card (PCI vendor 10DE) gets the 4090's settings, any other the 7900 XTX's.
-    $cards = @(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | ForEach-Object { $_.PNPDeviceID })
-    $Machine = if ($cards -match 'VEN_10DE') { '4090' } else { '7900xtx' }
+    $cards = @(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue)
+    $Machine = if ($cards.Name -match 'RTX 4070') { '4070' }
+        elseif ($cards.PNPDeviceID -match 'VEN_10DE') { '4090' } else { '7900xtx' }
 }
 if ($Machine -eq '7900xtx') {
     # i9-12900K, RX 7900 XTX, 64 GB: the page-mapping lock was fastest with one
@@ -53,6 +53,17 @@ if ($Machine -eq '7900xtx') {
     # Kept under -Safe too: without it those programs do not translate and
     # their draws are dropped, the picture -Safe is there to check.
     $settings.VICTORY_WAVE_WIDE_ONLY = '6f225b641c5b0708,5dc3b25986622949,369cbe906ea72764,2cc4c197ee29e291'
+}
+if ($Machine -eq '4070') {
+    # Ryzen 7 7800X3D: eight physical cores, versus the 4090 test PC's sixteen.
+    # Keep the same wave64 allowlist and rendering profile; spend VRAM on
+    # shader buffers before textures consume it. No approximate shader modes.
+    $settings.VICTORY_THIN_THREADS = '8'; $settings.VICTORY_UNDER_THREADS = '6'; $settings.VICTORY_LAND_THREADS = '4'
+    $settings.VICTORY_MAP_THREADS = '1'; $settings.VICTORY_PIPELINE_WORKERS = '3'
+    if (-not $Safe) {
+        $settings.VICTORY_CARD_BUFFERS_MIN_KB = '64'; $settings.VICTORY_CARD_BUFFERS_MB = '1536'
+        $settings.VICTORY_CARD_WINDOWS_MB = '1024'
+    }
 }
 # -Safe leaves out every way still on trial, and the newest faster ones.
 if ($Safe) {

@@ -21,8 +21,16 @@ fn words(text: &str) -> Vec<Word> {
             let (name, rest) = part.trim().split_once('=')?;
             let (offset, bytes) = rest.split_once(':').unwrap_or((rest, "8"));
             let offset = usize::from_str_radix(offset.trim().trim_start_matches("0x"), 16).ok()?;
-            let bytes = bytes.trim().parse().ok().filter(|n| matches!(n, 1 | 2 | 4 | 8))?;
-            Some(Word { name: name.trim().to_owned(), offset, bytes })
+            let bytes = bytes
+                .trim()
+                .parse()
+                .ok()
+                .filter(|n| matches!(n, 1 | 2 | 4 | 8))?;
+            Some(Word {
+                name: name.trim().to_owned(),
+                offset,
+                bytes,
+            })
         })
         .collect()
 }
@@ -57,26 +65,28 @@ pub(crate) fn start(base: usize) {
     }
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
-        let _ = std::thread::Builder::new().name("victory-image-watch".into()).spawn(move || {
-            let mut last = Vec::new();
-            loop {
-                std::thread::sleep(Duration::from_secs(1));
-                let now: Vec<Option<u64>> = words.iter().map(|word| read(base, word)).collect();
-                if now == last {
-                    continue;
+        let _ = std::thread::Builder::new()
+            .name("victory-image-watch".into())
+            .spawn(move || {
+                let mut last = Vec::new();
+                loop {
+                    std::thread::sleep(Duration::from_secs(1));
+                    let now: Vec<Option<u64>> = words.iter().map(|word| read(base, word)).collect();
+                    if now == last {
+                        continue;
+                    }
+                    let values: Vec<String> = words
+                        .iter()
+                        .zip(&now)
+                        .map(|(word, value)| match value {
+                            Some(value) => format!("{}={value:#x}", word.name),
+                            None => format!("{}=?", word.name),
+                        })
+                        .collect();
+                    tracing::info!("the title's image: {}", values.join(" "));
+                    last = now;
                 }
-                let values: Vec<String> = words
-                    .iter()
-                    .zip(&now)
-                    .map(|(word, value)| match value {
-                        Some(value) => format!("{}={value:#x}", word.name),
-                        None => format!("{}=?", word.name),
-                    })
-                    .collect();
-                tracing::info!("the title's image: {}", values.join(" "));
-                last = now;
-            }
-        });
+            });
     });
 }
 
@@ -88,10 +98,20 @@ mod tests {
     fn words_are_read_where_they_are_named() {
         let all = words("used=98d26d8:8, failed = 0x10:1,odd=3:3,none");
         assert_eq!(all.len(), 2);
-        assert_eq!((all[0].name.as_str(), all[0].offset, all[0].bytes), ("used", 0x98d_26d8, 8));
-        assert_eq!((all[1].name.as_str(), all[1].offset, all[1].bytes), ("failed", 0x10, 1));
+        assert_eq!(
+            (all[0].name.as_str(), all[0].offset, all[0].bytes),
+            ("used", 0x98d_26d8, 8)
+        );
+        assert_eq!(
+            (all[1].name.as_str(), all[1].offset, all[1].bytes),
+            ("failed", 0x10, 1)
+        );
         let memory = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
-        let word = |offset, bytes| Word { name: String::new(), offset, bytes };
+        let word = |offset, bytes| Word {
+            name: String::new(),
+            offset,
+            bytes,
+        };
         let base = memory.as_ptr() as usize;
         assert_eq!(read(base, &word(0, 4)), Some(0x4433_2211));
         assert_eq!(read(base, &word(2, 1)), Some(0x33));

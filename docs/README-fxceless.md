@@ -270,13 +270,22 @@ unset, window sizing is unchanged.
 
 Input: XInput pads, and PS5 pads (DualSense, DualSense Edge) over USB or
 Bluetooth without a remapper: cross, circle, square and triangle are A, B,
-X and Y; options is Menu; create and the touchpad click are View. Set
-`VICTORY_DUALSENSE=0` to leave HID entirely to Steam Input or DS4Windows.
-By default, connecting any XInput pad switches input to XInput, so a
-remapped DualSense is read once. Set `VICTORY_DUALSENSE=1` to use a direct
-DualSense alongside a separate Xbox pad. If a remapper also exposes that
-same DualSense, this setting reads both mappings. With no pad connected the
-keyboard acts as a pad while the title's window has focus:
+X and Y; options is Menu; create and the touchpad click are View. A pad
+on USB and Bluetooth at once is read once: both report the same Bluetooth
+address. A pad keeps its slot while another disconnects and reconnects.
+
+XInput does not say which physical pad it shows, so by default any XInput
+pad switches input to XInput only, and a remapped DualSense is read once:
+
+| Setup | `VICTORY_DUALSENSE` |
+|-------|---------------------|
+| PS5 pads only, no remapper | leave unset |
+| A remapper (Steam Input with the title started from Steam, DS4Windows, DualSenseX) | leave unset, or `0` to leave HID entirely to it |
+| A PS5 pad and a separate Xbox pad, no remapper | `1` |
+| `1` with a remapper that does not hide the pad (HidHide, exclusive mode) | the pad is read twice: unset it |
+
+With no pad connected the keyboard acts as a pad while the title's window
+has focus:
 
 | Keys | Pad |
 |------|-----|

@@ -1443,6 +1443,47 @@ mod host {
             (1.0, -1.0, 1.0, 0.0)
         );
     }
+
+    /// Hardware probe, not a check: prints what each host slot holds
+    /// whenever that changes, for `VICTORY_PROBE_SECS` (default 60), so a
+    /// pad can be unplugged, switched to Bluetooth or put behind a remapper
+    /// while it runs. `cargo test -p victory-hle probe_host_pads -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs real pads and someone to plug them"]
+    fn probe_host_pads() {
+        let secs = std::env::var("VICTORY_PROBE_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60);
+        let end = Instant::now() + Duration::from_secs(secs);
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("victory_hle::modules::gameinput=debug")
+            .with_test_writer()
+            .try_init();
+        let mut host = Host::default();
+        let mut last = String::new();
+        let start = Instant::now();
+        while Instant::now() < end {
+            let mut line = String::new();
+            for slot in 0..PADS {
+                let xinput = host.xinput(slot).is_some();
+                let pad = host.pad(slot);
+                let from = match (pad, xinput) {
+                    (None, _) => "-",
+                    (Some(_), true) => "xinput",
+                    (Some(_), false) => "hid",
+                };
+                let pressed = pad.map(|p| p.buttons).unwrap_or(0);
+                line += &format!("[{slot}: {from} {pressed:#06x}] ");
+            }
+            line += &format!("hid pads: {}", super::dualsense::pads().len());
+            if line != last {
+                println!("{:6.1}s {line}", start.elapsed().as_secs_f32());
+                last = line;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
 }
 
 #[cfg(test)]

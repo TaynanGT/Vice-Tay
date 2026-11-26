@@ -110,7 +110,8 @@ pub extern "system" fn CreateWindowExW(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (ex_style, style, (x, y, width, height)) = place(ex_style, style, parent, x, y, width, height);
+    let (ex_style, style, (x, y, width, height)) =
+        place(ex_style, style, parent, x, y, width, height);
     // SAFETY: the title's own arguments, forwarded (the size fitted, or the
     // window made full screen).
     let hwnd = unsafe {
@@ -137,7 +138,8 @@ pub extern "system" fn CreateWindowExA(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (ex_style, style, (x, y, width, height)) = place(ex_style, style, parent, x, y, width, height);
+    let (ex_style, style, (x, y, width, height)) =
+        place(ex_style, style, parent, x, y, width, height);
     // SAFETY: the title's own arguments, forwarded (the size fitted, or the
     // window made full screen).
     let hwnd = unsafe {
@@ -162,7 +164,12 @@ fn place(
 ) -> (u32, u32, (i32, i32, i32, i32)) {
     let fitted = fit(parent, x, y, width, height);
     // SAFETY: plain queries of the primary monitor's size.
-    let screen = unsafe { (wm::GetSystemMetrics(wm::SM_CXSCREEN), wm::GetSystemMetrics(wm::SM_CYSCREEN)) };
+    let screen = unsafe {
+        (
+            wm::GetSystemMetrics(wm::SM_CXSCREEN),
+            wm::GetSystemMetrics(wm::SM_CYSCREEN),
+        )
+    };
     let full = full_screen(ex_style, style, !parent.is_null(), screen);
     if full.is_some() {
         // A window that could go full screen: how it goes back to a window
@@ -172,7 +179,11 @@ fn place(
     if full_screen_on()
         && let Some(full) = full
     {
-        tracing::info!(width = screen.0, height = screen.1, "title window made full screen");
+        tracing::info!(
+            width = screen.0,
+            height = screen.1,
+            "title window made full screen"
+        );
         FULL_SCREEN.store(true, std::sync::atomic::Ordering::Relaxed);
         return full;
     }
@@ -190,14 +201,20 @@ static FULL_SCREEN: AtomicBool = AtomicBool::new(false);
 /// monitor it is on) or back to the window it was made as, whichever it is
 /// not now. The swap chain stretches to either.
 fn toggle_full_screen(hwnd: HWND) {
-    let Some(windowed) = *WINDOWED.lock().unwrap_or_else(|e| e.into_inner()) else { return };
+    let Some(windowed) = *WINDOWED.lock().unwrap_or_else(|e| e.into_inner()) else {
+        return;
+    };
     let full = FULL_SCREEN.load(std::sync::atomic::Ordering::Relaxed);
     // SAFETY: queries of the title's window and the monitor it is on.
     let monitor = unsafe {
         let mut info: windows_sys::Win32::Graphics::Gdi::MONITORINFO = std::mem::zeroed();
         info.cbSize = std::mem::size_of_val(&info) as u32;
-        let on = windows_sys::Win32::Graphics::Gdi::MonitorFromWindow(hwnd, windows_sys::Win32::Graphics::Gdi::MONITOR_DEFAULTTONEAREST);
-        (windows_sys::Win32::Graphics::Gdi::GetMonitorInfoW(on, &mut info) != 0).then_some(info.rcMonitor)
+        let on = windows_sys::Win32::Graphics::Gdi::MonitorFromWindow(
+            hwnd,
+            windows_sys::Win32::Graphics::Gdi::MONITOR_DEFAULTTONEAREST,
+        );
+        (windows_sys::Win32::Graphics::Gdi::GetMonitorInfoW(on, &mut info) != 0)
+            .then_some(info.rcMonitor)
     };
     let Some(monitor) = monitor else { return };
     let (ex_style, style, (x, y, w, h)) = toggled(full, windowed, monitor);
@@ -205,7 +222,15 @@ fn toggle_full_screen(hwnd: HWND) {
     unsafe {
         wm::SetWindowLongPtrW(hwnd, wm::GWL_STYLE, style as isize);
         wm::SetWindowLongPtrW(hwnd, wm::GWL_EXSTYLE, ex_style as isize);
-        wm::SetWindowPos(hwnd, std::ptr::null_mut(), x, y, w, h, wm::SWP_FRAMECHANGED | wm::SWP_NOZORDER | wm::SWP_SHOWWINDOW);
+        wm::SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            x,
+            y,
+            w,
+            h,
+            wm::SWP_FRAMECHANGED | wm::SWP_NOZORDER | wm::SWP_SHOWWINDOW,
+        );
     }
     FULL_SCREEN.store(!full, std::sync::atomic::Ordering::Relaxed);
     tracing::info!(full_screen = !full, "the title's window switched");
@@ -220,8 +245,8 @@ fn toggled(full: bool, windowed: Windowed, monitor: RECT) -> Windowed {
     }
     let (ex_style, style, _) = windowed;
     let (w, h) = (monitor.right - monitor.left, monitor.bottom - monitor.top);
-    let (ex_style, style, _) =
-        full_screen(ex_style, style | wm::WS_VISIBLE, false, (w, h)).unwrap_or((ex_style, style, (0, 0, w, h)));
+    let (ex_style, style, _) = full_screen(ex_style, style | wm::WS_VISIBLE, false, (w, h))
+        .unwrap_or((ex_style, style, (0, 0, w, h)));
     (ex_style, style, (monitor.left, monitor.top, w, h))
 }
 
@@ -230,7 +255,8 @@ fn switches_full_screen(message: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
     const VK_RETURN: usize = 0x0D;
     const VK_F11: usize = 0x7A;
     let alt = (lparam >> 29) & 1 != 0;
-    (message == wm::WM_KEYDOWN && wparam == VK_F11) || (message == wm::WM_SYSKEYDOWN && wparam == VK_RETURN && alt)
+    (message == wm::WM_KEYDOWN && wparam == VK_F11)
+        || (message == wm::WM_SYSKEYDOWN && wparam == VK_RETURN && alt)
 }
 
 /// `VICTORY_FULLSCREEN=1`: the title's windows fill the whole primary monitor
@@ -244,13 +270,30 @@ fn full_screen_on() -> bool {
 /// The styles and place of a full-screen window on a screen of `screen`
 /// pixels: a frameless popup over all of it. None for a window that keeps
 /// its own (one with a parent or owner, a child, a tool window).
-fn full_screen(ex_style: u32, style: u32, parented: bool, screen: (i32, i32)) -> Option<(u32, u32, (i32, i32, i32, i32))> {
-    if parented || style & wm::WS_CHILD != 0 || ex_style & wm::WS_EX_TOOLWINDOW != 0 || screen.0 <= 0 || screen.1 <= 0 {
+fn full_screen(
+    ex_style: u32,
+    style: u32,
+    parented: bool,
+    screen: (i32, i32),
+) -> Option<(u32, u32, (i32, i32, i32, i32))> {
+    if parented
+        || style & wm::WS_CHILD != 0
+        || ex_style & wm::WS_EX_TOOLWINDOW != 0
+        || screen.0 <= 0
+        || screen.1 <= 0
+    {
         return None;
     }
     let kept = wm::WS_VISIBLE | wm::WS_DISABLED | wm::WS_CLIPCHILDREN | wm::WS_CLIPSIBLINGS;
-    let frame = wm::WS_EX_WINDOWEDGE | wm::WS_EX_CLIENTEDGE | wm::WS_EX_DLGMODALFRAME | wm::WS_EX_STATICEDGE;
-    Some((ex_style & !frame, wm::WS_POPUP | (style & kept), (0, 0, screen.0, screen.1)))
+    let frame = wm::WS_EX_WINDOWEDGE
+        | wm::WS_EX_CLIENTEDGE
+        | wm::WS_EX_DLGMODALFRAME
+        | wm::WS_EX_STATICEDGE;
+    Some((
+        ex_style & !frame,
+        wm::WS_POPUP | (style & kept),
+        (0, 0, screen.0, screen.1),
+    ))
 }
 
 /// A console title sizes its window to its render target (
@@ -297,12 +340,7 @@ fn window_limit() -> Option<(i32, i32)> {
     })
 }
 
-fn fit_with_limit(
-    area: &RECT,
-    width: i32,
-    height: i32,
-    limit: Option<(i32, i32)>,
-) -> (i32, i32) {
+fn fit_with_limit(area: &RECT, width: i32, height: i32, limit: Option<(i32, i32)>) -> (i32, i32) {
     let Some((max_width, max_height)) = limit else {
         return fit_into(area, width, height);
     };
@@ -360,9 +398,12 @@ fn note_shown(hwnd: HWND) {
         return;
     }
     // SAFETY: both queries borrow a window of this thread's.
-    let top = unsafe { wm::IsWindowVisible(hwnd) != 0 && wm::GetAncestor(hwnd, wm::GA_ROOTOWNER) == hwnd };
+    let top = unsafe {
+        wm::IsWindowVisible(hwnd) != 0 && wm::GetAncestor(hwnd, wm::GA_ROOTOWNER) == hwnd
+    };
     if top {
-        let _ = TITLE_WINDOW.compare_exchange(0, hwnd as usize, Ordering::Relaxed, Ordering::Relaxed);
+        let _ =
+            TITLE_WINDOW.compare_exchange(0, hwnd as usize, Ordering::Relaxed, Ordering::Relaxed);
     }
 }
 
@@ -589,15 +630,31 @@ mod tests {
 
     #[test]
     fn full_screen_switches_both_ways_on_the_window_s_monitor() {
-        let windowed = (wm::WS_EX_WINDOWEDGE, wm::WS_OVERLAPPEDWINDOW, (100, 50, 1600, 900));
-        let monitor = RECT { left: 3840, top: 0, right: 3840 + 2560, bottom: 1440 };
+        let windowed = (
+            wm::WS_EX_WINDOWEDGE,
+            wm::WS_OVERLAPPEDWINDOW,
+            (100, 50, 1600, 900),
+        );
+        let monitor = RECT {
+            left: 3840,
+            top: 0,
+            right: 3840 + 2560,
+            bottom: 1440,
+        };
         // to full screen: a frameless popup over the monitor the window is on
         let (ex, style, place) = toggled(false, windowed, monitor);
         assert_eq!(place, (3840, 0, 2560, 1440));
         assert_eq!(style, wm::WS_POPUP | wm::WS_VISIBLE);
         assert_eq!(ex & wm::WS_EX_WINDOWEDGE, 0);
         // and back: the window it was made as, shown
-        assert_eq!(toggled(true, windowed, monitor), (wm::WS_EX_WINDOWEDGE, wm::WS_OVERLAPPEDWINDOW | wm::WS_VISIBLE, (100, 50, 1600, 900)));
+        assert_eq!(
+            toggled(true, windowed, monitor),
+            (
+                wm::WS_EX_WINDOWEDGE,
+                wm::WS_OVERLAPPEDWINDOW | wm::WS_VISIBLE,
+                (100, 50, 1600, 900)
+            )
+        );
         // the keys: F11, and Enter only with Alt
         let alt = 1 << 29;
         assert!(switches_full_screen(wm::WM_KEYDOWN, 0x7A, 0));
@@ -609,8 +666,13 @@ mod tests {
     #[test]
     fn a_full_screen_window_is_a_frameless_popup_over_the_screen() {
         let framed = wm::WS_OVERLAPPEDWINDOW | wm::WS_VISIBLE;
-        let (ex, style, place) =
-            full_screen(wm::WS_EX_APPWINDOW | wm::WS_EX_WINDOWEDGE, framed, false, (3840, 2160)).unwrap();
+        let (ex, style, place) = full_screen(
+            wm::WS_EX_APPWINDOW | wm::WS_EX_WINDOWEDGE,
+            framed,
+            false,
+            (3840, 2160),
+        )
+        .unwrap();
         assert_eq!(place, (0, 0, 3840, 2160));
         assert_eq!(style, wm::WS_POPUP | wm::WS_VISIBLE);
         assert_eq!(ex, wm::WS_EX_APPWINDOW);
@@ -694,8 +756,14 @@ mod tests {
             right: 2660,
             bottom: 1490,
         };
-        assert_eq!(fit_with_limit(&area, 3840, 2160, Some((1920, 1080))), (1920, 1080));
-        assert_eq!(fit_with_limit(&area, 640, 480, Some((1920, 1080))), (640, 480));
+        assert_eq!(
+            fit_with_limit(&area, 3840, 2160, Some((1920, 1080))),
+            (1920, 1080)
+        );
+        assert_eq!(
+            fit_with_limit(&area, 640, 480, Some((1920, 1080))),
+            (640, 480)
+        );
         assert_eq!(fit_with_limit(&area, 3840, 2160, None), (2560, 1440));
     }
 
@@ -707,7 +775,10 @@ mod tests {
             right: 1920,
             bottom: 1040,
         };
-        assert_eq!(fit_with_limit(&area, 3840, 2160, Some((2560, 1440))), (1848, 1040));
+        assert_eq!(
+            fit_with_limit(&area, 3840, 2160, Some((2560, 1440))),
+            (1848, 1040)
+        );
         assert_eq!(
             fit_with_limit(&area, wm::CW_USEDEFAULT, 0, Some((1920, 1080))),
             (wm::CW_USEDEFAULT, 0)
@@ -722,7 +793,10 @@ mod tests {
             right: 2560,
             bottom: 1440,
         };
-        assert_eq!(fit_with_limit(&area, 1600, 1200, Some((1920, 1080))), (1440, 1080));
+        assert_eq!(
+            fit_with_limit(&area, 1600, 1200, Some((1920, 1080))),
+            (1440, 1080)
+        );
     }
 
     #[test]

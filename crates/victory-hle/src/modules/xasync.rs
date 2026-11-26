@@ -853,7 +853,10 @@ pub fn pending_with(
     identity: *const c_void,
     work: impl FnOnce() -> Result<Vec<u8>, HRESULT> + Send + 'static,
 ) -> HRESULT {
-    type Data = Mutex<(Option<Box<dyn FnOnce() -> Result<Vec<u8>, HRESULT> + Send>>, Vec<u8>)>;
+    type Data = Mutex<(
+        Option<Box<dyn FnOnce() -> Result<Vec<u8>, HRESULT> + Send>>,
+        Vec<u8>,
+    )>;
     extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
         // SAFETY: the runtime passes valid provider data; the context is the
         // boxed state until cleanup frees it.
@@ -864,7 +867,11 @@ pub fn pending_with(
             OP_CLEANUP => drop(unsafe { Box::from_raw(state) }),
             OP_BEGIN => {
                 // SAFETY: as above; cleanup waits for completion.
-                let work = unsafe { &*state }.lock().unwrap_or_else(|e| e.into_inner()).0.take();
+                let work = unsafe { &*state }
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0
+                    .take();
                 let (block, state) = (data.block as usize, state as usize);
                 std::thread::spawn(move || {
                     let result = work.map_or(Err(E_ABORT), |work| work());
@@ -893,7 +900,13 @@ pub fn pending_with(
     }
     let state: Box<Data> = Box::new(Mutex::new((Some(Box::new(work)), Vec::new())));
     let context = Box::into_raw(state);
-    let hr = XAsyncBegin(block, context.cast(), identity, std::ptr::null(), Some(provider));
+    let hr = XAsyncBegin(
+        block,
+        context.cast(),
+        identity,
+        std::ptr::null(),
+        Some(provider),
+    );
     if hr < 0 {
         // SAFETY: refused before the call existed; still ours.
         drop(unsafe { Box::from_raw(context) });
@@ -1273,13 +1286,21 @@ mod tests {
         let (none, identity) = (std::ptr::null_mut(), 0x2e as *const c_void);
         let mut block = fresh();
         for round in 0..20 {
-            assert_eq!(XAsyncBegin(&mut block, none, identity, std::ptr::null(), Some(later)), S_OK, "round {round}");
+            assert_eq!(
+                XAsyncBegin(&mut block, none, identity, std::ptr::null(), Some(later)),
+                S_OK,
+                "round {round}"
+            );
             while XAsyncGetStatus(&mut block, false) == E_PENDING {
                 std::hint::spin_loop();
             }
             // freed with its result never taken; a new block in its place
             block = fresh();
-            assert_eq!(XAsyncBegin(&mut block, none, identity, std::ptr::null(), Some(idle)), S_OK, "round {round}");
+            assert_eq!(
+                XAsyncBegin(&mut block, none, identity, std::ptr::null(), Some(idle)),
+                S_OK,
+                "round {round}"
+            );
             XAsyncComplete(&mut block, E_ABORT, 0);
             block = fresh();
         }
@@ -1471,7 +1492,13 @@ mod tests {
         };
         let identity = 0x77 as *const c_void;
         assert_eq!(
-            XAsyncBegin(&mut block, std::ptr::null_mut(), identity, std::ptr::null(), Some(provider)),
+            XAsyncBegin(
+                &mut block,
+                std::ptr::null_mut(),
+                identity,
+                std::ptr::null(),
+                Some(provider)
+            ),
             S_OK
         );
         assert!(XTaskQueueDispatch(q, WORK, 0));
@@ -1482,11 +1509,20 @@ mod tests {
         let mut value = 0u64;
         let mut used = 0;
         assert_eq!(
-            XAsyncGetResult(&mut block, identity, 8, (&mut value as *mut u64).cast(), &mut used),
+            XAsyncGetResult(
+                &mut block,
+                identity,
+                8,
+                (&mut value as *mut u64).cast(),
+                &mut used
+            ),
             S_OK
         );
         assert_eq!((value, used), (0x1234, 8));
-        assert!(call(&raw mut block).is_none(), "the call ends with its result");
+        assert!(
+            call(&raw mut block).is_none(),
+            "the call ends with its result"
+        );
         XTaskQueueCloseHandle(q);
     }
 

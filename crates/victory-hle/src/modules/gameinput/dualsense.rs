@@ -81,6 +81,13 @@ pub(super) fn parse(report: &[u8], bluetooth: bool) -> Option<PadState> {
     })
 }
 
+/// The Bluetooth address in a pairing feature report (0x09, the address at
+/// 1..7 on both transports), `None` when it is too short or all zeros.
+fn mac(pairing: &[u8]) -> Option<[u8; 6]> {
+    let mac: [u8; 6] = pairing.get(1..7)?.try_into().ok()?;
+    (mac != [0; 6]).then_some(mac)
+}
+
 #[cfg(windows)]
 pub(super) use host::pads;
 
@@ -153,33 +160,55 @@ mod host {
         HIDD_ATTRIBUTES, HidD_GetAttributes, HidD_GetFeature, HidD_GetHidGuid,
     };
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+        CloseHandle, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
+        INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile,
+        CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        ReadFile,
     };
+    use windows_sys::Win32::System::IO::{
+        CancelIoEx, GetOverlappedResult, GetOverlappedResultEx, OVERLAPPED,
+    };
+    use windows_sys::Win32::System::Threading::CreateEventW;
 
-    use super::{PRODUCTS, PadState, SONY, parse};
+    use super::{PRODUCTS, PadState, SONY, mac, parse};
 
     /// How often to look for newly connected pads.
     const SCAN: Duration = Duration::from_secs(2);
 
+    /// A pad in full-report mode sends reports all the time (hundreds a
+    /// second); this long without one and we ask it whether it is still
+    /// there. Over Bluetooth Windows can keep the device after the pad is
+    /// switched off or out of range, and a read then waits for ever.
+    const QUIET_MS: u32 = 500;
+
     struct Pad {
+        /// This connection's: a pad that reconnects gets a new one.
         id: u64,
         path: Vec<u16>,
-        /// `None` until the first report.
+        /// The pad's Bluetooth address, the same over USB and Bluetooth:
+        /// one pad seen through both is opened once.
+        mac: Option<[u8; 6]>,
+        /// `None` until the first report, and while the pad is silent.
         state: Option<PadState>,
     }
 
-    /// Pads in the order they were found.
+    /// The open pads, in the order they were found.
     static PADS: Mutex<Vec<Pad>> = Mutex::new(Vec::new());
 
     fn lock() -> std::sync::MutexGuard<'static, Vec<Pad>> {
         PADS.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The connected pads' latest states, oldest connection first; the first
-    /// call starts looking for them.
+    /// Paths found to be a pad already open over its other transport, with
+    /// its address: not opened again on every scan (two feature reports
+    /// and a log line each time) while that pad stays open.
+    static TWINS: Mutex<Vec<(Vec<u16>, [u8; 6])>> = Mutex::new(Vec::new());
+
+    /// The open pads' latest states with their connection ids, oldest
+    /// connection first, without the pads that are silent or yet to report;
+    /// the first call starts looking for them.
     pub(in super::super) fn pads() -> Vec<(u64, PadState)> {
         static STARTED: LazyLock<()> = LazyLock::new(|| {
             std::thread::spawn(|| {
@@ -196,42 +225,107 @@ mod host {
             .collect()
     }
 
+    /// Feature report `id` into `buffer` (its first byte), `false` when the
+    /// pad did not answer. A round trip to the pad, so over Bluetooth it also
+    /// tells whether the pad is still there.
+    fn feature(handle: HANDLE, id: u8, buffer: &mut [u8]) -> bool {
+        buffer.fill(0);
+        buffer[0] = id;
+        // SAFETY: the buffer is as long as we say.
+        unsafe { HidD_GetFeature(handle, buffer.as_mut_ptr().cast(), buffer.len() as u32) }
+    }
+
+    /// Asks for the calibration report: it switches a pad on Bluetooth to
+    /// full reports (0x31), again after it reconnected; over USB it changes
+    /// nothing. `false` when the pad did not answer.
+    fn full_reports(handle: HANDLE) -> bool {
+        feature(handle, 0x05, &mut [0; 41])
+    }
+
     /// Opens the pads not open yet, each with a reader thread.
     fn scan() {
-        for path in hid_paths() {
+        let paths = hid_paths();
+        {
+            let pads = lock();
+            // A twin whose pad went away is opened again: over USB, say,
+            // after the Bluetooth link dropped with the cable still in.
+            TWINS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .retain(|(path, mac)| {
+                    paths.contains(path) && pads.iter().any(|pad| pad.mac == Some(*mac))
+                });
+        }
+        for path in paths {
             // Cheap filter before opening anything: Sony's vendor id is in
             // the path, as `vid_054c` (USB) or `vid&0002054c` (Bluetooth).
             let lower = String::from_utf16_lossy(&path).to_ascii_lowercase();
             if !lower.contains("054c") {
                 continue;
             }
-            if lock().iter().any(|pad| pad.path == path) {
+            if lock().iter().any(|pad| pad.path == path)
+                || TWINS
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .iter()
+                    .any(|(twin, _)| *twin == path)
+            {
                 continue;
             }
             let Some(handle) = open(&path) else {
                 continue;
             };
             let bluetooth = lower.contains("{00001124-");
-            tracing::info!(path = %lower, bluetooth, "DualSense connected");
-            // Asking for the calibration feature report switches a pad on
-            // Bluetooth to full reports (0x31); over USB it changes nothing.
-            let mut feature = [0u8; 41];
-            feature[0] = 0x05;
-            // SAFETY: the buffer is as long as we say.
-            unsafe { HidD_GetFeature(handle, feature.as_mut_ptr().cast(), feature.len() as u32) };
+            // A paired pad that is switched off can still be listed over
+            // Bluetooth: it does not answer.
+            if !full_reports(handle) {
+                tracing::debug!(path = %lower, "DualSense listed but not answering");
+                // SAFETY: just opened, nothing else has it.
+                unsafe { CloseHandle(handle) };
+                continue;
+            }
+            let mut pairing = [0u8; 20];
+            let mac = if feature(handle, 0x09, &mut pairing) {
+                mac(&pairing)
+            } else {
+                None
+            };
             static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-            lock().push(Pad {
-                id,
-                path,
-                state: None,
-            });
+            let id = {
+                let mut pads = lock();
+                let twin = mac.is_some() && pads.iter().any(|pad| pad.mac == mac);
+                (!twin).then(|| {
+                    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+                    pads.push(Pad {
+                        id,
+                        path: path.clone(),
+                        mac,
+                        state: None,
+                    });
+                    id
+                })
+            };
+            let Some(id) = id else {
+                tracing::info!(path = %lower, bluetooth, "DualSense already open over the other transport");
+                if let Some(mac) = mac {
+                    TWINS
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push((path, mac));
+                }
+                // SAFETY: just opened, nothing else has it.
+                unsafe { CloseHandle(handle) };
+                continue;
+            };
+            tracing::info!(path = %lower, bluetooth, "DualSense connected");
             let raw = handle as usize;
             if let Err(error) = std::thread::Builder::new()
                 .name("DualSense reader".into())
                 .spawn(move || read(raw as HANDLE, id, bluetooth))
             {
-                remove(handle, id);
+                lock().retain(|pad| pad.id != id);
+                // SAFETY: just opened, and no reader has it.
+                unsafe { CloseHandle(handle) };
                 tracing::warn!(%error, "could not start a DualSense reader");
             }
         }
@@ -239,37 +333,77 @@ mod host {
 
     /// Reads reports until the pad goes away, then forgets it.
     fn read(handle: HANDLE, id: u64, bluetooth: bool) {
+        let set = |state: Option<PadState>| {
+            if let Some(pad) = lock().iter_mut().find(|pad| pad.id == id) {
+                pad.state = state;
+            }
+        };
+        // SAFETY: an unnamed manual-reset event; no security attributes.
+        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
         let mut report = [0u8; 128];
-        loop {
+        let why = 'pad: loop {
+            if event.is_null() {
+                break 'pad "no event";
+            }
+            // SAFETY: plain data; only the event is set.
+            let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+            overlapped.hEvent = event;
             let mut got = 0;
-            // SAFETY: a synchronous read into a buffer as long as we say.
-            let ok = unsafe {
+            // SAFETY: the buffer and `overlapped` outlive the read: every way
+            // out below waits for it to end first.
+            let started = unsafe {
                 ReadFile(
                     handle,
                     report.as_mut_ptr(),
                     report.len() as u32,
-                    &mut got,
                     std::ptr::null_mut(),
+                    &mut overlapped,
                 )
             };
-            if ok == 0 || got == 0 {
-                break;
+            // SAFETY: plain query.
+            if started == 0 && unsafe { GetLastError() } != ERROR_IO_PENDING {
+                break 'pad "read failed";
             }
-            if let Some(state) = parse(&report[..got as usize], bluetooth) {
-                let mut pads = lock();
-                if let Some(pad) = pads.iter_mut().find(|pad| pad.id == id) {
-                    pad.state = Some(state);
+            loop {
+                // SAFETY: the read started above.
+                let done =
+                    unsafe { GetOverlappedResultEx(handle, &overlapped, &mut got, QUIET_MS, 0) };
+                if done != 0 {
+                    if got == 0 {
+                        break 'pad "read nothing";
+                    }
+                    break;
+                }
+                // SAFETY: plain query.
+                if unsafe { GetLastError() } != WAIT_TIMEOUT {
+                    break 'pad "read failed";
+                }
+                // Silent: whatever was held is not held any more, and the
+                // pad may be gone without the read failing.
+                set(None);
+                if !full_reports(handle) {
+                    // SAFETY: cancel the read and wait for it to end, so
+                    // nothing writes into `report` once we return.
+                    unsafe {
+                        CancelIoEx(handle, &overlapped);
+                        GetOverlappedResult(handle, &overlapped, &mut got, 1);
+                    }
+                    break 'pad "not answering";
                 }
             }
-        }
-        tracing::info!("DualSense disconnected");
-        remove(handle, id);
-    }
-
-    fn remove(handle: HANDLE, id: u64) {
-        // SAFETY: ours, and nothing uses it any more.
-        unsafe { CloseHandle(handle) };
+            if let Some(state) = parse(&report[..got as usize], bluetooth) {
+                set(Some(state));
+            }
+        };
+        tracing::info!(why, bluetooth, "DualSense disconnected");
         lock().retain(|pad| pad.id != id);
+        // SAFETY: ours, and nothing uses them any more.
+        unsafe {
+            if !event.is_null() {
+                CloseHandle(event);
+            }
+            CloseHandle(handle);
+        }
     }
 
     /// The pad at `path` opened for reading, `None` when it is something else
@@ -285,7 +419,7 @@ mod host {
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 std::ptr::null(),
                 OPEN_EXISTING,
-                0,
+                FILE_FLAG_OVERLAPPED,
                 std::ptr::null_mut(),
             )
         };
@@ -444,6 +578,17 @@ mod tests {
             slots(Mode::Both, xinput, &mut assigned, || vec![(8, b), (9, a)]),
             [Some(a), Some(x), Some(b), None]
         );
+    }
+
+    #[test]
+    fn the_pairing_report_holds_the_address() {
+        let mut pairing = [0u8; 20];
+        pairing[0] = 0x09;
+        pairing[1..7].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+        assert_eq!(mac(&pairing), Some([1, 2, 3, 4, 5, 6]));
+        // a pad that answered with nothing cannot be told apart
+        assert_eq!(mac(&[0x09; 1]), None);
+        assert_eq!(mac(&[0x09, 0, 0, 0, 0, 0, 0]), None);
     }
 
     #[test]

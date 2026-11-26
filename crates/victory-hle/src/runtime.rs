@@ -188,9 +188,15 @@ fn elements(text: &str) -> Vec<(String, String)> {
             .unwrap_or("");
         path.push(name);
         let body = field_text(rest);
-        let body = [("&lt;", "<"), ("&gt;", ">"), ("&quot;", "\""), ("&apos;", "'"), ("&amp;", "&")]
-            .iter()
-            .fold(body, |b, (entity, c)| b.replace(entity, c));
+        let body = [
+            ("&lt;", "<"),
+            ("&gt;", ">"),
+            ("&quot;", "\""),
+            ("&apos;", "'"),
+            ("&amp;", "&"),
+        ]
+        .iter()
+        .fold(body, |b, (entity, c)| b.replace(entity, c));
         out.push((path.join("/"), body));
         if closed {
             path.pop();
@@ -239,9 +245,9 @@ pub fn title() -> Title {
 pub fn use_console_timers() {
     use windows_sys::Win32::Media::timeBeginPeriod;
     use windows_sys::Win32::System::Threading::{
-        GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
-        PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
-        ProcessPowerThrottling, SetProcessInformation,
+        GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        PROCESS_POWER_THROTTLING_STATE, ProcessPowerThrottling, SetProcessInformation,
     };
     // Also: the system does not run this process at reduced speed (its
     // "efficiency mode": lower clock, the slow cores of a hybrid processor)
@@ -280,13 +286,18 @@ pub fn use_console_timers() {
 /// `VICTORY_PROCESS_PRIORITY=normal`: as it was started.
 #[cfg(windows)]
 fn ahead_of_other_programs() {
-    use windows_sys::Win32::System::Threading::{ABOVE_NORMAL_PRIORITY_CLASS, GetCurrentProcess, SetPriorityClass};
+    use windows_sys::Win32::System::Threading::{
+        ABOVE_NORMAL_PRIORITY_CLASS, GetCurrentProcess, SetPriorityClass,
+    };
     if std::env::var_os("VICTORY_PROCESS_PRIORITY").is_some_and(|v| v == "normal" || v == "0") {
         return;
     }
     // SAFETY: a plain process setting.
     let set = unsafe { SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS) } != 0;
-    tracing::info!(set, "the process runs above normal priority (VICTORY_PROCESS_PRIORITY=normal: not)");
+    tracing::info!(
+        set,
+        "the process runs above normal priority (VICTORY_PROCESS_PRIORITY=normal: not)"
+    );
 }
 
 #[cfg(test)]

@@ -293,7 +293,10 @@ mod tests {
             };
             assert_eq!(prompt(this, bytes, &mut block), S_OK);
             assert_eq!(
-                (xasync::XAsyncGetStatus(&mut block, true), result(this, &mut block)),
+                (
+                    xasync::XAsyncGetStatus(&mut block, true),
+                    result(this, &mut block)
+                ),
                 (expect, expect),
                 "{bytes} bytes"
             );

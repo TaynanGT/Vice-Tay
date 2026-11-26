@@ -6,12 +6,16 @@
 //! reads it through a table and finds the slot changed.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
+
+/// Distinguishes host heaps even when a title heap address is reused.
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// A set of a heap's slots, a bit for each: no lock (a pass that went through
 /// a set of 70,000 under its lock kept everyone who writes slots waiting for
@@ -125,6 +129,7 @@ impl Made {
 }
 
 pub(crate) struct HostHeap {
+    id: u64,
     pub(crate) buffer_sweep: Mutex<crate::draw::BufferSweep>,
     pub(crate) buffer_frame: std::sync::atomic::AtomicU64,
     pub(crate) heap: ID3D12DescriptorHeap,
@@ -1808,6 +1813,7 @@ impl HostHeap {
             .flatten();
         let queued = std::sync::Arc::new(Queued::new(if sampler { 0 } else { count }));
         let h = HostHeap {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             buffer_sweep: Mutex::default(),
             buffer_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
             heap,
@@ -3039,11 +3045,19 @@ impl HostHeap {
         }
     }
 
-    /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
-    /// returned).
+    /// The identity to store with a range this heap allocated.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Gives back `n` slots from `first` (an index [`dynamic`] returned)
+    /// when they came from this heap.
     ///
     /// [`dynamic`]: HostHeap::dynamic
-    pub(crate) fn release(&self, first: u32, n: u32) {
+    pub(crate) fn release(&self, id: u64, first: u32, n: u32) {
+        if id != self.id {
+            return;
+        }
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
@@ -5366,6 +5380,19 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn dynamic_slots_are_given_back_only_to_the_heap_that_took_them() {
+        let Some(old) = HostHeap::new(false, 4) else { return };
+        let Some(new) = HostHeap::new(false, 4) else { return };
+        assert_ne!(old.id(), new.id());
+        let first = new.dynamic(2).expect("two dynamic slots");
+        let free = new.free.load(Ordering::Relaxed);
+        new.release(old.id(), first, 2);
+        assert_eq!(new.free.load(Ordering::Relaxed), free);
+        new.release(new.id(), first, 2);
+        assert_eq!(new.free.load(Ordering::Relaxed), free + 2);
+    }
+
     /// Every host sampler heap backs all 2,048 hardware descriptors and
     /// reserves slot 2,047 as a null sentinel so `umin(index, 2047)` in
     /// `victory-shader` never reads past smaller title sampler heaps.
@@ -5829,7 +5856,11 @@ mod tests {
             // SAFETY: a live buffer.
             unsafe { made.GetDesc() }.Width
         };
-        for (off, raw, len) in [(8, true, 128u64), (8, false, 4 * 456)] {
+        // The copy is the 4 MiB window the view lies in. Off 16 bytes, and
+        // off the 456-byte elements counted from the window's start: a view
+        // on them needs no copy of its own (1 page in 57 at 8 bytes in).
+        let off = [8u64, 24, 40].into_iter().find(|o| !((start + o) % (4 << 20)).is_multiple_of(456)).unwrap();
+        for (raw, len) in [(true, 128u64), (false, 4 * 456)] {
             let v = view(start + off, raw);
             assert_eq!(width(&v), len.next_multiple_of(256));
             let (copy, address, bytes) = buffer_copy(&v).unwrap();
@@ -6293,7 +6324,7 @@ mod tests {
         assert_eq!((a, b), (4, 4 + heap.dynamic - 100));
         // 40 left at the end: 50 do not fit until something is given back.
         assert_eq!(heap.dynamic(50), None);
-        heap.release(a, 50);
+        heap.release(heap.id(), a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
     }
@@ -6311,17 +6342,17 @@ mod tests {
         assert_eq!((first, left, right, rest), (4, 5, 7, 9));
 
         // Reallocating the left half puts the cursor back in the middle.
-        heap.release(left, 2);
+        heap.release(heap.id(), left, 2);
         assert_eq!(heap.dynamic(2), Some(left));
-        heap.release(left, 2);
-        heap.release(right, 2);
+        heap.release(heap.id(), left, 2);
+        heap.release(heap.id(), right, 2);
         assert_eq!(heap.dynamic(4), Some(left));
         assert_eq!(heap.dynamic(1), None);
 
         // A free slot at each physical end does not form a two-slot range.
-        heap.release(first, 1);
+        heap.release(heap.id(), first, 1);
         let last = first + heap.dynamic - 1;
-        heap.release(last, 1);
+        heap.release(heap.id(), last, 1);
         assert_eq!(heap.dynamic(2), None);
     }
 

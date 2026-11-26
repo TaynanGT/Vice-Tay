@@ -464,7 +464,20 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
         // SAFETY: the bytes outlive the library (kept beside it).
         unsafe {
-            device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
+            if bytes.is_empty() {
+                let mut raw: *mut std::ffi::c_void = std::ptr::null_mut();
+                (windows::core::Interface::vtable(device).CreatePipelineLibrary)(
+                    windows::core::Interface::as_raw(device),
+                    std::ptr::null(),
+                    0,
+                    &<ID3D12PipelineLibrary as windows::core::Interface>::IID,
+                    &mut raw,
+                )
+                .ok()?;
+                <ID3D12PipelineLibrary as windows::core::Interface>::from_raw(raw).cast()
+            } else {
+                device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
+            }
         }
     };
     if !blob.bytes().is_empty() {
@@ -644,10 +657,14 @@ pub(crate) fn save(now: bool) {
             )
         });
     }
-    let slow: Vec<String> = slow_ones().iter().flatten().map(|(key, ms)| format!("{key} {ms}")).collect();
-    let written = library_written
-        .and_then(|()| write_atomically(&dir.join(SLOW_FILE), slow.join("\n").as_bytes()))
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
+    let written = if saved_pipeline_history() {
+        let slow: Vec<String> = slow_ones().iter().flatten().map(|(key, ms)| format!("{key} {ms}")).collect();
+        library_written
+            .and_then(|()| write_atomically(&dir.join(SLOW_FILE), slow.join("\n").as_bytes()))
+            .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
+    } else {
+        library_written
+    };
     match written {
         Ok(()) => tracing::info!(
             bytes,
@@ -709,6 +726,20 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
     res
 }
 
+/// VICTORY_PIPELINE_HISTORY=0 starts with an empty scheduling history.
+/// The driver library is still loaded and saved.
+fn saved_pipeline_history() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_HISTORY").is_none_or(|v| v != "0"))
+}
+
+fn read_pipeline_history(file: &str) -> String {
+    if !saved_pipeline_history() {
+        return String::new();
+    }
+    DIR.get().and_then(|dir| std::fs::read_to_string(dir.join(file)).ok()).unwrap_or_default()
+}
+
 /// How long each title pipeline that took long to make took, in ms (beside
 /// the early list; a key may be there more than once).
 const SLOW_FILE: &str = "slow-pipelines.txt";
@@ -719,7 +750,7 @@ static SLOW: Mutex<Option<std::collections::HashMap<String, u64>>> = Mutex::new(
 fn slow_ones() -> std::sync::MutexGuard<'static, Option<std::collections::HashMap<String, u64>>> {
     let mut slow = SLOW.lock().unwrap_or_else(|e| e.into_inner());
     if slow.is_none() {
-        let listed = DIR.get().and_then(|d| std::fs::read_to_string(d.join(SLOW_FILE)).ok()).unwrap_or_default();
+        let listed = read_pipeline_history(SLOW_FILE);
         *slow = Some(
             listed
                 .lines()
@@ -758,10 +789,7 @@ static USED_CHANGED: AtomicBool = AtomicBool::new(false);
 fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
     let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
     if used.is_none() {
-        let listed = DIR
-            .get()
-            .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
-            .unwrap_or_default();
+        let listed = read_pipeline_history(EARLY_FILE);
         let set: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
         tracing::info!(pipelines = set.len(), "title pipelines to start early");
         *used = Some(set);

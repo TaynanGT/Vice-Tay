@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="920" height="272" viewBox="0 0 920 272" role="img" aria-labelledby="title description">
   <title id="title">Series S frame rate</title>
-  <desc id="description">Series S median 21.5 fps, 1% low 7.0, P10 to P90 18.4 to 24.0.</desc>
+  <desc id="description">Series S median 21.1 fps, 1% low 17.0, P10 to P90 19.1 to 23.2.</desc>
   <style>
     text { font-family: system-ui, 'Segoe UI', sans-serif; font-variant-numeric: tabular-nums; }
     .muted { fill: #A6B7CD; font-size: 16px; }
@@ -39,11 +39,11 @@
   <path d="M628.5 146V225" class="guide"/>
   <text x="628.5" y="128" fill="#FFC186" font-size="16" font-weight="650" text-anchor="middle">30 fps target</text>
   <text x="36" y="171" fill="#EDF4FF" font-size="20" font-weight="690">Series S</text>
-  <text x="36" y="196" class="muted">98 samples</text>
+  <text x="36" y="196" class="muted">349 samples</text>
   <path d="M246 168H756" stroke="#26384F" stroke-width="8" stroke-linecap="round"/>
-  <path d="M480.6 168H552" stroke="#91ADFF" stroke-width="9" stroke-linecap="round"/>
-  <path d="M335.25 162l6 6-6 6-6-6z" fill="#0E1829" stroke="#91ADFF" stroke-width="2"/>
-  <circle cx="520.13" cy="168" r="7" fill="#EDF4FF" stroke="#0E1829" stroke-width="2"/>
-  <text x="246" y="196" class="muted">1% low 7.0 · P10–P90 18.4–24.0</text>
-  <text x="882" y="176" fill="#91ADFF" text-anchor="end" font-size="25" font-weight="720">21.5 <tspan font-size="15">fps</tspan></text>
+  <path d="M489.52 168H541.8" stroke="#91ADFF" stroke-width="9" stroke-linecap="round"/>
+  <path d="M462.75 162l6 6-6 6-6-6z" fill="#0E1829" stroke="#91ADFF" stroke-width="2"/>
+  <circle cx="515.02" cy="168" r="7" fill="#EDF4FF" stroke="#0E1829" stroke-width="2"/>
+  <text x="246" y="196" class="muted">1% low 17.0 · P10–P90 19.1–23.2</text>
+  <text x="882" y="176" fill="#91ADFF" text-anchor="end" font-size="25" font-weight="720">21.1 <tspan font-size="15">fps</tspan></text>
 </svg>

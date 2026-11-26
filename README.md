@@ -14,17 +14,18 @@ developer or publisher.
 > [!TIP]
 > **[View the gameplay screenshots](https://github.com/TaynanGT/Vice-Tay-Screenshots#readme)**
 >
-> Ten captures from the Series S playtest on build `672cf831`.
+> Ten captures from an earlier Series S playtest, on build `672cf831`.
 
 ## At a glance
 
-- **Playable prologue.** In the latest Series S benchmark the world loaded in
-  126 seconds, and the run completed eight minutes of movement and camera tests.
-- **It is not fast enough yet.** Vice-Tay is measured on the Series S profile. On
-  the current build the world runs at **21.5 fps** (median; 18.4-24.0 for most
-  frames), short of the 30 fps goal.
-- **Memory in the latest run.** The game used 26.4 GB of private memory at the
-  median and peaked at 27.9 GB during the eight-minute benchmark.
+- **It plays.** On the Series S profile the game goes from the prison into the
+  prologue's boat section. The boat is driven by hand; when it runs aground the
+  mission fails, and the game repeats or skips the checkpoint.
+- **It is not fast enough yet.** The world runs at **21.1 fps** (median;
+  19.1-23.2 for most frames), short of the 30 fps goal.
+- **Memory levels off.** 23.5 GB at the median and 24.1 GB at most over 30
+  minutes in the world, about 1 GB more in the last ten minutes than in the
+  first; the frame rate eased from 21.7 to 20.6 fps over the same span.
 
 ## Test PC
 
@@ -46,16 +47,18 @@ developer or publisher.
 ## Measurements
 
 <!-- measurements:start -->
-### Measured sessions (build bc090416)
+### Measured session (build bc090416)
 
-On the test PC above, with `scripts\play.ps1` and its RTX 4090 settings, in
-full screen, each session walking, running, turning the camera and taking
-captures every minute. Nothing compiled meanwhile; the screen was recorded
-to video on the card's encoder throughout.
+On the test PC above, with `scripts\play.ps1 -Console series-s` and its RTX 4090
+settings, in full screen, played by hand: the prologue from the prison into the
+boat section, the boat driven to the package and along the marked route to an
+island, three failed attempts picked up again from a checkpoint (one of them
+skipped), and a capture every minute. Nothing compiled meanwhile; the screen was
+recorded to video on the card's encoder throughout.
 
 | Profile | In the world | To the start screen / to the world | fps: median (p10-p90; 1% low) | ms per frame (median) | Game memory, median / max | Card: memory max, load, power, temperature |
 |---|---|---|---|---|---|---|
-| Series S | 8 min, ended by the runner | 88 s / 126 s | **21.5** (18.4-24.0; 1% low 7.0) | 46.5: 0.1 GPU, 32.3 preparing, 12.3 copying back | 26.4 / 27.9 GB | 11.6 GB, 85.0%, 134.2 W, 59.4 C |
+| Series S | 30 min, ended by the runner | 72 s / 120 s | **21.1** (19.1-23.2; 1% low 17.0) | 47.3: 33.7 preparing, 12.6 copying back | 23.5 / 24.1 GB | 8.8 GB, 86.0%, 134.5 W, 49.6 C |
 
 Every number is from the game's own once-a-second frame lines in the world
 (over 1,000 draws a frame) and samples every 20 s; the full tables, with each
@@ -80,19 +83,22 @@ Select a chart to explore the readings, adjust the FPS target and project a redu
 
 - **Frame rate.** Below 30 fps in the world. Most of a frame goes to preparing the
   GPU's work on the CPU and copying data back, not to the GPU itself.
-- **Memory.** The game holds 26-28 GB on the Series S profile. On a PC with less
-  free RAM than that, Windows pages part of it out and frames stall.
+- **Memory.** On a PC with less free RAM than the game holds (above), Windows
+  pages part of it out and frames stall.
 - **Picture.** Skin, hair and some walls show flat bands of colour; some objects
   (tanks, tarps, plants, a skylight) glow in flat purple, pink or blue; some faces
   show scrambled colour patches and some eyes are lit white; clouds and reflections
   break into square blocks; a few shapes render as flat black.
-- **Ray tracing.** The ray-traced structures are not built by default (`-RayTracing`
-  turns the builder on), so a few hundred dispatches a frame are skipped and some
-  light is missing.
+  For banding that varies between launches, pass `-More @{VICTORY_RTV_FORMAT_LOG='1'}`
+  to `scripts\play.ps1` on a diagnostics build. Compare the `RTV format check`
+  totals and `RTV format mismatch` examples at the same checkpoint in a clean and a banded run.
+- **Ray tracing.** The ray-traced structures are not built by default, so a few
+  hundred dispatches a frame are skipped and some light is missing; `-RayTracing`
+  builds them.
 - **Loading.** The first run of a new build translates every shader while it plays;
   translate them ahead (below).
-- **Measuring.** On the Series S profile the log's GPU-time counter reads near zero;
-  it is left out of conclusions until it is clear what it measures there.
+- **Measuring.** On the Series S profile the log's GPU-time counter reads near zero,
+  so the README's table leaves it out until it is clear what it measures there.
 
 ## Getting started
 
@@ -113,32 +119,34 @@ command scans that directory. To scan one archive, pass its quoted path, for
 example `.\target\diag\victory.exe shaders "D:\My Game Dump\shaders.rpf"`.
 
 ```powershell
-.\target\diag\victory.exe shaders                         # scans game_dir in victory.toml
-target\diag\victory.exe warm --used                     # pipelines earlier runs drew with
+.\target\diag\victory.exe shaders       # scans game_dir in victory.toml
+.\target\diag\victory.exe warm --used   # pipelines earlier runs drew with
 ```
 
-Then play:
+Then play on the Series S profile, the one measured above:
 
 ```powershell
-scripts\play.ps1 -Exe <path of your copy's executable>
+scripts\play.ps1 -Exe <path of your copy's executable> -Console series-s
 ```
 
-`Play-VIctory.cmd -Exe <path>` does the same from a double-click or a Command Prompt.
+`Play-VIctory.cmd` takes the same options from a Command Prompt; on a double-click
+PowerShell asks for the executable's path.
 
 | Option | What it does |
 |---|---|
 | (none) | Full screen, Series X profile, settings picked for your graphics card |
 | **F11** or **Alt+Enter** | Switch between full screen and a window while it runs |
 | `-Windowed` | Start in a window |
-| `-Console series-s` | Run as a Series S: a smaller picture, lighter on the card, faster |
+| `-Console series-s` | Run as a Series S: a smaller picture, lighter on the card, faster; the profile measured above |
 | `-Machine 4090` / `7900xtx` | Force the settings for NVIDIA (measured on the RTX 4090) or AMD |
 | `-Safe` | Leave out the changes still on trial; try it first when something goes wrong |
-| `-RayTracing` | Turn the title's ray-traced indirect light on |
+| `-RayTracing` | Build the ray-traced structures, so the title's ray-traced indirect light runs |
 | `-Build release` | Run `target\release\victory.exe` (`cargo build --release --locked -p victory`) |
 
 Every `VICTORY_...` switch is described in a comment where the code reads it.
 More commands and debugging switches:
-[docs/README-fxceless.md](docs/README-fxceless.md) and [docs/findings.md](docs/findings.md).
+[docs/README-fxceless.md](docs/README-fxceless.md) and [docs/findings.md](docs/findings.md);
+recording one frame and running it again: [docs/replay.md](docs/replay.md).
 
 ## How this tree is built
 

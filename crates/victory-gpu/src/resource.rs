@@ -3011,9 +3011,13 @@ static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 
 
 /// The placed textures asked for with filler words set, as asked
 /// (address and description): for [`PLACED_TWINS`].
-#[cfg(windows)]
+#[cfg(all(windows, any(test, feature = "diagnostics")))]
 static PLACED_RAW: std::sync::Mutex<std::collections::BTreeSet<(u64, [u32; 14])>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Most variants [`PLACED_RAW`] keeps; past it the set starts over.
+#[cfg(all(windows, feature = "diagnostics"))]
+const PLACED_RAW_CAP: usize = 1 << 14;
 
 /// Placed textures asked for a second time with other filler words in
 /// their description: each was a second resource and host copy before the
@@ -3104,6 +3108,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     // that fills at world entry. They are not part of what a texture is.
     // `VICTORY_PLACED_FILLER=1`: kept in the key, as before.
     static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    #[cfg(feature = "diagnostics")]
     let raw = *desc;
     let mut key = *desc;
     if !*KEPT.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1")) {
@@ -3114,8 +3119,15 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     // How many resources the filler alone would have added (a count for
     // the log: `placed_filler_twins`).
+    // Only a diagnostics build reads the count, so only it keeps the variants,
+    // and not past a cap: every filler variant the title ever passed was a
+    // set entry (about 100 bytes each, 1M of them in a synthetic load test).
+    #[cfg(feature = "diagnostics")]
     if raw != key {
         let mut seen = PLACED_RAW.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.len() >= PLACED_RAW_CAP {
+            seen.clear();
+        }
         if seen.insert((address, raw)) {
             let others = seen.range((address, [0; 14])..=(address, [u32::MAX; 14])).filter(|(_, r)| {
                 let mut blank = *r;
@@ -4618,6 +4630,54 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(sweep_batch(&all, 4, 2).collect::<Vec<_>>(), [5]);
         all.remove(&5);
         assert_eq!(sweep_batch(&all, 4, 2).collect::<Vec<_>>(), [1, 3]);
+    }
+
+    /// Load test (`cargo test -p victory-gpu --lib --locked placed_filler_bookkeeping_load -- --ignored --nocapture`).
+    /// `texture_at` is asked a million times for placed memory whose resource
+    /// description differs only in the filler words 1 and 13. A buffer
+    /// description is used so that no host resource is needed: `texture_at`
+    /// notes the filler variants before it looks at the dimension.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "load test: about a million lookups"]
+    fn placed_filler_bookkeeping_load() {
+        use crate::loadprobe::{mix, private_bytes};
+        const N: u64 = 1_000_000;
+        let raw_len = || PLACED_RAW.lock().unwrap().len();
+        let map_len = || PLACED_TEXTURES.lock().unwrap().len();
+        let (r0, m0, p0) = (raw_len(), map_len(), private_bytes());
+        // Control: no filler, a million addresses.
+        for n in 0..N {
+            let desc = [BUFFER, 0, 0, 0, 0x1000, 0, 1, 0x10001, 0, 1, 0, 0, 0, 0];
+            texture_at(0x10_0000_0000 + n * 0x1000, &desc);
+        }
+        let control = (raw_len() - r0, map_len() - m0, private_bytes().saturating_sub(p0));
+        eprintln!("no filler, {N} addresses: PLACED_RAW +{}, PLACED_TEXTURES +{}, private +{} KiB", control.0, control.1, control.2 >> 10);
+        // Filler varies, one entry per address as when many resources are placed.
+        let (r1, p1) = (raw_len(), private_bytes());
+        let t = std::time::Instant::now();
+        for n in 0..N {
+            let desc = [BUFFER, mix(n), 0, 0, 0x1000, 0, 1, 0x10001, 0, 1, 0, 0, 0, mix(n + N)];
+            texture_at(0x20_0000_0000 + (n % 100_000) * 0x1000, &desc);
+        }
+        let filler = (raw_len() - r1, private_bytes().saturating_sub(p1));
+        eprintln!(
+            "filler varies, {N} asks at 100,000 addresses: PLACED_RAW +{}, private +{} KiB, {:?}",
+            filler.0,
+            filler.1 >> 10,
+            t.elapsed()
+        );
+        // One address, ever more filler variants: the cost of one ask.
+        for k in [2_000u64, 4_000, 8_000] {
+            let t = std::time::Instant::now();
+            for n in 0..k {
+                let desc = [BUFFER, mix(n + 9 * N), 0, 0, 0x1000, 0, 1, 0x10001, 0, 1, 0, 0, 0, mix(n + 10 * N)];
+                texture_at(0x30_0000_0000 + k * 0x10_0000, &desc);
+            }
+            eprintln!("one address, {k} variants: {:?}", t.elapsed());
+        }
+        assert_eq!(control.0, 0, "no filler, nothing noted");
+        assert!(filler.0 <= 1 << 16, "{} filler variants kept for a log counter", filler.0);
     }
 
     #[test]

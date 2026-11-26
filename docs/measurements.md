@@ -1,21 +1,23 @@
 # Measurements
 
-Build bc090416 (`cargo build --profile diag -p victory --features diagnostics`), 2026-11-26,
-on the test PC in the README. The benchmark used revision `7d62e536`.
-The only change between that revision and `bc090416` is in the README. Each session: `scripts\play.ps1` with the
-RTX 4090 settings, full screen, past the start screen into the prologue, then
-every minute a capture, the camera turned, a walk, and a route (run, turn,
-look around, step aside) with another capture.
+Build bc090416, 2026-11-26 (`cargo build --profile diag -p victory --features diagnostics`).
+On the test PC the README describes, with `scripts\play.ps1 -Console series-s`
+and the RTX 4090 settings, in full screen, played by hand: the prologue from the
+prison into the boat section, the boat driven to the package and along the
+marked route to an island, three failed attempts picked up again from a
+checkpoint (one of them skipped), and a capture every minute.
 
-Frame columns use recorded in-world samples with over 1,000 draws. Memory and card columns are samples every 20 s over the whole
-session, loading included.
+Frame columns are medians over the world lines (once a second, over 1,000
+draws a frame). Memory and card columns are samples every 20 s over the whole
+session, loading included. The GPU ms column reads near zero on this profile
+and is left out of conclusions (README, Known problems).
 
 | Profile | world lines | fps median | p10 | p90 | 1% low | ms/frame | preparing | copies ms / MB | textures ms / MB | GPU ms | copying back ms / MB | draws | dropped draws | captures |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| Series S | 98 | 21.5 | 18.4 | 24.0 | 7.0 | 46.5 | 32.3 | 12.4 / 82.0 | 0.5 / 31.1 | 0.1 | 12.3 / 29.5 | 3830.5 | 78.0 | 41 |
+| Series S | 349 | 21.1 | 19.1 | 23.2 | 17.0 | 47.3 | 33.7 | 13.3 / 86.8 | 0.6 / 31.0 | 0.3 | 12.6 / 29.9 | 4446.0 | 98.0 | 183 |
 
 | Profile | samples | game memory median / max (GB) | working set max (GB) | card memory max (GB) | card load median (%) | power median (W) | temperature max (C) | clock median (MHz) | CPU seconds per minute |
 |---|---|---|---|---|---|---|---|---|---|
-| Series S | 31 | 26.4 / 27.9 | 29.6 | 11.6 | 85.0 | 134.2 | 59.4 | 2760.0 | 532 |
+| Series S | 94 | 23.5 / 24.1 | 27.4 | 8.8 | 86.0 | 134.5 | 49.6 | 2760.0 | 624 |
 
 CPU seconds per minute: the game's CPU time over all its threads; 60 is one core busy all the time.

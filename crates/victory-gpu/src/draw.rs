@@ -24,6 +24,9 @@ use crate::host::HostList;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
+#[cfg(feature = "diagnostics")]
+pub(crate) mod rtv_trace;
+
 /// Shader interface metadata shared by every pipeline variant and draw.
 pub(crate) struct TablePlan {
     groups: Vec<TableGroup>,
@@ -431,6 +434,8 @@ pub(crate) struct State {
     /// it has any ([`State::set_targets`]): per view the host texture (0:
     /// a null view) and what its descriptor says.
     host_targets: Option<(Vec<TargetKey>, Option<TargetKey>)>,
+    #[cfg(feature = "diagnostics")]
+    bound_rtv_formats: [(i32, bool); 8],
     viewports: Vec<D3D12_VIEWPORT>,
     scissors: Vec<RECT>,
     blend: Option<[f32; 4]>,
@@ -1192,6 +1197,10 @@ impl State {
             return;
         }
         self.host_targets = Some(now);
+        #[cfg(feature = "diagnostics")]
+        if rtv_trace::enabled() {
+            self.bound_rtv_formats = rtv_trace::bound_formats(&views);
+        }
         let rtvs: Vec<_> = views.iter().map(|(texture, desc)| host.rtv(*texture, desc.as_ref())).collect();
         let dsv = dsv.map(|(texture, record)| host.dsv(texture, record.depth_desc().as_ref()));
         // SAFETY: an open list; the views were just made.
@@ -4201,6 +4210,10 @@ impl State {
     /// A draw with the pipeline `p` was recorded (as [`State::buffers_written`]
     /// if its shaders can store to buffers).
     fn drew(&mut self, list: &HostList, p: Option<&HostPipeline>) {
+        #[cfg(feature = "diagnostics")]
+        if let Some((key, declared)) = p.and_then(|p| p.traced_targets.as_ref()) {
+            rtv_trace::check(key, declared, &self.bound_rtv_formats);
+        }
         if p.is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores)) {
             self.batch = None;
         }

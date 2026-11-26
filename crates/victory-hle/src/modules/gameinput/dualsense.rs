@@ -1,17 +1,19 @@
 //! PlayStation 5 pads (DualSense, DualSense Edge) read straight from HID:
 //! they are not XInput devices, so without a remapper (Steam Input,
-//! DS4Windows) XInput never lists them. USB and Bluetooth both work. A scan
+//! DS4Windows) XInput never lists them. Reports can be USB or Bluetooth. A scan
 //! thread looks for new pads every [`SCAN`]; each pad has a reader thread
-//! that keeps its latest state until the pad goes away. `VICTORY_DUALSENSE=0`
-//! leaves them alone (a remapper already shows them as XInput pads).
+//! that keeps its latest state until the pad goes away. By default XInput
+//! has priority over HID, since a remapper can present the same pad twice.
 
 use super::{
     A, B, DOWN, LEFT, LEFT_SHOULDER, LEFT_STICK, MENU, PadState, RIGHT, RIGHT_SHOULDER,
     RIGHT_STICK, UP, VIEW, X, Y,
 };
 
+#[cfg(windows)]
 const SONY: u16 = 0x054C;
 /// DualSense, DualSense Edge.
+#[cfg(windows)]
 const PRODUCTS: [u16; 2] = [0x0CE6, 0x0DF2];
 
 /// The D-pad hat (low nibble of the first button byte): 0 up, clockwise in
@@ -82,8 +84,63 @@ pub(super) fn parse(report: &[u8], bluetooth: bool) -> Option<PadState> {
 #[cfg(windows)]
 pub(super) use host::pads;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Mode {
+    Off,
+    Auto,
+    Both,
+}
+
+#[cfg(windows)]
+pub(super) fn mode() -> Mode {
+    static MODE: std::sync::LazyLock<Mode> =
+        std::sync::LazyLock::new(|| match std::env::var("VICTORY_DUALSENSE").as_deref() {
+            Ok("0") => Mode::Off,
+            Ok("1") => Mode::Both,
+            _ => Mode::Auto,
+        });
+    *MODE
+}
+
+/// XInput does not identify the corresponding physical HID device. Prefer
+/// it in automatic mode. If both sources are requested, retain the slot of
+/// every connected HID pad unless that slot has been claimed by XInput.
+pub(super) fn slots(
+    mode: Mode,
+    mut xinput: [Option<PadState>; super::PADS],
+    assigned: &mut [Option<u64>; super::PADS],
+    hid: impl FnOnce() -> Vec<(u64, PadState)>,
+) -> [Option<PadState>; super::PADS] {
+    if mode == Mode::Off || mode == Mode::Auto && xinput.iter().any(Option::is_some) {
+        assigned.fill(None);
+        return xinput;
+    }
+    let pads = hid();
+    for (slot, owner) in xinput.iter_mut().zip(assigned.iter_mut()) {
+        if slot.is_none()
+            && let Some((_, state)) = pads.iter().find(|(id, _)| Some(*id) == *owner)
+        {
+            *slot = Some(*state);
+        } else {
+            *owner = None;
+        }
+    }
+    for (id, state) in pads {
+        if assigned.contains(&Some(id)) {
+            continue;
+        }
+        let Some(slot) = xinput.iter().position(Option::is_none) else {
+            break;
+        };
+        xinput[slot] = Some(state);
+        assigned[slot] = Some(id);
+    }
+    xinput
+}
+
 #[cfg(windows)]
 mod host {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{LazyLock, Mutex, PoisonError};
     use std::time::Duration;
 
@@ -108,6 +165,7 @@ mod host {
     const SCAN: Duration = Duration::from_secs(2);
 
     struct Pad {
+        id: u64,
         path: Vec<u16>,
         /// `None` until the first report.
         state: Option<PadState>,
@@ -122,23 +180,20 @@ mod host {
 
     /// The connected pads' latest states, oldest connection first; the first
     /// call starts looking for them.
-    pub(in super::super) fn pads() -> Vec<PadState> {
-        static STARTED: LazyLock<bool> = LazyLock::new(|| {
-            let on = std::env::var_os("VICTORY_DUALSENSE").is_none_or(|v| v != "0");
-            if on {
-                std::thread::spawn(|| {
-                    loop {
-                        scan();
-                        std::thread::sleep(SCAN);
-                    }
-                });
-            }
-            on
+    pub(in super::super) fn pads() -> Vec<(u64, PadState)> {
+        static STARTED: LazyLock<()> = LazyLock::new(|| {
+            std::thread::spawn(|| {
+                loop {
+                    scan();
+                    std::thread::sleep(SCAN);
+                }
+            });
         });
-        if !*STARTED {
-            return Vec::new();
-        }
-        lock().iter().filter_map(|pad| pad.state).collect()
+        LazyLock::force(&STARTED);
+        lock()
+            .iter()
+            .filter_map(|pad| Some((pad.id, pad.state?)))
+            .collect()
     }
 
     /// Opens the pads not open yet, each with a reader thread.
@@ -164,17 +219,26 @@ mod host {
             feature[0] = 0x05;
             // SAFETY: the buffer is as long as we say.
             unsafe { HidD_GetFeature(handle, feature.as_mut_ptr().cast(), feature.len() as u32) };
+            static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
             lock().push(Pad {
-                path: path.clone(),
+                id,
+                path,
                 state: None,
             });
-            let handle = handle as usize;
-            std::thread::spawn(move || read(handle as HANDLE, path, bluetooth));
+            let raw = handle as usize;
+            if let Err(error) = std::thread::Builder::new()
+                .name("DualSense reader".into())
+                .spawn(move || read(raw as HANDLE, id, bluetooth))
+            {
+                remove(handle, id);
+                tracing::warn!(%error, "could not start a DualSense reader");
+            }
         }
     }
 
     /// Reads reports until the pad goes away, then forgets it.
-    fn read(handle: HANDLE, path: Vec<u16>, bluetooth: bool) {
+    fn read(handle: HANDLE, id: u64, bluetooth: bool) {
         let mut report = [0u8; 128];
         loop {
             let mut got = 0;
@@ -188,20 +252,24 @@ mod host {
                     std::ptr::null_mut(),
                 )
             };
-            if ok == 0 {
+            if ok == 0 || got == 0 {
                 break;
             }
             if let Some(state) = parse(&report[..got as usize], bluetooth) {
                 let mut pads = lock();
-                if let Some(pad) = pads.iter_mut().find(|pad| pad.path == path) {
+                if let Some(pad) = pads.iter_mut().find(|pad| pad.id == id) {
                     pad.state = Some(state);
                 }
             }
         }
         tracing::info!("DualSense disconnected");
-        lock().retain(|pad| pad.path != path);
+        remove(handle, id);
+    }
+
+    fn remove(handle: HANDLE, id: u64) {
         // SAFETY: ours, and nothing uses it any more.
         unsafe { CloseHandle(handle) };
+        lock().retain(|pad| pad.id != id);
     }
 
     /// The pad at `path` opened for reading, `None` when it is something else
@@ -313,6 +381,70 @@ mod host {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_input_prefers_the_remapper_in_any_slot_and_falls_back_to_hid() {
+        let physical = PadState {
+            buttons: A,
+            ..PadState::default()
+        };
+        let remapped = PadState {
+            buttons: Y,
+            ..PadState::default()
+        };
+        let mut assigned = [None; super::super::PADS];
+        let none = [None; super::super::PADS];
+        let xinput = [None, None, Some(remapped), None];
+
+        assert_eq!(
+            slots(Mode::Auto, none, &mut assigned, || vec![(1, physical)])[0],
+            Some(physical)
+        );
+        assert_eq!(
+            slots(Mode::Auto, xinput, &mut assigned, || panic!(
+                "HID not needed"
+            )),
+            xinput
+        );
+        assert_eq!(
+            slots(Mode::Off, none, &mut assigned, || panic!("HID disabled")),
+            none
+        );
+        assert_eq!(
+            slots(Mode::Auto, none, &mut assigned, || vec![(2, physical)])[0],
+            Some(physical)
+        );
+    }
+
+    #[test]
+    fn a_surviving_hid_pad_keeps_its_slot_through_disconnect_and_reconnect() {
+        let a = PadState {
+            buttons: A,
+            ..PadState::default()
+        };
+        let b = PadState {
+            buttons: B,
+            ..PadState::default()
+        };
+        let x = PadState {
+            buttons: X,
+            ..PadState::default()
+        };
+        let xinput = [None, Some(x), None, None];
+        let mut assigned = [None; super::super::PADS];
+        assert_eq!(
+            slots(Mode::Both, xinput, &mut assigned, || vec![(7, a), (8, b)]),
+            [Some(a), Some(x), Some(b), None]
+        );
+        assert_eq!(
+            slots(Mode::Both, xinput, &mut assigned, || vec![(8, b)]),
+            [None, Some(x), Some(b), None]
+        );
+        assert_eq!(
+            slots(Mode::Both, xinput, &mut assigned, || vec![(8, b), (9, a)]),
+            [Some(a), Some(x), Some(b), None]
+        );
+    }
 
     #[test]
     fn a_usb_report_reads_as_a_pad() {

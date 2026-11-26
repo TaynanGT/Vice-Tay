@@ -1,6 +1,6 @@
 //! `gameinput.dll`: input devices from the host. Gamepads come from XInput
-//! (host slots 0-3), PS5 pads ([`dualsense`]) taking the slots XInput leaves
-//! empty; while none is connected, the keyboard drives one
+//! (host slots 0-3), with PS5 HID input when XInput reports no pads or both
+//! sources are explicitly requested. With no pad the keyboard drives one
 //! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
 //! too. A poll thread turns host state into readings (a new one per change)
 //! and runs device callbacks on connect and disconnect.
@@ -22,6 +22,7 @@ use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
 
+#[cfg(any(windows, test))]
 mod dualsense;
 
 /// The documented errors.
@@ -1185,8 +1186,9 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
-        /// The PS5 pads' states, taken when slot 0 is read.
-        dualsense: Vec<PadState>,
+        /// The input snapshot for this poll and the HID connection owning each slot.
+        pads: [Option<PadState>; PADS],
+        hid_slots: [Option<u64>; PADS],
     }
 
     impl Host {
@@ -1203,21 +1205,20 @@ mod host {
             self.empty_until[slot] = None;
             Some(convert(&state.Gamepad))
         }
-
-        /// The PS5 pad for a slot XInput has left empty: the first such slot
-        /// gets the first pad, and so on.
-        fn dualsense(&self, slot: usize) -> Option<PadState> {
-            let before = (0..slot).filter(|&s| self.empty_until[s].is_some()).count();
-            self.dualsense.get(before).copied()
-        }
     }
 
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
             if slot == 0 {
-                self.dualsense = super::dualsense::pads();
+                let xinput = std::array::from_fn(|slot| self.xinput(slot));
+                self.pads = super::dualsense::slots(
+                    super::dualsense::mode(),
+                    xinput,
+                    &mut self.hid_slots,
+                    super::dualsense::pads,
+                );
             }
-            let mut pad = self.xinput(slot).or_else(|| self.dualsense(slot))?;
+            let mut pad = self.pads[slot]?;
             // The scripted keys (`VICTORY_KEYS_FILE` and `VICTORY_KEYS`)
             // also press the first pad's buttons, by the stand-in pad's
             // table: with a real pad connected the stand-in is not there,

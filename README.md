@@ -16,11 +16,11 @@ down), itself [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory
 with work for NVIDIA cards on top. Our fixes come over in batches; what each one
 changes is in [docs/this-fork.md](docs/this-fork.md).
 
-## Prison gameplay test (maintainer report)
+## Prison gameplay on the RTX 4090
 
-On the PC below, I observed **20–25 fps** while walking through the prison and
-navigating the in-game menus. I ended the session manually after **31 minutes
-and 22 seconds**, with no crashes.
+I ran a **31-minute, 22-second** gameplay test on the RTX 4090, walking through
+the prison and navigating the in-game menus. I observed **20–25 FPS** and ended
+the session manually without a crash.
 
 ### Test PC
 

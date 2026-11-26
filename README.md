@@ -16,18 +16,39 @@ down), itself [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory
 with work for NVIDIA cards on top. Our fixes come over in batches; what each one
 changes is in [docs/this-fork.md](docs/this-fork.md).
 
-## Where it stands (2026-11-26, RTX 4090, Series X profile, 3840x2160)
+## Prison gameplay test (maintainer report)
+
+On the PC below, I observed **20–25 fps** while walking through the prison and
+navigating the in-game menus. I ended the session manually after **31 minutes
+and 22 seconds**, with no crashes.
+
+### Test PC
+
+| Component | Configuration |
+| --- | --- |
+| CPU | AMD Ryzen 9 9950X3D, 16 cores and 32 threads |
+| Motherboard | MSI MAG X870 TOMAHAWK WIFI (MS-7E51), revision 1.0 |
+| BIOS | MSI 1.A93 |
+| GPU | NVIDIA GeForce RTX 4090, 24 GB GDDR6X |
+| NVIDIA driver | 621.40 |
+| Integrated graphics | AMD Radeon Graphics |
+| RAM | 48 GiB DDR5 (2 × 24 GiB), configured at 8,000 MT/s |
+| System SSD | Samsung 990 PRO 4 TB NVMe |
+| Additional SSDs | Samsung 990 PRO 2 TB NVMe and Samsung 970 PRO 1 TB NVMe |
+| Monitor | Samsung Odyssey OLED G8 (G81SF), 3840 × 2160, 240 Hz |
+| OS | Windows 11 Pro 26H2 x64, build 26300.10075 |
+
+## Earlier Series X measurements (2026-11-26, 3840 × 2160)
 
 | | |
 |---|---|
 | Menus, videos, loading screens | 30 fps |
 | Prologue, indoors and the yard | 12-15 fps (median 12.9-13.2 over 6-8 minute sessions) |
 | A frame in the world | about 75-80 ms: 38-44 ms on the GPU, about 28 ms preparing (12.6 ms of copies, ~105 MB), 23-25 ms copying back |
-| Longest sessions | 8-10 minutes in the world, no crash, the character and camera answering every minute |
+| Stability runs | 8-10 minutes in the world, no crash, the character and camera answering every minute |
 | Memory | about 37 GB of private memory: 48 GB of RAM with a large page file works |
 
-Those runs had builds and tests going on the same PC, so they read low; clean
-measurements will replace them.
+These earlier runs shared the PC with concurrent builds and tests.
 
 What is known to be wrong:
 

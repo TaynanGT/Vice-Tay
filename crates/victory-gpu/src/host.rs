@@ -565,6 +565,39 @@ pub(crate) fn submissions() -> (u64, u64) {
     (STARTED.load(Ordering::Acquire), FINISHED.load(Ordering::Acquire))
 }
 
+fn insert_retired(queue: &mut VecDeque<(u64, Retired)>, entry: (u64, Retired)) {
+    if queue.back().is_none_or(|(at, _)| *at <= entry.0) {
+        queue.push_back(entry);
+    } else {
+        let index = queue.partition_point(|(at, _)| *at <= entry.0);
+        queue.insert(index, entry);
+    }
+}
+
+/// Keep each shard ordered by the original submission stamp. A worker can
+/// hand off an older batch after that shard has already received newer entries.
+fn merge_retired_batch(queue: &mut VecDeque<(u64, Retired)>, batch: &mut Vec<(u64, Retired)>) {
+    if batch.is_empty() {
+        return;
+    }
+    batch.sort_by_key(|(at, _)| *at);
+    let oldest = batch[0].0;
+    if queue.back().is_none_or(|(at, _)| *at <= oldest) {
+        queue.extend(batch.drain(..));
+        return;
+    }
+
+    let index = queue.partition_point(|(at, _)| *at <= oldest);
+    let mut tail = queue.split_off(index).into_iter().peekable();
+    for entry in batch.drain(..) {
+        while tail.peek().is_some_and(|(at, _)| *at <= entry.0) {
+            queue.push_back(tail.next().unwrap());
+        }
+        queue.push_back(entry);
+    }
+    queue.extend(tail);
+}
+
 /// Drops `object` once every submission running now has finished: at once
 /// if none is.
 pub(crate) fn retire<T: 'static>(object: T) {
@@ -577,7 +610,7 @@ pub(crate) fn retire<T: 'static>(object: T) {
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    retired().push_back((started, Retired::Any(Box::new(object))));
+    insert_retired(&mut retired(), (started, Retired::Any(Box::new(object))));
 }
 
 /// Whether list-translation worker threads accumulate retired `ID3D12Resource`s
@@ -615,7 +648,7 @@ fn retire_resource_with(object: ID3D12Resource, batch_on: bool) {
         // Flush any buffered entries left over if toggled off mid-run.
         flush_retired();
         if let Some(back) = entry {
-            retired().push_back(back);
+            insert_retired(&mut retired(), back);
         }
         return;
     }
@@ -626,12 +659,12 @@ fn retire_resource_with(object: ID3D12Resource, batch_on: bool) {
         into_batch(target, taken, BATCH_MOST)
     });
     match flush {
-        Ok(Err(back)) => retired().push_back(back),
+        Ok(Err(back)) => insert_retired(&mut retired(), back),
         Ok(Ok(true)) => flush_retired(),
         Ok(Ok(false)) => {}
         Err(_) => {
             if let Some(back) = entry {
-                retired().push_back(back);
+                insert_retired(&mut retired(), back);
             }
         }
     }
@@ -665,7 +698,7 @@ struct RetiredBatch {
 impl Drop for RetiredBatch {
     fn drop(&mut self) {
         if !self.entries.is_empty() {
-            retired().extend(self.entries.drain(..));
+            merge_retired_batch(&mut retired(), &mut self.entries);
         }
     }
 }
@@ -685,8 +718,7 @@ thread_local! {
 /// Worker threads translating command lists retire thousands of replaced view
 /// resources per frame; accumulating up to [`BATCH_MOST`] items and flushing
 /// at recording boundaries amortizes lock acquisitions on [`RETIRED`] while
-/// preserving retirement ordering (an entry handed over later can only be
-/// dropped later, never sooner).
+/// preserving the stamp that determines when each resource can be released.
 pub(crate) fn retire_in_batches() {
     let _ = BATCH.try_with(|b| {
         let mut guard = b.borrow_mut();
@@ -706,7 +738,7 @@ pub(crate) fn flush_retired() {
     let _ = BATCH.try_with(|b| {
         let mut guard = b.borrow_mut();
         if !guard.entries.is_empty() {
-            retired().extend(guard.entries.drain(..));
+            merge_retired_batch(&mut retired(), &mut guard.entries);
         }
     });
 }
@@ -714,6 +746,27 @@ pub(crate) fn flush_retired() {
 #[cfg(test)]
 mod retire_batch_tests {
     use super::*;
+
+    #[test]
+    fn a_late_batch_does_not_hide_eligible_retirements() {
+        let item = |stamp| (stamp, Retired::Any(Box::new(())));
+        let mut queue = VecDeque::new();
+        insert_retired(&mut queue, item(10));
+        insert_retired(&mut queue, item(14));
+        insert_retired(&mut queue, item(9));
+
+        let mut pending = vec![item(13), item(8), item(12)];
+        merge_retired_batch(&mut queue, &mut pending);
+
+        assert!(pending.is_empty());
+        let stamps = queue.iter().map(|(stamp, _)| *stamp).collect::<Vec<_>>();
+        assert_eq!(stamps, [8, 9, 10, 12, 13, 14]);
+        assert_eq!(queue.iter().take_while(|(stamp, _)| *stamp <= 10).count(), 3);
+
+        pending.push(item(16));
+        merge_retired_batch(&mut queue, &mut pending);
+        assert_eq!(queue.back().unwrap().0, 16);
+    }
 
     #[test]
     fn batch_retire_switch_defaults_off_and_accepts_only_one() {
@@ -889,9 +942,7 @@ fn bury_lag() -> u64 {
     })
 }
 
-/// Drops what waited for submissions up to `finished` ([`bury_lag`]). The
-/// numbers come in order, but for threads that overtake each other: one of
-/// those is dropped a little later than it could be.
+/// Drops the eligible prefix of each stamp-ordered retirement shard.
 fn bury(finished: u64) {
     let finished = finished.saturating_sub(bury_lag());
     for part in &RETIRED {

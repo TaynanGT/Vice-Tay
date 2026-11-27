@@ -11,8 +11,9 @@
 # -Fsr4K        PC FidelityFX at 3840x2160 (quality, balanced or performance)
 # -Dlss4K       NVIDIA DLSS at 3840x2160 (quality, balanced or performance); FSR if it cannot start
 # -Build        target\diag (the default, the build all measurements are of) or target\release
-# -Machine      auto (the default: by the graphics card), 7900xtx, 4070, 4090 or laptop
-#               (laptop: an NVIDIA PC with 16 GB of RAM and a 6-8 GB card, docs/laptop-16gb.md)
+# -Machine      auto (the default: by the graphics card), 7900xtx, 4070, 4090, 4060 or laptop
+#               (4060: Ryzen 9 7900X / RTX 4060 8 GB / 16 GB RAM;
+#                laptop: an NVIDIA PC with 16 GB of RAM and a 6-8 GB card, docs/laptop-16gb.md)
 # -More         other settings: -More @{VICTORY_PANEL='1'} or -More @{VICTORY_AMBIENT='1.0'}
 # On a smaller NVIDIA PC, compare the same Series S scene after a fresh start
 # with one override at a time, e.g. -More @{VICTORY_LAND_THREADS='3'} for
@@ -32,7 +33,7 @@ param(
     [ValidateSet('quality', 'balanced', 'performance')][string]$Fsr4K,
     [ValidateSet('quality', 'balanced', 'performance')][string]$Dlss4K,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
-    [ValidateSet('auto', '7900xtx', '4070', '4090', 'laptop')][string]$Machine = 'auto',
+    [ValidateSet('auto', '7900xtx', '4070', '4090', '4060', 'laptop')][string]$Machine = 'auto',
     [hashtable]$More = @{}
 )
 $settings = @{
@@ -96,6 +97,29 @@ if ($Machine -eq '4070') {
         $settings.VICTORY_CARD_WINDOWS_MB = '1024'
     }
 }
+if ($Machine -eq '4060') {
+    # Ryzen 9 7900X (12C/24T), RTX 4060 (8 GB VRAM, 7188 MiB DXGI budget, ReBAR), 16 GB RAM:
+    # Retain 16 GB RAM safeguards from `laptop`, scale worker threads for 12C/24T,
+    # and raise BAR/buffer budgets slightly for 8 GB VRAM headroom.
+    $settings.VICTORY_THIN_THREADS = '10'; $settings.VICTORY_UNDER_THREADS = '6'; $settings.VICTORY_LAND_THREADS = '6'
+    $settings.VICTORY_MAP_THREADS = '1'; $settings.VICTORY_PIPELINE_WORKERS = '4'
+    $settings.VICTORY_DSTORAGE_IO = 'direct'; $settings.VICTORY_INPLACE = '2'
+    $settings.VICTORY_WINDOW_KB = '64'; $settings.VICTORY_WINDOW_TAILS = '1'
+    $settings.VICTORY_WINDOWS_BAR_MB = '3584'; $settings.VICTORY_CARD_BUFFERS_MB = '512'
+    $settings.VICTORY_LEVELS_ON_DEMAND = '1'
+    if (-not $Safe) {
+        $settings.VICTORY_CARD_RESERVE_BUDGETS = '1'
+        $settings.VICTORY_CARD_BUFFERS_MIN_KB = '64'
+        $settings.VICTORY_PORT_GUARD = '1'
+        $settings.VICTORY_PORT_JOURNAL = '1'
+        $settings.VICTORY_ASK_SPREAD = '1'
+        $settings.VICTORY_SYNC_FINE = '1'
+    }
+    if ($ram) {
+        $settings.VICTORY_WORKING_SET_MB = [string][math]::Max(3072, [int64]($ram / 1MB) - 11624)
+    }
+    $settings.VICTORY_OUTPUT = '1920x1080'; $settings.VICTORY_UPSCALER = '6'; $settings.VICTORY_RENDER_SCALE = '0.5'
+}
 if ($Machine -eq 'laptop') {
     # i7-13700H, RTX 3050 6 GB Laptop GPU, 16 GB (docs/laptop-16gb.md); asked for explicitly,
     # the measurements cover that one machine. On top of the NVIDIA settings above, which the
@@ -145,7 +169,7 @@ if ($Dlss4K) { $settings.VICTORY_DLSS_4K = $Dlss4K.ToLowerInvariant() }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
 Write-Host "Settings for the $Machine$(if ($Safe) { ', safe' })$(if ($RayTracing) { ', with ray tracing' })."
-if ($Console -eq 'series-s' -and $Machine -in '4090', 'laptop') {
+if ($Console -eq 'series-s' -and $Machine -in '4090', '4060', 'laptop') {
     Write-Host ("Series S requests {0} list translation threads, {1} for memory updates, and {2} for landing." -f
         $settings.VICTORY_THIN_THREADS, $settings.VICTORY_UNDER_THREADS, $settings.VICTORY_LAND_THREADS)
 }

@@ -4659,15 +4659,37 @@ fn read_backs(list: &HostList, scratch: &mut crate::texback::Scratch) {
     if !deferred.texture_backs.is_empty() {
         #[cfg(feature = "diagnostics")]
         let began = std::time::Instant::now();
-        for back in &deferred.texture_backs {
-            crate::texback::land(back, scratch);
-        }
+        let backs: Vec<&crate::texback::Back> = deferred.texture_backs.iter().collect();
+        crate::texback::land_many(&backs, scratch);
         #[cfg(feature = "diagnostics")]
         {
             crate::land::spent(crate::land::stat::TEXTURE_READBACK_US, began);
             crate::land::count(crate::land::stat::TEXTURE_READBACKS, deferred.texture_backs.len() as u64);
         }
     }
+    read_backs_buffers(&deferred);
+}
+
+fn read_flight_backs(flight: &Flight, texture_scratch: &mut crate::texback::Scratch) {
+    let guards: Vec<_> = flight.lists.iter().map(|l| l.host().deferred()).collect();
+    let texture_backs: Vec<&crate::texback::Back> =
+        flight.order.iter().flat_map(|&i| guards[i].texture_backs.iter()).collect();
+    if !texture_backs.is_empty() {
+        #[cfg(feature = "diagnostics")]
+        let began = std::time::Instant::now();
+        crate::texback::land_many(&texture_backs, texture_scratch);
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::land::spent(crate::land::stat::TEXTURE_READBACK_US, began);
+            crate::land::count(crate::land::stat::TEXTURE_READBACKS, texture_backs.len() as u64);
+        }
+    }
+    for &i in &flight.order {
+        read_backs_buffers(&guards[i]);
+    }
+}
+
+fn read_backs_buffers(deferred: &Deferred) {
     #[cfg(feature = "diagnostics")]
     let began = (!deferred.backs.is_empty()).then(std::time::Instant::now);
     for (buffer, at, [row, rows, pitch]) in &deferred.backs {
@@ -5763,9 +5785,7 @@ impl Host {
             telling = match item {
                 Late::Run(mut flight) => {
                     last = flight.number;
-                    for &i in &flight.order {
-                        read_backs(flight.lists[i].host(), texture_scratch);
-                    }
+                    read_flight_backs(&flight, texture_scratch);
                     if let Some(card) = flight.card {
                         self.card_done(card);
                     }
@@ -6250,9 +6270,7 @@ impl Host {
                 match item {
                     Late::Run(mut flight) => {
                         last = flight.number;
-                        for &i in &flight.order {
-                            read_backs(flight.lists[i].host(), &mut texture_scratch);
-                        }
+                        read_flight_backs(&flight, &mut texture_scratch);
                         if let Some(card) = flight.card {
                             self.card_done(card);
                         }
@@ -8665,7 +8683,7 @@ struct Batch {
     index: ByCopy<usize>,
     /// Staging buffers (by address) refreshed since the last title write,
     /// or due to be.
-    textures: std::collections::HashSet<usize>,
+    textures: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Those due ([`Batch::refresh_textures`]).
     due: Vec<std::sync::Arc<crate::texture::Staging>>,
     /// What copies at their place in the submission's lists put into title
@@ -8676,6 +8694,9 @@ struct Batch {
     /// Copies (by address) brought up to date ahead of the steps, and the
     /// range (from, to) ([`Batch::refresh_ahead`]).
     ahead: ByCopy<(usize, usize)>,
+    /// Single-entry cache for the most recent `ahead` hit (`(key, from, to)`),
+    /// skipping hash lookups on consecutive `Step::Refresh` entries for the same buffer.
+    last_ahead: (usize, usize, usize),
     /// `ahead` holds everything the submission refreshes
     /// ([`Batch::refresh_front`]).
     front: bool,
@@ -8761,7 +8782,7 @@ fn front_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize)>
 
 /// Steps of a submission's lists from which [`Batch::refresh_front`] makes
 /// each list's part beside the submitting thread (renderer port #6).
-const WIDE_PLAN_STEPS: usize = 4096;
+const WIDE_PLAN_STEPS: usize = 1024;
 
 /// One list's part of [`front_spans`] (renderer port #6, [`list_front`]).
 #[derive(Default)]
@@ -9073,8 +9094,14 @@ impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
-        if self.ahead.get(&key).is_some_and(|&(from, to)| from <= address && end <= to) {
+        if self.last_ahead.0 == key && self.last_ahead.1 <= address && end <= self.last_ahead.2 {
             return;
+        }
+        if let Some(&(from, to)) = self.ahead.get(&key) {
+            self.last_ahead = (key, from, to);
+            if from <= address && end <= to {
+                return;
+            }
         }
         match self.index.get(&key) {
             Some(&at) => {
@@ -9093,10 +9120,14 @@ impl Batch {
     fn flush_one(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>) {
         // From here on it is refreshed around what the shaders write. (What
         // is in front of all the steps was, up to here.)
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
         if !self.front {
-            self.ahead.remove(&(std::sync::Arc::as_ptr(shadow) as usize));
+            self.ahead.remove(&key);
+            if self.last_ahead.0 == key {
+                self.last_ahead = (0, 0, 0);
+            }
         }
-        let Some(at) = self.index.remove(&(std::sync::Arc::as_ptr(shadow) as usize)) else {
+        let Some(at) = self.index.remove(&key) else {
             return;
         };
         let (shadow, from, to) = self.refreshes.swap_remove(at);
@@ -9141,6 +9172,7 @@ impl Batch {
     fn title_written(&mut self, write: TitleWrite) {
         self.flush(Some(write));
         self.ahead.clear();
+        self.last_ahead = (0, 0, 0);
         self.textures.clear();
     }
 
@@ -9189,7 +9221,7 @@ impl Batch {
             return;
         }
         let mut copies: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
-        let mut touches = Vec::new();
+        let mut touches = Vec::with_capacity(steps);
         for (n, list) in runs.iter().enumerate() {
             if parts.contains(&n) {
                 touches.push(Touch::Part);

@@ -19,13 +19,19 @@ Vice-Tay builds on [VIctory](https://github.com/Marvisak/VIctory) to run an Xbox
    .\target\diag\victory.exe warm --used
    ```
 
-2. Run the Series S profile with `-Machine 4060` (and compare against `main` with `-Machine laptop` on the same scene/route using [`scripts/measure-frames.ps1`](scripts/measure-frames.ps1)):
+2. **First A/B pair (code changes only, identical launch settings):** Compare `main` vs `exp/perf-4060-16gb` using the same `-Machine laptop` settings, warmed cache, and matched indoor/boat scenes:
+
+   ```powershell
+   .\scripts\play.ps1 -Exe 'D:\victory-data\game\game.exe' -Console series-s -Machine laptop
+   ```
+
+3. **Second A/B pair (`-Machine 4060` preset on `exp/perf-4060-16gb`):** Compare `-Machine laptop` vs `-Machine 4060` on the same branch to isolate the memory-budget, worker-count, and `VICTORY_PORT_*` preset changes:
 
    ```powershell
    .\scripts\play.ps1 -Exe 'D:\victory-data\game\game.exe' -Console series-s -Machine 4060
    ```
 
-   For DLSS + 2× FSR Frame Generation, pass `-Dlss quality -FrameGen` with `VICTORY_DLSS_DIR` and `VICTORY_FFX_FG_DIR` set. Record rendered FPS separately from `FG OUTPUT FPS` and report results in [Issue #1](https://github.com/swam122yam-glitch/Vice-Tay/issues/1).
+   Record rendered frame times ([`scripts/measure-frames.ps1`](scripts/measure-frames.ps1)), peak private bytes, shared GPU memory, and matched indoor/boat screenshots (keeping `-Dlss`/`-FrameGen` separate from native rendered FPS). Report results in [Issue #1](https://github.com/swam122yam-glitch/Vice-Tay/issues/1).
 
 ## Measurements
 

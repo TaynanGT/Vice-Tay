@@ -270,7 +270,7 @@ try {
     Write-Warning "Could not read the Vice-Tay executable checksum: $($_.Exception.Message)"
 }
 # (Other settings left over in this window go; where your files are stays.)
-$paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_FIDELITYFX_DIR', 'VICTORY_FFX_FG_DIR', 'VICTORY_DLSS_DIR'
+$paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_FIDELITYFX_DIR', 'VICTORY_FFX_FG_DIR', 'VICTORY_DLSS_DIR', 'VICTORY_BCPACK_TABLES'
 $inherited = @(Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $paths })
 foreach ($entry in $inherited) { Remove-Item "Env:$($entry.Name)" }
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
@@ -316,4 +316,6 @@ try {
         if ($LASTEXITCODE -ne 0) { Write-Host "victory warm ended with exit code $LASTEXITCODE; starting anyway." }
     }
     & $victory run $Exe --console $Console --execute
+    $runtimeExitCode = $LASTEXITCODE
 } finally { Pop-Location }
+exit $runtimeExitCode

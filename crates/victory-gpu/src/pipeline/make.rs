@@ -472,15 +472,8 @@ const MAKING: u8 = 3;
 /// the first minute and a half of the world ran at 0.5 to 1.6 s a frame,
 /// dropping up to 2,900 draws a frame (run shaders-1).
 /// `VICTORY_PIPELINE_SLOW=0`: in the order the title creates them, as before.
-fn slow_limit() -> usize {
-    static LIMIT: OnceLock<usize> = OnceLock::new();
-    *LIMIT.get_or_init(|| {
-        if std::env::var_os("VICTORY_PIPELINE_SLOW").is_some_and(|v| v == "0") {
-            usize::MAX
-        } else {
-            (worker_count(None, std::thread::available_parallelism().map_or(2, |n| n.get())) / 4).max(1)
-        }
-    })
+fn slow_limit(workers: usize) -> usize {
+    (workers / 4).max(1)
 }
 
 struct Queue {
@@ -509,7 +502,11 @@ impl Queue {
     /// Queues an unrequested pipeline or promotes one queued at creation.
     /// Returns whether it is new to the queue, or `None` if nothing changed.
     fn push(&mut self, p: &Arc<Pending>, priority: u8) -> Option<bool> {
-        self.push_as(p, priority, priority == EARLY && slow_limit() != usize::MAX && super::library::slow(&p.key))
+        static LIMIT_SLOW: OnceLock<bool> = OnceLock::new();
+        let slow = priority == EARLY
+            && *LIMIT_SLOW.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_SLOW").is_none_or(|v| v != "0"))
+            && super::library::slow(&p.key);
+        self.push_as(p, priority, slow)
     }
 
     fn push_as(&mut self, p: &Arc<Pending>, priority: u8, slow: bool) -> Option<bool> {
@@ -589,10 +586,10 @@ fn start(p: &Arc<Pending>, priority: u8) {
 /// Workers that make passes over the screen alone, besides the others.
 const SCREEN_WORKERS: usize = 2;
 
-fn next(screens_only: bool) -> Arc<Pending> {
+fn next(screens_only: bool, slow_limit: usize) -> Arc<Pending> {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     loop {
-        if let Some(p) = queue.pop(screens_only, slow_limit()) {
+        if let Some(p) = queue.pop(screens_only, slow_limit) {
             return p;
         }
         queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
@@ -602,10 +599,6 @@ fn next(screens_only: bool) -> Arc<Pending> {
 /// How many workers make pipelines: `asked` (`VICTORY_PIPELINE_WORKERS`, 1 to
 /// 64), else two thirds of the logical processors, 2 to 16. They run below the
 /// title's own threads, and a cold cache queues hundreds at once.
-fn worker_count(asked: Option<usize>, processors: usize) -> usize {
-    worker_count_for(asked, processors, false)
-}
-
 fn worker_count_for(asked: Option<usize>, processors: usize, limited_ram: bool) -> usize {
     match asked {
         Some(n) => n.clamp(1, 64),
@@ -614,7 +607,7 @@ fn worker_count_for(asked: Option<usize>, processors: usize, limited_ram: bool) 
     }
 }
 
-/// Starts the workers ([`worker_count`]) on first use.
+/// Starts the workers ([`worker_count_for`]) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
@@ -627,6 +620,7 @@ fn workers() -> bool {
             crate::residency::limited_host_ram(),
         );
         tracing::info!(workers, "pipeline workers");
+        let slow_limit = slow_limit(workers);
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
         for i in 0..workers + screens {
             let screens_only = i >= workers;
@@ -644,7 +638,7 @@ fn workers() -> bool {
                         let _ = SetThreadPriority(GetCurrentThread(), priority);
                     }
                     loop {
-                        let p = next(screens_only);
+                        let p = next(screens_only, slow_limit);
                         p.make();
                         if p.was_slow.load(Ordering::Relaxed) {
                             let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
@@ -691,6 +685,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn configured_pool_limits_slow_precompilation() {
+        assert_eq!(slow_limit(worker_count_for(Some(3), 32, false)), 1);
+        assert_eq!(slow_limit(worker_count_for(None, 32, true)), 2);
+        assert_eq!(slow_limit(worker_count_for(None, 32, false)), 4);
+        assert_eq!(slow_limit(worker_count_for(Some(64), 32, false)), 16);
+    }
+
+    #[test]
     fn a_panicking_pipeline_is_refused_and_the_worker_continues() {
         let failed = Arc::new(Pending::new(Vec::new(), None));
         let next = Arc::new(Pending::new(Vec::new(), None));
@@ -728,11 +730,11 @@ mod tests {
 
     #[test]
     fn worker_count_follows_the_processors_and_the_switch() {
-        assert_eq!(worker_count(None, 1), 2);
-        assert_eq!(worker_count(None, 24), 16);
-        assert_eq!(worker_count(None, 64), 16);
-        assert_eq!(worker_count(Some(0), 24), 1);
-        assert_eq!(worker_count(Some(20), 24), 20);
+        assert_eq!(worker_count_for(None, 1, false), 2);
+        assert_eq!(worker_count_for(None, 24, false), 16);
+        assert_eq!(worker_count_for(None, 64, false), 16);
+        assert_eq!(worker_count_for(Some(0), 24, false), 1);
+        assert_eq!(worker_count_for(Some(20), 24, false), 20);
         assert_eq!(worker_count_for(None, 8, true), 6);
         assert_eq!(worker_count_for(None, 16, true), 8);
         assert_eq!(worker_count_for(None, 24, true), 8);

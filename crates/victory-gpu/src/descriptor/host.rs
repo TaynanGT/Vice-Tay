@@ -876,6 +876,15 @@ pub(crate) static PAGE_WRITES: [std::sync::atomic::AtomicU64; 4] =
 const PAGE_WRITE_AFTER: u64 = 2;
 
 const MAX_PENDING_TEXTURE_CHANGES: usize = 1 << 15;
+const MAX_BAKE_TEXTURE_CHANGES: usize = 1 << 14;
+
+/// DirectStorage can finish many batches between two one-shot bakes.
+fn retain_bake_writes(kept: &mut Vec<(u64, u64)>, ranges: Vec<(u64, u64)>) {
+    kept.extend(ranges);
+    if kept.len() > MAX_BAKE_TEXTURE_CHANGES {
+        compact_texture_changes(kept, MAX_BAKE_TEXTURE_CHANGES);
+    }
+}
 
 /// The bytes of a write the guards do not see are in title memory `[at,
 /// at + len)`: the placed textures there changed with no descriptor
@@ -960,21 +969,25 @@ fn remember_texture_change(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64) -
     let mut compacted = 0;
     if ranges.len() >= MAX_PENDING_TEXTURE_CHANGES {
         compacted = ranges.len();
-        join(ranges);
-        if ranges.len() > MAX_PENDING_TEXTURE_CHANGES / 2 {
-            // Cover pairs of neighboring ranges so the next texture pass
-            // can still find every change without growing the queue.
-            let pairs = ranges.len().div_ceil(2);
-            for pair in 0..pairs {
-                let first = 2 * pair;
-                let last = (first + 1).min(ranges.len() - 1);
-                ranges[pair] = (ranges[first].0, ranges[last].1);
-            }
-            ranges.truncate(pairs);
-        }
+        compact_texture_changes(ranges, MAX_PENDING_TEXTURE_CHANGES / 2);
     }
     ranges.push((start, end));
     compacted
+}
+
+/// Keep every changed byte covered. At capacity a pair can span an unchanged
+/// gap, whose textures will also be checked at the next pass.
+fn compact_texture_changes(ranges: &mut Vec<(u64, u64)>, limit: usize) {
+    join(ranges);
+    while ranges.len() > limit {
+        let pairs = ranges.len().div_ceil(2);
+        for pair in 0..pairs {
+            let first = 2 * pair;
+            let last = (first + 1).min(ranges.len() - 1);
+            ranges[pair] = (ranges[first].0, ranges[last].1);
+        }
+        ranges.truncate(pairs);
+    }
 }
 
 /// Ranges of memory, those that touch made one (DexNom/VIctory 921d8d3b:
@@ -1132,8 +1145,8 @@ impl Queued {
 }
 
 /// Slots due of a [`TextureQueue`], of those looked at before and of the
-/// others: the frame each was written in, the slot and its write's number.
-type Due = [Vec<(u64, u32, u64)>; 2];
+/// others: the slot and its write's number.
+type Due = [Vec<(u32, u64)>; 2];
 
 impl TextureQueue {
     fn next_revision(&mut self) -> u64 {
@@ -1228,32 +1241,47 @@ impl TextureQueue {
                 counts[1] += 1;
                 counts[4] = counts[4].max(frame.saturating_sub(w.written));
                 if collect_slots {
-                    due[usize::from(w.looks == 0 && w.mapped == 0)].push((w.written, index, w.write));
+                    due[usize::from(w.looks == 0 && w.mapped == 0)].push((index, w.write));
                 }
             }
         }
         (due, counts)
     }
 
-    /// What [`TextureQueue::due`] says of `due` (with nothing held: some
-    /// ten thousand slots are sorted).
+    /// Select a batch in service order after releasing the queue lock.
     fn in_order([mut again, mut fresh]: Due, max: usize) -> Vec<(u32, u64)> {
         // By the number of the write, counted over the run.
-        let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
+        let newest_first = |a: &(u32, u64), b: &(u32, u64)| b.1.cmp(&a.1);
+        if again.len() > max {
+            again.select_nth_unstable_by(max, newest_first);
+            again.truncate(max);
+        }
         again.sort_unstable_by(newest_first);
+        let take = fresh.len().min(max - again.len());
+        if take == 0 {
+            return again;
+        }
+        // When a normal pass cannot serve the whole backlog, keep only the
+        // newest and oldest writes it will actually return.
+        if take < fresh.len() {
+            let newest = take.div_ceil(2);
+            let oldest = fresh.len() - take / 2;
+            fresh.select_nth_unstable_by(newest, newest_first);
+            if oldest < fresh.len() {
+                fresh[newest..].select_nth_unstable_by(oldest - newest, newest_first);
+            }
+            fresh.drain(newest..oldest);
+        }
         fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
-        let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
-            new += 1;
-            if new < old && order.len() < max {
-                old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+        again.reserve(take);
+        let mut fresh = fresh.into_iter();
+        while let Some(newest) = fresh.next() {
+            again.push(newest);
+            if let Some(oldest) = fresh.next_back() {
+                again.push(oldest);
             }
         }
-        order.truncate(max);
-        order
+        again
     }
 
     /// The entry of `index` if it is still the write the pass was handed.
@@ -2265,15 +2293,7 @@ impl HostHeap {
         let made_due = self.slots_written_under(&ranges, frame, due)[2];
         if !due {
             let mut kept = BAKE_PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-            kept.extend(ranges);
-            if kept.len() > 256 {
-                join(&mut kept);
-                const MOST: usize = 1 << 14;
-                if kept.len() > MOST {
-                    let drop_n = kept.len() - MOST;
-                    kept.drain(..drop_n);
-                }
-            }
+            retain_bake_writes(&mut kept, ranges);
         }
         made_due
     }
@@ -6139,6 +6159,25 @@ mod tests {
     }
 
     #[test]
+    fn capped_texture_batches_match_the_full_service_order() {
+        let len = 32;
+        for retries in 0..=len {
+            let mut q = TextureQueue::default();
+            for i in 0..len {
+                let index = (i * 13) % len;
+                q.written(index, 1, 1, false);
+                if index < retries {
+                    q.later(index, q.slots[&index].write, 1, 1);
+                }
+            }
+            let full = q.due(2, usize::MAX);
+            for max in 0..=len as usize {
+                assert_eq!(q.due(2, max), full[..max], "{retries} retries, batch of {max}");
+            }
+        }
+    }
+
+    #[test]
     fn texture_snapshot_counts_include_deferred_slots_and_do_not_depend_on_the_batch() {
         let mut q = TextureQueue::default();
         q.written(1, 2, 0, false);
@@ -6415,6 +6454,24 @@ mod tests {
         spans.forget(4);
         spans.forget(7);
         assert!(spans.by_start.is_empty() && spans.by_slot.is_empty());
+    }
+
+    #[test]
+    fn bake_writes_keep_coverage_across_batches() {
+        let mut kept = Vec::new();
+        let mut changes = Vec::new();
+        for batch in 0..3 {
+            let ranges: Vec<_> = (0..MAX_PENDING_TEXTURE_CHANGES)
+                .map(|i| {
+                    let start = ((3 * i + batch) * 8) as u64;
+                    (start, start + 2)
+                })
+                .collect();
+            changes.extend_from_slice(&ranges);
+            retain_bake_writes(&mut kept, ranges);
+            assert!(kept.len() <= MAX_BAKE_TEXTURE_CHANGES);
+            assert_texture_changes_covered(&kept, &changes);
+        }
     }
 
     #[test]

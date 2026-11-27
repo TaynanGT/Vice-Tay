@@ -10970,6 +10970,52 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     })
 }
 
+/// Use a direct copy for a single plane when possible. A format DXGI cannot
+/// scan out directly can still be sampled into the composer's SDR target.
+fn display_format(
+    native: Option<DXGI_FORMAT>,
+    sampleable: bool,
+    compose: bool,
+) -> Option<DXGI_FORMAT> {
+    if sampleable && (compose || native.is_none()) {
+        Some(crate::compose::UI_FORMAT)
+    } else {
+        native
+    }
+}
+
+#[cfg(test)]
+mod display_format_tests {
+    use super::*;
+
+    #[test]
+    fn single_planes_use_the_composer_when_a_direct_copy_is_unavailable() {
+        for format in [DXGI_FORMAT_R11G11B10_FLOAT, DXGI_FORMAT_R9G9B9E5_SHAREDEXP] {
+            let mut desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Format: format,
+                DepthOrArraySize: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            };
+            let native = swap_format(format);
+            assert!(native.is_none());
+            assert_eq!(
+                display_format(native, crate::compose::view(&desc).is_some(), false),
+                Some(crate::compose::UI_FORMAT),
+            );
+            desc.Flags = D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+            assert_eq!(
+                display_format(native, crate::compose::view(&desc).is_some(), false),
+                None,
+            );
+        }
+        let bgra = swap_format(DXGI_FORMAT_B8G8R8A8_UNORM);
+        assert_eq!(display_format(bgra, true, false), bgra);
+        assert_eq!(display_format(bgra, true, true), Some(crate::compose::UI_FORMAT));
+    }
+}
+
 const BUFFERS: u32 = 2;
 
 struct Presenter {
@@ -11428,27 +11474,22 @@ impl Host {
     ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
+        let base_view = crate::compose::view(&desc);
         let planes = overlay.and_then(|(over, over_state)| {
             // SAFETY: a live overlay resource.
             let over_desc = unsafe { over.GetDesc() };
             Some((
                 over,
                 D3D12_RESOURCE_STATES(over_state as i32),
-                crate::compose::view(&desc)?,
+                base_view?,
                 crate::compose::view(&over_desc)?,
             ))
         });
         let native_format = swap_format(desc.Format);
-        let format = if planes.is_some() {
-            DXGI_FORMAT_R8G8B8A8_UNORM
-        } else {
-            let Some(format) = native_format else {
-                tracing::warn!(format = desc.Format.0, "cannot present this format");
-                return None;
-            };
-            format
+        let Some(format) = display_format(native_format, base_view.is_some(), planes.is_some()) else {
+            tracing::warn!(format = desc.Format.0, "cannot present this format");
+            return None;
         };
-        let base_view = crate::compose::view(&desc);
         // Keep a single SDR format as Series S changes between UI and movie
         // frames. The composer converts single-plane sources when needed.
         let fg_format = if crate::console::current() == crate::console::Console::SeriesS && base_view.is_some() {

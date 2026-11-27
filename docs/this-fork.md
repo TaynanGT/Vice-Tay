@@ -66,6 +66,14 @@ How each of these was found, with the numbers:
 - The translator's version is 2: the shader cache translates again what version 1
   made.
 
+- **Series S upscaler choice** (known build only): with `--console series-s` the
+  title's upscaler picker (+0x7e93f0) and its per-frame copy (+0x5400190) both
+  return 6, its own upscaler, instead of AMD FidelityFX, whose DLL the host
+  policy refuses. The two sites are compared first and written as a pair, or not
+  at all. `VICTORY_TITLE_PATCHES=0` turns the automatic choice off, `=1` applies
+  it on any console; an explicit `VICTORY_UPSCALER=<kind>` (6 or 7) always takes
+  precedence and is written to both sites.
+
 ## Loading and the runtime
 
 - **DirectStorage**: a queue submits itself when it holds half its capacity, unless

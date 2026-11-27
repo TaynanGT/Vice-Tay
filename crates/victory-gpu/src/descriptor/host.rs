@@ -5803,12 +5803,15 @@ mod tests {
     #[test]
     fn views_are_made_beside_the_heap_and_copied_in() {
         let Some(host) = host() else {
-            return; // no host GPU here
+            eprintln!("copied descriptor test skipped (no D3D12 host)");
+            return;
         };
         let Some(heap) = HostHeap::new(false, 4) else {
+            eprintln!("copied descriptor test skipped (no descriptor heap)");
             return;
         };
         let (Some(a), Some(b)) = (staged(false, 0), staged(false, 1)) else {
+            eprintln!("copied descriptor test skipped (no staging slots)");
             return;
         };
         assert_ne!(a.ptr, b.ptr);
@@ -5882,6 +5885,7 @@ mod tests {
         assert_eq!(read_view(), [0; 3], "replaced by a null view");
         // SAFETY: a plain query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        eprintln!("copied descriptor test completed on the GPU (data, bounds and null view)");
     }
 
     /// A raw view moved on by some dwords says so in its descriptor, on a

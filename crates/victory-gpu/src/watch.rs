@@ -4397,6 +4397,7 @@ mod tests {
     /// begun to unmap: no note of it stays behind.
     #[test]
     fn nothing_is_guarded_between_our_forgetting_it_and_its_unmapping() {
+        let _one = crate::watch::one_asking_test();
         use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile};
         // SAFETY: a pagefile section of a block, mapped read-write.
         let view = unsafe {
@@ -5359,6 +5360,7 @@ mod tests {
     /// the write through one takes the bits of all.
     #[test]
     fn bits_go_at_every_view() {
+        let _one = crate::watch::one_asking_test();
         const SIZE: usize = 2 * BLOCK;
         let (section, one, two) = two_views(SIZE);
         let ask = |at: usize| writes(at, at + SIZE, true).expect("a view");
@@ -5406,6 +5408,7 @@ mod tests {
     /// wrote while a submission's one asking stands.
     #[test]
     fn what_is_put_in_beside_the_guards_is_told_at_every_view() {
+        let _one = crate::watch::one_asking_test();
         let (section, one, two) = two_views(BLOCK);
         writes(two, two + BLOCK, true).expect("a view");
         let (before, _) = writes(two, two + BLOCK, true).expect("a view");
@@ -5619,6 +5622,7 @@ mod many_askers_tests {
     /// for one address only, `VICTORY_VIEW_GUARD=0`.)
     #[test]
     fn no_write_through_another_view_is_lost_between_askers() {
+        let _one = crate::watch::one_asking_test();
         writes_to_views_are_not_lost::<3>(0, 0);
     }
 
@@ -5786,6 +5790,7 @@ mod many_askers_tests {
     /// allocated there. A hole that is no placeholder's is asked about.
     #[test]
     fn holes_are_known_until_the_runtime_tells() {
+        let _one = crate::watch::one_asking_test();
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
         const BLOCKS: usize = 8;
         // SAFETY (all): a placeholder and a section of our own, which stay.
@@ -5871,6 +5876,7 @@ mod many_askers_tests {
     /// whoever asks after it, and blocks are known by their bits meanwhile.
     #[test]
     fn no_mapping_is_lost_between_askers() {
+        let _one = crate::watch::one_asking_test();
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
         const BLOCKS: usize = 12;

@@ -873,18 +873,25 @@ mod retire_batch_tests {
         let before = RETIREMENTS[1].load(Ordering::Relaxed);
         let _ = STARTED.fetch_add(1, Ordering::AcqRel);
         std::thread::scope(|s| {
-            for t in 0..THREADS {
-                s.spawn(move || {
-                    retire_in_batches();
-                    for _ in 0..PER_THREAD {
-                        let (buf, _) = host.upload_buffer(256).expect("upload buffer");
-                        retire_resource_with(buf, true);
-                    }
-                    // Explicitly flush half the threads; let the others exercise RetiredBatch::drop.
-                    if t % 2 == 0 {
-                        flush_retired();
-                    }
-                });
+            // Joined one by one: the scope's own wait can end before a thread's
+            // thread-locals are dropped, and with them `RetiredBatch::drop`.
+            let workers: Vec<_> = (0..THREADS)
+                .map(|t| {
+                    s.spawn(move || {
+                        retire_in_batches();
+                        for _ in 0..PER_THREAD {
+                            let (buf, _) = host.upload_buffer(256).expect("upload buffer");
+                            retire_resource_with(buf, true);
+                        }
+                        // Explicitly flush half the threads; let the others exercise RetiredBatch::drop.
+                        if t % 2 == 0 {
+                            flush_retired();
+                        }
+                    })
+                })
+                .collect();
+            for worker in workers {
+                worker.join().expect("retirement worker");
             }
         });
         let queued_now = RETIREMENTS[1].load(Ordering::Relaxed) - before;
@@ -920,7 +927,9 @@ mod retire_batch_tests {
         let send_drop = SendResource(buf_drop);
 
         std::thread::scope(|s| {
-            s.spawn(move || {
+            // Joined explicitly: the scope's own wait can end before the second
+            // thread's thread-locals are dropped, and with them `RetiredBatch::drop`.
+            let explicit = s.spawn(move || {
                 let SendResource(buf) = send_explicit;
                 let probe = buf.clone();
                 retire_in_batches();
@@ -931,13 +940,15 @@ mod retire_batch_tests {
                 flush_retired();
                 assert_eq!(BATCH.with(|b| b.borrow().entries.len()), 0);
             });
-            s.spawn(move || {
+            let dropped = s.spawn(move || {
                 let SendResource(buf) = send_drop;
                 retire_in_batches();
                 retire_resource_with(buf, true);
                 assert_eq!(BATCH.with(|b| b.borrow().entries.len()), 1);
                 // Intentionally exit without flush_retired() to exercise RetiredBatch::drop.
             });
+            explicit.join().expect("explicit flush worker");
+            dropped.join().expect("drop flush worker");
         });
         let stamp_after = STARTED.load(Ordering::Acquire) + crate::queue::queued();
 

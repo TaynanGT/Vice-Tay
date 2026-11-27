@@ -294,14 +294,18 @@ const FINISH_BOUND: std::time::Duration = std::time::Duration::from_secs(3);
 /// returns, or [`FINISH_BOUND`] has passed (logged). A picture saved after
 /// this is written by its caller.
 pub(crate) fn finish() {
-    let left = finish_within(FINISH_BOUND);
-    if left != 0 {
-        tracing::warn!(
-            left,
-            seconds = FINISH_BOUND.as_secs(),
-            "capture pictures were still to be written when the process ended"
-        );
-    }
+    // Window close and title exit may overlap. Both wait for one bounded drain.
+    static DRAIN: std::sync::Once = std::sync::Once::new();
+    DRAIN.call_once(|| {
+        let left = finish_within(FINISH_BOUND);
+        if left != 0 {
+            tracing::warn!(
+                left,
+                seconds = FINISH_BOUND.as_secs(),
+                "capture pictures were still to be written when the process ended"
+            );
+        }
+    });
 }
 
 /// [`finish`] with its bound: how many pictures were not written in time.
@@ -1135,13 +1139,50 @@ mod tests {
     /// line: it is closed afterwards.)
     #[test]
     fn pictures_in_the_line_are_valid_png_files_when_finish_returns() {
+        use std::sync::mpsc::{RecvTimeoutError, channel, sync_channel};
+        use std::time::{Duration, Instant};
+
         let dir = tempfile::tempdir().unwrap();
         let (w, h) = (37, 21);
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let mut held = Some(held);
+        let worker = super::Aside::start(move |(path, w, h, raw)| {
+            if let Some(held) = held.take() {
+                let _ = held.recv();
+            }
+            super::write(&path, w, h, &raw);
+        })
+        .unwrap();
+        {
+            let mut line = super::LINE.lock().unwrap();
+            assert!(matches!(*line, super::Line::Unused));
+            *line = super::Line::Aside(worker);
+        }
         let pictures: Vec<_> = (0..8).map(|i| (dir.path().join(format!("frame-{i}.png")), rows(w, h, i))).collect();
         for (path, raw) in &pictures {
             assert!(super::write_aside(path.clone(), w, h, raw.clone()), "the picture did not go to the thread");
         }
-        assert_eq!(super::finish_within(std::time::Duration::from_secs(60)), 0, "pictures left unwritten");
+        std::thread::scope(|scope| {
+            scope.spawn(super::finish);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !matches!(*super::LINE.lock().unwrap(), super::Line::Caller) {
+                assert!(Instant::now() < deadline, "the first exit did not close the line");
+                std::thread::yield_now();
+            }
+
+            let (started, start) = sync_channel(0);
+            let (returned, done) = channel();
+            scope.spawn(move || {
+                started.send(()).unwrap();
+                super::finish();
+                returned.send(()).unwrap();
+            });
+            start.recv_timeout(Duration::from_secs(2)).unwrap();
+            let early = done.recv_timeout(Duration::from_millis(100));
+            drop(release);
+            assert_eq!(early, Err(RecvTimeoutError::Timeout), "the second exit bypassed the drain");
+            done.recv_timeout(Duration::from_secs(3)).unwrap();
+        });
         for (path, raw) in &pictures {
             let png = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             assert_eq!(unpacked(&png), (w, h, raw.clone()), "{}", path.display());

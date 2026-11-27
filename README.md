@@ -96,6 +96,7 @@ FSR 4.1.2 and uses 3.1.6 when that is what the adapter supports. In Series S,
 pass `-More @{VICTORY_FSR4_SERIES_S='1'}` to prefer FSR 4.1.2 on a supported
 adapter. Series S uses FSR 3.1.6 by default. Both profiles can use FSR when
 DLSS fails.
+
 For DLSS on an RTX card, get `nvngx_dlss.dll` from the NVIDIA DLSS SDK.
 Set `VICTORY_DLSS_DIR` or `[paths].dlss_dir` to its folder, or put the DLL
 beside `victory.exe`. Some drivers ship without this library. Vice-Tay

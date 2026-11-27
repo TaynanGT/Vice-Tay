@@ -15,7 +15,7 @@
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -Machine      auto (the default: by GPU vendor; on NVIDIA, worker counts sized to the CPU and,
 #               for a card of 10 to 19 GB, title buffers in the card's memory),
-#               7900xtx, 4070, 4070tisuper, 4090, 3060 or laptop
+#               7900xtx, 4070, 4070tisuper, 4080, 4090, 3060 or laptop
 #               (3060: a six-core NVIDIA desktop with 16 GB of RAM and a 12 GB card, docs/rtx3060-16gb.md;
 #               laptop: an NVIDIA PC with 16 GB of RAM and a 6-8 GB card, docs/laptop-16gb.md)
 # -More         other settings: -More @{VICTORY_PANEL='1'} or -More @{VICTORY_AMBIENT='1.0'}
@@ -39,7 +39,8 @@ param(
     [ValidateSet('quality', 'balanced', 'performance')][string]$Dlss4K,
     [ValidateRange(0.0, 1000.0)][double]$FrameIntervalMs,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
-    [ValidateSet('auto', '7900xtx', '4070', '4070tisuper', '4090', '3060', 'laptop')][string]$Machine = 'auto',
+    [ValidateSet('auto', '7900xtx', '4070', '4070tisuper', '4080', '4090', '3060', 'laptop')][string]$Machine = 'auto',
+    [ValidateRange(0, 3600)][int]$TestSeconds = 0,
     [hashtable]$More = @{}
 )
 $settings = @{
@@ -59,7 +60,7 @@ $cardGb = 0
 $autoAdds = @{}
 if ($Machine -eq 'auto') {
     # Keep the vendor defaults for rendering. The measured machine profiles are explicit.
-    $Machine = if ($hasNvidia) { '4090' } else { '7900xtx' }
+    $Machine = if ($nvidiaControllers.Name -match 'RTX 4080\b') { '4080' } elseif ($hasNvidia) { '4090' } else { '7900xtx' }
     # Read the driver key for the detected NVIDIA adapter. Old driver entries and
     # ambiguous adapter selections must not determine the automatic memory profile.
     if ($autoNvidia -and -not $Safe -and $nvidiaControllers.Count -eq 1 -and
@@ -156,6 +157,10 @@ if ($Machine -eq '7900xtx') {
         $autoAdds = Get-AutoNvidiaSettings $cardGb $coreCount ([bool]$Safe)
         foreach ($k in $autoAdds.Keys) { $settings[$k] = $autoAdds[$k] }
     }
+}
+if ($Machine -eq '4080') {
+    $settings.VICTORY_TEXTURE_LOOK_MS = '1000'
+    $settings.VICTORY_AMBIENT_AIR = '1'
 }
 if ($Machine -in '4070', '3060') {
     # Ryzen 7 7800X3D: eight physical cores, versus the 4090 test PC's sixteen.
@@ -320,7 +325,12 @@ try {
         & $victory warm --used
         if ($LASTEXITCODE -ne 0) { Write-Host "victory warm ended with exit code $LASTEXITCODE; starting anyway." }
     }
-    & $victory run $Exe --console $Console --execute
-    $runtimeExitCode = $LASTEXITCODE
+    if ($TestSeconds) {
+        & "$PSScriptRoot\measure-world.ps1" -Victory $victory -Exe $Exe -Console $Console -Seconds $TestSeconds
+        $runtimeExitCode = 0
+    } else {
+        & $victory run $Exe --console $Console --execute
+        $runtimeExitCode = $LASTEXITCODE
+    }
 } finally { Pop-Location }
 exit $runtimeExitCode

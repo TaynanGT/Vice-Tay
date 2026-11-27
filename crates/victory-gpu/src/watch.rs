@@ -2880,7 +2880,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // takes the block out of the set, and it is looked at as any other.
     let unsure: Vec<usize> = {
         let of = |g: &Guards| -> Option<Vec<usize>> {
-            if g.clean.range(first..last).count() == last - first && !BESIDE.any(first, last) {
+            if (first == last || g.clean.0.all(first, last)) && !BESIDE.any(first, last) {
                 return None;
             }
             Some(g.absent.range(first..last).filter(|block| !g.held.contains(*block)).collect())

@@ -338,8 +338,10 @@ const SOURCE: &str = r#"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
+#ifndef PX
 #define PX 160
 #define PY 90
+#endif
 cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
@@ -595,6 +597,11 @@ void raise(uint3 at : SV_DispatchThreadID) {
     float top = max(dot(found, LUMA) * bound, 1e-6);
     float has = dot(was, LUMA);
     was *= min(1.0, top / max(has, 1e-6));
+#ifdef LOCAL_COLOR_BOUND
+    // Luminance alone gives a blue outlier nearly fourteen times the
+    // local intensity. Allow neutral headroom as well as local colour.
+    was = min(was, bound * max(found, dot(found, LUMA)));
+#endif
     float3 written = max(was, found * least);
     light[p] = pack(written);
     if (probe != 0 && (at.x & 15) == 0 && (at.y & 15) == 0) {
@@ -611,7 +618,10 @@ void raise(uint3 at : SV_DispatchThreadID) {
 /// Bytes of the cells' buffer and of the points'.
 const CELLS: u64 = 64 * 36;
 const CELL_BYTES: u64 = (2 * CELLS + 1) * 16;
-const POINT_BYTES: u64 = 160 * 90 * 48;
+fn point_grid() -> (u32, u32) {
+    static GRID: OnceLock<(u32, u32)> = OnceLock::new();
+    *GRID.get_or_init(|| if crate::switch::on("VICTORY_AMBIENT_COARSE") { (80, 46) } else { (160, 90) })
+}
 /// Where the slow mean is among the cells (float4s).
 pub(crate) const CELLS_AT: u32 = CELLS as u32;
 
@@ -645,7 +655,11 @@ fn make(
     let mut resolve_root: Option<ID3D12RootSignature> = None;
     let mut indirect_root: Option<ID3D12RootSignature> = None;
     let mut pipeline = |part: &str, entry| -> windows::core::Result<ID3D12PipelineState> {
-        let code = crate::host::compile(&format!("#define {part}\n{SOURCE}"), entry, s!("cs_5_1"))?;
+        let (px, py) = point_grid();
+        let bound = if crate::switch::on("VICTORY_AMBIENT_COLOR_BOUND") && !crate::pipeline::builder_runs() {
+            "#define LOCAL_COLOR_BOUND"
+        } else { "" };
+        let code = crate::host::compile(&format!("#define {part}\n#define PX {px}\n#define PY {py}\n{bound}\n{SOURCE}"), entry, s!("cs_5_1"))?;
         let root = match part {
             "PLACE" | "GATHER" | "RAISE" => &mut resolve_root,
             "HOLD_INDIRECT" => &mut indirect_root,
@@ -699,7 +713,7 @@ fn make(
         hold,
         hold_indirect: indirect_root.zip(hold_indirect),
         cells: made(CELL_BYTES)?,
-        points: made(POINT_BYTES)?,
+        points: made(u64::from(point_grid().0) * u64::from(point_grid().1) * 48)?,
         stats: made(256)?,
     })
 }
@@ -970,7 +984,8 @@ pub(crate) fn after(
             Role::Resolve => {
                 if constant == 0.0 {
                     run(&pass.place, 8, 9, 1);
-                    run(&pass.gather, 20, 45, 1);
+                    let (px, py) = point_grid();
+                    run(&pass.gather, px / 8, py / 2, 1);
                 }
                 run(&pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
             }

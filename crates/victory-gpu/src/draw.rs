@@ -599,6 +599,18 @@ impl Drop for State {
 }
 
 impl State {
+    /// Adjacent tables owned by this command list have the same lifetime.
+    /// Release the whole range with one heap lookup and lock acquisition.
+    fn hold_slots(&mut self, heap: usize, id: u64, first: u32, count: u32) {
+        if let Some((previous_heap, previous_id, start, length)) = self.dynamic.last_mut()
+            && *previous_heap == heap && *previous_id == id && *start + *length == first
+        {
+            *length += count;
+        } else {
+            self.dynamic.push((heap, id, first, count));
+        }
+    }
+
     /// The list's submission has run (submissions are waited for): the
     /// dynamic slots its tables were made in are given back, not kept
     /// until the title resets the list. A frame of the opening cutscene
@@ -2099,12 +2111,14 @@ impl State {
             }
             Some(s)
         };
+        #[cfg(feature = "diagnostics")]
+        let pipeline = self.pipeline;
         let ready = |a: u64, s: &std::sync::Arc<crate::shadow::Shadow>| {
             let len = s.left(a).min(limit);
             s.refresh(list, a, len);
             if writes {
                 #[cfg(feature = "diagnostics")]
-                crate::host::wide_write(a, len, self.pipeline);
+                crate::host::wide_write(a, len, pipeline);
                 s.gpu_writes(list, a, len);
             }
         };
@@ -2144,7 +2158,7 @@ impl State {
                 let Some(index) = dynamic_or_settle(host, 1) else {
                     return prepare_failed!(self, RootUavSlot);
                 };
-                self.dynamic.push((key.0, host.id(), index, 1));
+                self.hold_slots(key.0, host.id(), index, 1);
                 if let Some((a, s)) = &shadow {
                     // SAFETY: a live buffer.
                     let base = unsafe { s.buffer.GetGPUVirtualAddress() };
@@ -2215,7 +2229,7 @@ impl State {
                 let Some(index) = dynamic_or_settle(host, 1) else {
                     return prepare_failed!(self, RootSrvSlot);
                 };
-                self.dynamic.push((key.0, host.id(), index, 1));
+                self.hold_slots(key.0, host.id(), index, 1);
                 self.root_srv_slots
                     .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
                 match &shadow {
@@ -2538,8 +2552,10 @@ impl State {
             return;
         };
         if is_bake {
-            let began = std::time::Instant::now();
             let mut bake_slot = BAKE_UPLOAD.lock().unwrap_or_else(|e| e.into_inner());
+            // Parallel recording threads wait for the same upload. Charge it
+            // once, on the thread doing it, so later bakes retain their budget.
+            let began = std::time::Instant::now();
             let gpu = crate::host::host();
             if bake_slot.is_none()
                 && let Some(gpu) = gpu
@@ -2913,7 +2929,9 @@ impl State {
             // (all their blocks are shown at other addresses too), and each
             // was shown four frames late, over and over.
             let mut again_in = RECHECK_FRAMES[0];
-            if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
+            // A permanent character bake must catch changes between the three
+            // fingerprint windows too. Fall through to the full content check.
+            if !baking && let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
                 if crate::texture::fingerprint(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
@@ -2966,7 +2984,7 @@ impl State {
                 host.texture_slot_here(index);
                 there = Some(mapped);
                 if mapped < len {
-                    if mapped <= host.texture_slot_mapped(index) {
+                    if !baking && mapped <= host.texture_slot_mapped(index) {
                         HEAP_TEXTURES_PARTLY[0].fetch_add(1, Ordering::Relaxed);
                         host.texture_slot_later(index, write, frame, most);
                         continue;
@@ -3005,6 +3023,7 @@ impl State {
                 let has_its_texture = reupload_when_full()
                     && heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle));
                 if !has_its_texture {
+                    served = false;
                     refused += 1;
                     if full_card_pass() {
                         // Held back for the frames of about four seconds
@@ -4158,8 +4177,7 @@ impl State {
                 continue;
             };
             self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, host.id(), first, n));
+            self.hold_slots(std::ptr::from_ref(heap) as usize, host.id(), first, n);
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());

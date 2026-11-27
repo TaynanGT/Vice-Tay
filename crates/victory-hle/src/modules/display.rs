@@ -57,13 +57,64 @@ pub const INTERFACES: &[Interface] = &[
 
 type This = *const Object;
 
-/// 2: disabled. We present in SDR, so the title must render SDR.
-// shortcut: HDR output is not done (see the presentation items in
-// `TODO.md`); report enabled, with the host display's luminance, once the
-// swap chain can present HDR.
-extern "system" fn try_enable_hdr(_: This, preference: u32, _info: *mut c_void) -> u32 {
-    tracing::info!(preference, "HDR mode: disabled (SDR presentation)");
-    2
+/// Result codes for `XDisplayTryEnableHdrMode`.
+const HDR_RESULT_ENABLED: u32 = 1;
+const HDR_RESULT_DISABLED: u32 = 2;
+
+/// Luminance capabilities returned to the title when HDR mode is enabled
+/// (`XDisplayHdrModeInfo`, in nits).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct HdrModeInfo {
+    min_tone_map_luminance: f32,
+    max_tone_map_luminance: f32,
+    max_full_frame_tone_map_luminance: f32,
+}
+const _: () = assert!(size_of::<HdrModeInfo>() == 12);
+
+fn try_enable_hdr_with(
+    preference: u32,
+    info: *mut c_void,
+    caps: &victory_gpu::display_output::OutputHdrCaps,
+    override_pref: victory_gpu::display_output::HdrPreference,
+) -> u32 {
+    let decision = victory_gpu::display_output::resolve_hdr_mode(caps, preference, override_pref);
+    victory_gpu::display_output::set_title_hdr_enabled(decision.enabled);
+    if decision.enabled {
+        if !info.is_null() {
+            let out = HdrModeInfo {
+                min_tone_map_luminance: decision.min_tone_map_luminance,
+                max_tone_map_luminance: decision.max_tone_map_luminance,
+                max_full_frame_tone_map_luminance: decision.max_full_frame_tone_map_luminance,
+            };
+            // SAFETY: caller supplies a writable `HdrModeInfo` when non-null.
+            unsafe { info.cast::<HdrModeInfo>().write_unaligned(out) };
+        }
+        tracing::info!(
+            preference,
+            min_nits = decision.min_tone_map_luminance,
+            max_nits = decision.max_tone_map_luminance,
+            max_full_frame_nits = decision.max_full_frame_tone_map_luminance,
+            bpc = caps.bits_per_color,
+            red = ?caps.red_primary,
+            green = ?caps.green_primary,
+            blue = ?caps.blue_primary,
+            white = ?caps.white_point,
+            "HDR mode: enabled"
+        );
+        HDR_RESULT_ENABLED
+    } else {
+        tracing::info!(preference, ?override_pref, "HDR mode: disabled (SDR presentation)");
+        HDR_RESULT_DISABLED
+    }
+}
+
+/// Reports host HDR capabilities from `IDXGIOutput6::GetDesc1()` (`1`: enabled
+/// with display luminance, `2`: disabled / SDR presentation).
+extern "system" fn try_enable_hdr(_: This, preference: u32, info: *mut c_void) -> u32 {
+    let caps = victory_gpu::display_output::probe_primary_hdr();
+    let override_pref = victory_gpu::display_output::hdr_preference();
+    try_enable_hdr_with(preference, info, &caps, override_pref)
 }
 
 /// Nothing launches URIs for the title: no store, browser or console app
@@ -174,14 +225,102 @@ static CAPTURE_VTABLE: Methods<6> = Methods([
 mod tests {
     use super::*;
     use crate::modules::xgameruntime::{S_OK, method};
+    use victory_gpu::display_output::{HdrPreference, OutputHdrCaps};
+
+    #[test]
+    fn hdr_query_reports_output_capabilities_and_luminance() {
+        let hdr_caps = OutputHdrCaps {
+            hdr_active: true,
+            bits_per_color: 10,
+            min_luminance: 0.005,
+            max_luminance: 1000.0,
+            max_full_frame_luminance: 450.0,
+            red_primary: [0.68, 0.32],
+            green_primary: [0.265, 0.69],
+            blue_primary: [0.15, 0.06],
+            white_point: [0.3127, 0.3290],
+        };
+        let mut info = HdrModeInfo {
+            min_tone_map_luminance: 0.0,
+            max_tone_map_luminance: 0.0,
+            max_full_frame_tone_map_luminance: 0.0,
+        };
+        assert_eq!(
+            try_enable_hdr_with(
+                0,
+                (&raw mut info).cast(),
+                &hdr_caps,
+                HdrPreference::Auto
+            ),
+            HDR_RESULT_ENABLED
+        );
+        assert!((info.min_tone_map_luminance - 0.005).abs() < 1e-6);
+        assert!((info.max_tone_map_luminance - 1000.0).abs() < 1e-4);
+        assert!((info.max_full_frame_tone_map_luminance - 450.0).abs() < 1e-4);
+
+        // Null info pointer is tolerated cleanly.
+        assert_eq!(
+            try_enable_hdr_with(1, std::ptr::null_mut(), &hdr_caps, HdrPreference::Auto),
+            HDR_RESULT_ENABLED
+        );
+
+        // Explicit HDR10 / scRGB overrides also report enabled (1) on HDR displays
+        // and disabled (2) on SDR displays.
+        for pref in [HdrPreference::Hdr10, HdrPreference::ScRgb] {
+            assert_eq!(
+                try_enable_hdr_with(0, std::ptr::null_mut(), &hdr_caps, pref),
+                HDR_RESULT_ENABLED
+            );
+            assert_eq!(
+                try_enable_hdr_with(0, std::ptr::null_mut(), &OutputHdrCaps::sdr_default(), pref),
+                HDR_RESULT_DISABLED
+            );
+        }
+
+        // Explicit SDR override (and default Off) disables HDR cleanly without overwriting info.
+        assert_eq!(
+            try_enable_hdr_with(0, (&raw mut info).cast(), &hdr_caps, HdrPreference::Off),
+            HDR_RESULT_DISABLED
+        );
+
+        // SDR output returns disabled (2).
+        assert_eq!(
+            try_enable_hdr_with(
+                0,
+                std::ptr::null_mut(),
+                &OutputHdrCaps::sdr_default(),
+                HdrPreference::Auto
+            ),
+            HDR_RESULT_DISABLED
+        );
+    }
 
     #[test]
     fn sdr_and_display_deferrals() {
         type Hdr = extern "system" fn(This, u32, *mut c_void) -> u32;
+        let expected = if victory_gpu::display_output::resolve_hdr_mode(
+            &victory_gpu::display_output::probe_primary_hdr(),
+            0,
+            victory_gpu::display_output::hdr_preference(),
+        )
+        .enabled
+        {
+            HDR_RESULT_ENABLED
+        } else {
+            HDR_RESULT_DISABLED
+        };
+        let mut live_info = HdrModeInfo {
+            min_tone_map_luminance: -1.0,
+            max_tone_map_luminance: -1.0,
+            max_full_frame_tone_map_luminance: -1.0,
+        };
         assert_eq!(
-            method::<Hdr>(&HDR_OBJECT, 0x20)(&HDR_OBJECT, 0, std::ptr::null_mut()),
-            2
+            method::<Hdr>(&HDR_OBJECT, 0x20)(&HDR_OBJECT, 0, (&raw mut live_info).cast()),
+            expected
         );
+        if expected == HDR_RESULT_ENABLED {
+            assert!(live_info.max_tone_map_luminance > 80.0);
+        }
         type Acquire = extern "system" fn(This, *mut *mut c_void) -> HRESULT;
         type Close = extern "system" fn(This, *mut c_void);
         let mut handle = std::ptr::null_mut();

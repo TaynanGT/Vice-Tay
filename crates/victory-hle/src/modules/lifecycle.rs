@@ -163,6 +163,7 @@ fn place(
     width: i32,
     height: i32,
 ) -> (Windowed, Option<WindowState>) {
+    victory_gpu::display_output::ensure_dpi_awareness();
     if !placeable(ex_style, style, !parent.is_null()) || zero_sized(style, width, height) {
         return ((ex_style, style, (x, y, width, height)), None);
     }
@@ -547,7 +548,43 @@ extern "system" fn window_proc(
     if title_window && message == wm::WM_INPUT {
         super::gameinput::mouse::receive(hwnd, wparam, lparam);
     }
+    if title_window && victory_gpu::display_output::native_resize_enabled() {
+        if message == wm::WM_SIZE {
+            let width = (lparam as usize & 0xffff) as u32;
+            let height = ((lparam as usize >> 16) & 0xffff) as u32;
+            victory_gpu::display_output::note_wm_size(hwnd as usize, wparam, width, height);
+        } else if message == wm::WM_DPICHANGED {
+            let dpi_x = (wparam & 0xffff) as u32;
+            let dpi_y = ((wparam >> 16) & 0xffff) as u32;
+            victory_gpu::display_output::note_wm_dpi_changed(hwnd as usize, dpi_x, dpi_y);
+            let full = WINDOWS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&(hwnd as usize))
+                .is_some_and(|s| s.full_screen);
+            if !full && lparam != 0 {
+                // SAFETY: Win32 guarantees `lparam` points to the suggested `RECT` for `WM_DPICHANGED`.
+                let suggested = unsafe { *(lparam as *const RECT) };
+                // SAFETY: our hooked top-level window on its own UI thread.
+                unsafe {
+                    wm::SetWindowPos(
+                        hwnd,
+                        std::ptr::null_mut(),
+                        suggested.left,
+                        suggested.top,
+                        suggested.right - suggested.left,
+                        suggested.bottom - suggested.top,
+                        wm::SWP_NOZORDER | wm::SWP_NOACTIVATE,
+                    );
+                }
+                return 0;
+            }
+        } else if message == wm::WM_DISPLAYCHANGE {
+            victory_gpu::display_output::note_display_change(hwnd as usize);
+        }
+    }
     if message == wm::WM_NCDESTROY {
+        victory_gpu::display_output::note_window_destroyed(hwnd as usize);
         WINDOWS.lock().unwrap_or_else(|e| e.into_inner()).remove(&(hwnd as usize));
         if title_window {
             super::gameinput::mouse::detach(hwnd);

@@ -11016,10 +11016,16 @@ mod display_format_tests {
     }
 }
 
-const BUFFERS: u32 = 2;
-
 struct Presenter {
-    swap_chain: IDXGISwapChain3,
+    swap_chain: IDXGISwapChain4,
+    buffer_count: u32,
+    swap_flags: DXGI_SWAP_CHAIN_FLAG,
+    tearing_enabled: bool,
+    waitable: Option<crate::display_output::WaitableLatency>,
+    color_space: crate::display_output::ColorSpace,
+    requested_color_space: crate::display_output::ColorSpace,
+    hdr_caps: crate::display_output::OutputHdrCaps,
+    occluded: bool,
     framegen: bool,
     width: u32,
     height: u32,
@@ -11454,6 +11460,24 @@ mod present_status_tests {
 }
 
 impl Host {
+    /// Signals `self.queue` and waits for completion of all prior queue work
+    /// (including `IDXGISwapChain::Present` calls) before `ResizeBuffers` or
+    /// swap-chain retirement.
+    pub(crate) fn drain_queue(&self) {
+        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        *submitted += 1;
+        let value = *submitted;
+        // SAFETY: signaling our own queue/fence and waiting on our own event under `submitted`.
+        unsafe {
+            if self.queue.Signal(&self.fence, value).is_ok()
+                && self.fence.GetCompletedValue() < value
+                && self.fence.SetEventOnCompletion(value, self.event).is_ok()
+            {
+                WaitForSingleObject(self.event, INFINITE);
+            }
+        }
+    }
+
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
@@ -11486,21 +11510,42 @@ impl Host {
             ))
         });
         let native_format = swap_format(desc.Format);
-        let Some(format) = display_format(native_format, base_view.is_some(), planes.is_some()) else {
-            tracing::warn!(format = desc.Format.0, "cannot present this format");
-            return None;
-        };
-        // Keep a single SDR format as Series S changes between UI and movie
-        // frames. The composer converts single-plane sources when needed.
-        let fg_format = if crate::console::current() == crate::console::Console::SeriesS && base_view.is_some() {
-            DXGI_FORMAT_R8G8B8A8_UNORM
-        } else {
-            format
-        };
+        let base_view = crate::compose::view(&desc);
+        let effective_native = native_format
+            .or_else(|| display_format(None, base_view.is_some(), planes.is_some()));
         let (width, height) = (desc.Width as u32, desc.Height);
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let pref = crate::display_output::hdr_preference();
+        let title_hdr = crate::display_output::title_hdr_enabled();
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {
-            *presenter = match self.presenter(width, height, format, fg_format, frame) {
+            let init_caps = crate::display_output::probe_output_hdr(title_window());
+            let Some(init_plan) = crate::display_output::plan_present(
+                effective_native.map(|f| f.0),
+                planes.is_some(),
+                init_caps.hdr_active,
+                title_hdr,
+                pref,
+            ) else {
+                tracing::warn!(format = desc.Format.0, "cannot present this format");
+                return None;
+            };
+            let format = if base_view.is_some() {
+                DXGI_FORMAT(init_plan.swap_format)
+            } else {
+                native_format?
+            };
+            let fg_format = if crate::console::current() == crate::console::Console::SeriesS
+                && base_view.is_some()
+                && init_plan.output_space == crate::display_output::ColorSpace::Sdr
+            {
+                DXGI_FORMAT_R8G8B8A8_UNORM
+            } else {
+                format
+            };
+            *presenter = match self.presenter(width, height, format, fg_format, init_plan.output_space, frame) {
                 Ok(p) => Some(p),
                 Err(e) => {
                     tracing::warn!(error = %e, "no swap chain");
@@ -11510,15 +11555,73 @@ impl Host {
         }
         let state_u32 = state;
         let p = presenter.as_mut()?;
-        let format = if p.framegen { fg_format } else { format };
+        let native_resize = crate::display_output::native_resize_enabled();
+        let win_state = if native_resize {
+            crate::display_output::window_state(p.hwnd.0 as usize)
+        } else {
+            crate::display_output::WindowResizeState::new()
+        };
+        if native_resize && win_state.should_skip_present() {
+            return None;
+        }
+        let display_reprobed = native_resize && win_state.needs_display_reprobe();
+        if display_reprobed {
+            p.hdr_caps = crate::display_output::probe_output_hdr(Some(p.hwnd));
+            crate::display_output::mark_window_display_probed(p.hwnd.0 as usize);
+        }
+        if native_resize && p.occluded {
+            let probe = crate::display_output::present_swap_chain(
+                &p.swap_chain,
+                p.tearing_enabled,
+                0,
+                true,
+            );
+            if probe == windows::Win32::Foundation::DXGI_STATUS_OCCLUDED {
+                return None;
+            }
+            p.occluded = false;
+        }
+        let Some(plan) = crate::display_output::plan_present(
+            effective_native.map(|f| f.0),
+            planes.is_some(),
+            p.hdr_caps.hdr_active,
+            title_hdr,
+            pref,
+        ) else {
+            tracing::warn!(format = desc.Format.0, "cannot present this format");
+            return None;
+        };
+        let planned_format = if base_view.is_some() {
+            DXGI_FORMAT(plan.swap_format)
+        } else {
+            native_format?
+        };
+        let fg_format = if crate::console::current() == crate::console::Console::SeriesS
+            && base_view.is_some()
+            && plan.output_space == crate::display_output::ColorSpace::Sdr
+        {
+            DXGI_FORMAT_R8G8B8A8_UNORM
+        } else {
+            planned_format
+        };
+        let format = if p.framegen { fg_format } else { planned_format };
         if (p.width, p.height, p.format) != (width, height, format) {
-            // Presents sent ahead hold back buffers until they have run.
+            if native_resize && !win_state.can_resize_buffers(width, height) {
+                return None;
+            }
+            // Presents sent ahead hold back buffers until they have run, and
+            // draining the direct queue ensures any prior Present has finished
+            // before ResizeBuffers replaces the back buffers.
             settle_now(WHY_SYNC);
+            self.drain_queue();
+            let buffer_count = p.buffer_count;
+            let swap_flags = p.swap_flags;
             let resize_buffers = || {
-                // SAFETY: no back buffer is held; every submission was waited for.
+                // SAFETY: no back buffer is held; every submission was waited for;
+                // creation flags (ALLOW_TEARING / WAITABLE) are preserved verbatim.
                 unsafe {
                     p.swap_chain
-                        .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+                        .ResizeBuffers(buffer_count, width, height, format, swap_flags)
                 }
             };
             let resized = if p.framegen {
@@ -11533,10 +11636,28 @@ impl Host {
                     }
                     p.game_ui = None;
                     (p.width, p.height, p.format) = (width, height, format);
+                    if let Some(waitable) = p.waitable.as_mut() {
+                        waitable.note_presented();
+                    }
+                    if plan.output_space != crate::display_output::ColorSpace::Sdr
+                        || p.color_space != crate::display_output::ColorSpace::Sdr
+                    {
+                        p.color_space = crate::display_output::apply_color_space_and_metadata(
+                            &p.swap_chain,
+                            format,
+                            plan.output_space,
+                            &p.hdr_caps,
+                        );
+                    }
+                    p.requested_color_space = plan.output_space;
+                    if native_resize {
+                        crate::display_output::mark_window_resized(p.hwnd.0 as usize);
+                    }
                     tracing::info!(
                         width,
                         height,
                         format = format.0,
+                        color_space = ?p.color_space,
                         frame,
                         "the swap chain's buffers were made again for another size or format"
                     );
@@ -11556,8 +11677,32 @@ impl Host {
                     return None;
                 }
             }
+        } else if p.requested_color_space != plan.output_space
+            || display_reprobed
+            || !crate::display_output::format_matches_color_space(format.0, p.color_space)
+        {
+            if plan.output_space != crate::display_output::ColorSpace::Sdr
+                || p.color_space != crate::display_output::ColorSpace::Sdr
+            {
+                p.color_space = crate::display_output::apply_color_space_and_metadata(
+                    &p.swap_chain,
+                    format,
+                    plan.output_space,
+                    &p.hdr_caps,
+                );
+            }
+            p.requested_color_space = plan.output_space;
         }
-        let draw_planes = planes.is_some() || native_format != Some(format);
+        debug_assert!(crate::display_output::format_matches_color_space(
+            format.0,
+            p.color_space,
+        ));
+        let draw_planes =
+            (plan.needs_compose || native_format != Some(format) || plan.scene_space != p.color_space)
+                && base_view.is_some();
+        if p.composer.as_ref().is_some_and(|c| c.format() != format) {
+            p.composer = None;
+        }
         if draw_planes && p.composer.is_none() {
             match crate::compose::Composer::new(self, format) {
                 Ok(c) => p.composer = Some(c),
@@ -11569,6 +11714,9 @@ impl Host {
             }
         }
         let state = D3D12_RESOURCE_STATES(state_u32 as i32);
+        if let Some(waitable) = p.waitable.as_mut() {
+            let _ = waitable.wait_before_present();
+        }
         // SAFETY: our swap chain, list and live source texture(s).
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
@@ -11639,10 +11787,24 @@ impl Host {
                     Some((over, _, _, over_fmt)) if game_ui.is_none() => Picture::Composed(base, (over, over_fmt)),
                     _ => Picture::Scene(base),
                 };
-                let drawn = composer.record(self, compose_slot, list, picture, &back, (width, height))
+                let compose_params = crate::compose::ComposeParams {
+                    scene_space: plan.scene_space,
+                    output_space: p.color_space,
+                    paper_white_nits: crate::display_output::paper_white_nits(),
+                };
+                let drawn = composer
+                    .record(self, compose_slot, list, picture, &back, (width, height), compose_params)
                     .and_then(|()| {
                         if let (Some(ui), Some((over, _, _, over_fmt))) = (&game_ui, planes) {
-                            composer.record(self, compose_slot + 1, list, Picture::Overlay((over, over_fmt)), ui, (width, height))?;
+                            composer.record(
+                                self,
+                                compose_slot + 1,
+                                list,
+                                Picture::Overlay((over, over_fmt)),
+                                ui,
+                                (width, height),
+                                crate::compose::ComposeParams::default(),
+                            )?;
                         }
                         Ok(())
                     });
@@ -11811,6 +11973,7 @@ impl Host {
                     // before retiring the presenter, then render both planes.
                     drop(back);
                     settle_now(WHY_SYNC);
+                    self.drain_queue();
                     if !crate::framegen::release_swap_chain(|| drop(presenter.take())) {
                         return None;
                     }
@@ -11818,14 +11981,30 @@ impl Host {
                     return self.present_planes(texture, state_u32, overlay, frame, token);
                 }
                 let generation = registered && (planes.is_none() || game_ui.is_some());
-                let status = crate::framegen::present(&p.swap_chain, frame, token, generation);
+                let fg_flags = if p.tearing_enabled && crate::display_output::sync_interval() == 0 {
+                    DXGI_PRESENT(crate::display_output::PRESENT_ALLOW_TEARING_FLAG)
+                } else {
+                    DXGI_PRESENT(0)
+                };
+                let status = crate::framegen::present(&p.swap_chain, frame, token, generation, fg_flags);
                 if game_ui.is_some() {
                     p.ui_slot ^= 1;
                 }
                 status
             } else {
-                p.swap_chain.Present(0, DXGI_PRESENT(0))
+                let status = crate::display_output::present_swap_chain(
+                    &p.swap_chain,
+                    p.tearing_enabled,
+                    crate::display_output::sync_interval(),
+                    false,
+                );
+                if let Some(waitable) = p.waitable.as_mut() {
+                    waitable.note_presented();
+                }
+                status
             };
+            p.occluded =
+                native_resize && status == windows::Win32::Foundation::DXGI_STATUS_OCCLUDED;
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
             if status == windows::Win32::Foundation::S_OK {
@@ -11848,13 +12027,16 @@ impl Host {
         height: u32,
         format: DXGI_FORMAT,
         fg_format: DXGI_FORMAT,
+        desired_space: crate::display_output::ColorSpace,
         frame: u64,
     ) -> windows::core::Result<Presenter> {
+        crate::display_output::ensure_dpi_awareness();
         let title = title_window();
         let hwnd = match title {
             Some(hwnd) => hwnd,
             None => window(width, height)?,
         };
+        let hdr_caps = crate::display_output::probe_output_hdr(Some(hwnd));
         self.log_video_memory("right before the swap chain is made");
         // SAFETY: plain object creation for our window.
         unsafe {
@@ -11862,40 +12044,98 @@ impl Host {
             let copy = self.new_list()?;
             copy.close();
             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
-            let desc = DXGI_SWAP_CHAIN_DESC1 {
+            let buffer_count = crate::display_output::swap_buffer_count();
+            let fg_tearing = crate::display_output::check_tearing_support(&factory);
+            let fg_flags = if fg_tearing {
+                DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32
+            } else {
+                0
+            };
+            let fg_desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
-                Format: format,
+                Format: fg_format,
                 SampleDesc: DXGI_SAMPLE_DESC {
                     Count: 1,
                     Quality: 0,
                 },
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-                BufferCount: BUFFERS,
+                BufferCount: buffer_count,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                Flags: fg_flags,
                 ..Default::default()
             };
-            let fg_desc = DXGI_SWAP_CHAIN_DESC1 { Format: fg_format, ..desc };
             let generated = crate::framegen::requested()
                 .then(|| crate::framegen::swap_chain(hwnd, &fg_desc, &factory, &self.queue, &self.device, frame))
                 .flatten();
             let framegen = generated.is_some();
-            let swap_chain = match generated {
-                Some(swap_chain) => swap_chain,
-                None => factory
-                    .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
-                    .cast::<IDXGISwapChain3>()?,
+            let created = match generated {
+                Some(swap_chain) => {
+                    let (actual_buffers, actual_flags, actual_tearing) =
+                        match swap_chain.GetDesc1() {
+                            Ok(actual) => (
+                                actual.BufferCount.max(2),
+                                actual.Flags,
+                                (actual.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32) != 0,
+                            ),
+                            Err(_) => (buffer_count, fg_flags, fg_tearing),
+                        };
+                    if title.is_some() || actual_tearing {
+                        let _ = factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+                    }
+                    let color_space = if desired_space == crate::display_output::ColorSpace::Sdr {
+                        crate::display_output::ColorSpace::Sdr
+                    } else {
+                        crate::display_output::apply_color_space_and_metadata(
+                            &swap_chain,
+                            fg_format,
+                            desired_space,
+                            &hdr_caps,
+                        )
+                    };
+                    crate::display_output::CreatedSwapChain {
+                        swap_chain,
+                        buffer_count: actual_buffers,
+                        flags: DXGI_SWAP_CHAIN_FLAG(actual_flags as i32),
+                        tearing_enabled: actual_tearing,
+                        waitable: None,
+                        color_space,
+                    }
+                }
+                None => crate::display_output::create_swap_chain(
+                    &factory,
+                    &self.queue,
+                    hwnd,
+                    width,
+                    height,
+                    format,
+                    desired_space,
+                    &hdr_caps,
+                    true,
+                    title.is_some(),
+                )?,
             };
-            // Alt+Enter is the title window's own switch to and from full
-            // screen (frameless, the swap chain stretched); DXGI's would make
-            // it exclusive full screen, whose buffers nothing resizes.
-            if title.is_some() {
-                let _ = factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
-            }
-            tracing::info!(width, height, format = format.0, "presenting to a window");
+            tracing::info!(
+                width,
+                height,
+                format = if framegen { fg_format.0 } else { format.0 },
+                buffers = created.buffer_count,
+                tearing = created.tearing_enabled,
+                waitable = created.waitable.is_some(),
+                color_space = ?created.color_space,
+                "presenting to a window"
+            );
             self.log_video_memory("right after the swap chain is made");
             Ok(Presenter {
-                swap_chain,
+                swap_chain: created.swap_chain,
+                buffer_count: created.buffer_count,
+                swap_flags: created.flags,
+                tearing_enabled: created.tearing_enabled,
+                waitable: created.waitable,
+                color_space: created.color_space,
+                requested_color_space: desired_space,
+                hdr_caps,
+                occluded: false,
                 framegen,
                 width,
                 height,
@@ -11916,7 +12156,7 @@ impl Host {
 
 /// A visible top-level window of this process: the one the title made, if
 /// it made one.
-fn title_window() -> Option<HWND> {
+pub(crate) fn title_window() -> Option<HWND> {
     extern "system" fn visit(hwnd: HWND, found: LPARAM) -> windows::core::BOOL {
         let mut process = 0;
         // SAFETY: a window handle from the enumeration; `found` is ours.
@@ -12457,11 +12697,50 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if crate::display_output::native_resize_enabled() {
+        match message {
+            WM_SIZE => {
+                let width = (lparam.0 as usize & 0xffff) as u32;
+                let height = ((lparam.0 as usize >> 16) & 0xffff) as u32;
+                crate::display_output::note_wm_size(hwnd.0 as usize, wparam.0, width, height);
+            }
+            WM_DPICHANGED => {
+                let dpi_x = (wparam.0 & 0xffff) as u32;
+                let dpi_y = ((wparam.0 >> 16) & 0xffff) as u32;
+                crate::display_output::note_wm_dpi_changed(hwnd.0 as usize, dpi_x, dpi_y);
+                if lparam.0 != 0 {
+                    // SAFETY: `lparam` points to the system-suggested `RECT` during `WM_DPICHANGED`.
+                    let rect = unsafe { *(lparam.0 as *const RECT) };
+                    // SAFETY: repositioning our own fallback window on its UI thread.
+                    unsafe {
+                        let _ = SetWindowPos(
+                            hwnd,
+                            None,
+                            rect.left,
+                            rect.top,
+                            rect.right - rect.left,
+                            rect.bottom - rect.top,
+                            SWP_NOZORDER | SWP_NOACTIVATE,
+                        );
+                    }
+                    return LRESULT(0);
+                }
+            }
+            WM_DISPLAYCHANGE => {
+                crate::display_output::note_display_change(hwnd.0 as usize);
+            }
+            WM_NCDESTROY => {
+                crate::display_output::note_window_destroyed(hwnd.0 as usize);
+            }
+            _ => {}
+        }
+    }
     // SAFETY: the default handling for our window.
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
 
 fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
+    crate::display_output::ensure_dpi_awareness();
     const CLASS: PCWSTR = w!("VIctory");
     // SAFETY: registers our class once and creates a window of it.
     unsafe {

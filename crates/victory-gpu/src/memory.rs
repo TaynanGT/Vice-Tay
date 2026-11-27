@@ -230,8 +230,10 @@ static MEMORY: Mutex<Option<Memory>> = Mutex::new(None);
 pub(crate) struct Ready {
     pub(crate) directory: u64,
     pub(crate) faults: u64,
-    /// The view heap slot of the null view; copy `n`'s view is `n` further.
+    /// The view heap slot of the null raw UAV view; copy `n`'s UAV is `n` further.
     pub(crate) base: u32,
+    /// The view heap slot of the null raw SRV view; copy `n`'s read-only SRV is `n` further.
+    pub(crate) srv_base: u32,
 }
 
 impl Memory {
@@ -1090,21 +1092,29 @@ pub(crate) fn ready(
         *sum += n;
     }
     let key = std::ptr::from_ref(heap) as usize;
+    let run_len = COPIES + 1;
     let (base, made) = match m.heaps.get(&key) {
         Some(&run) => run,
         None => {
             // Held for the heap's life: not given back with a list's slots.
-            let base = heap.dynamic(COPIES + 1)?;
-            // Every slot of the run: a number shows no view of another kind.
+            // First half `[base, base + run_len)` holds raw UAVs (builders and
+            // shaders that store by address); second half `[base + run_len,
+            // base + 2 * run_len)` holds parallel read-only raw SRVs
+            // (`ByteAddressBuffer`) for ray-tracing walkers.
+            let base = heap.dynamic(2 * run_len)?;
+            // Every slot of both runs: a number shows no view of another kind.
             for n in 0..=COPIES {
                 heap.null_raw_uav_at(base + n);
+                heap.null_raw_at(base + run_len + n);
             }
             (base, 0)
         }
     };
+    let srv_base = base + run_len;
     for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
         let (_, len) = shadow.span();
         heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
+        heap.raw_at(srv_base + 1 + n as u32, &shadow.buffer, 0, len);
     }
     m.heaps.insert(key, (base, m.copies.len() as u32));
     // Every copy by every list that has come to by-address memory, whoever
@@ -1131,6 +1141,7 @@ pub(crate) fn ready(
         directory: directory.gpu(directory.span().0),
         faults: m.faults.2,
         base,
+        srv_base,
     })
 }
 
@@ -1364,5 +1375,247 @@ mod tests {
         assert_eq!(packed_len(header(0x8102_0007, 5)), None);
         assert_eq!(packed_len(header(0x8102_0006, 0)), None);
         assert_eq!(packed_len(header(0x8102_0006, 1 << 21)), None);
+    }
+
+    /// Verifies bidirectional intra-list coherency (`UAV write -> RAW barrier ->
+    /// RO SRV read -> WAR barrier -> UAV overwrite`) on the SAME `COMMON`-state
+    /// `uav_buffer` inside a single `HostList` via `HostList::note_memory_access`,
+    /// using SM 6.6 `ResourceDescriptorHeap` raw UAV and raw SRV views under
+    /// `VICTORY_D3D12_DEBUG=1` on both HW and WARP.
+    #[test]
+    fn intra_list_uav_srv_uav_coherency_on_common_buffer() {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_TYPELESS;
+        use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+        use windows::core::Interface;
+
+        let Some(host) = host() else {
+            eprintln!("no host GPU; skipped");
+            return;
+        };
+        let dxc = std::env::var_os("VICTORY_DXC")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                let bin = std::path::Path::new(r"C:\Program Files (x86)\Windows Kits\10\bin");
+                let mut versions: Vec<_> = std::fs::read_dir(bin)
+                    .ok()?
+                    .filter_map(Result::ok)
+                    .map(|e| e.path())
+                    .collect();
+                versions.sort();
+                versions
+                    .into_iter()
+                    .rev()
+                    .map(|v| v.join(r"x64\dxc.exe"))
+                    .find(|p| p.exists())
+            });
+        let Some(dxc) = dxc else {
+            eprintln!("no dxc.exe; skipped");
+            return;
+        };
+
+        const HLSL: &str = r#"
+#define RS "RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED), RootConstants(num32BitConstants=3, b0)"
+cbuffer C : register(b0) { uint mode; uint base_val; uint dst_slot; };
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint id : SV_DispatchThreadID) {
+    if (mode == 0u) {
+        RWByteAddressBuffer target = ResourceDescriptorHeap[0];
+        target.Store(id * 4u, base_val | id);
+    } else {
+        ByteAddressBuffer target = ResourceDescriptorHeap[1];
+        RWByteAddressBuffer outb = ResourceDescriptorHeap[dst_slot];
+        outb.Store(id * 4u, target.Load(id * 4u));
+    }
+}
+"#;
+        let dir = std::env::temp_dir().join(format!("victory-mem-coherency-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let hlsl = dir.join("coherency.hlsl");
+        let cso = dir.join("coherency.cso");
+        std::fs::write(&hlsl, HLSL).unwrap();
+        let out = std::process::Command::new(&dxc)
+            .args(["-T", "cs_6_6", "-E", "main", "-O3", "-Fo"])
+            .arg(&cso)
+            .arg(&hlsl)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "dxc failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let code = std::fs::read(&cso).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        const WORDS: usize = 64;
+        const BYTES: u64 = (WORDS * 4) as u64;
+        let device = &host.device;
+        let info_queue = device.cast::<ID3D12InfoQueue>().ok();
+        if let Some(iq) = &info_queue {
+            // SAFETY: clear prior messages so we count only messages from this test.
+            unsafe { iq.ClearStoredMessages() };
+        }
+        let target = host.uav_buffer(BYTES).expect("target uav_buffer");
+        let observed = host.uav_buffer(BYTES).expect("observed uav_buffer");
+        let rb_obs = host.read_back_buffer(BYTES).expect("rb_obs");
+        let rb_tgt = host.read_back_buffer(BYTES).expect("rb_tgt");
+        let hlist = host.new_list().expect("HostList");
+
+        // SAFETY: valid D3D12 objects outlive command-list execution and fence wait.
+        unsafe {
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, &code).unwrap();
+            let pso: ID3D12PipelineState = device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.as_ptr().cast(),
+                        BytecodeLength: code.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            let heap: ID3D12DescriptorHeap = device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 3,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .unwrap();
+            let step = device
+                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                as usize;
+            let start = heap.GetCPUDescriptorHandleForHeapStart();
+            let raw_uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_UAV {
+                        FirstElement: 0,
+                        NumElements: WORDS as u32,
+                        StructureByteStride: 0,
+                        CounterOffsetInBytes: 0,
+                        Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                    },
+                },
+            };
+            let raw_srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_SRV {
+                        FirstElement: 0,
+                        NumElements: WORDS as u32,
+                        StructureByteStride: 0,
+                        Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                    },
+                },
+            };
+            // Slot 0: target raw UAV; slot 1: target raw SRV; slot 2: observed raw UAV.
+            device.CreateUnorderedAccessView(&target, None::<&ID3D12Resource>, Some(&raw_uav), start);
+            device.CreateShaderResourceView(
+                &target,
+                Some(&raw_srv),
+                D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start.ptr + step },
+            );
+            device.CreateUnorderedAccessView(
+                &observed,
+                None::<&ID3D12Resource>,
+                Some(&raw_uav),
+                D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start.ptr + 2 * step },
+            );
+
+            let list = &hlist.list;
+            list.SetDescriptorHeaps(&[Some(heap.clone())]);
+            list.SetComputeRootSignature(&root);
+            list.SetPipelineState(&pso);
+
+            // 1. UAV write of pattern A (`0xCAFE_0000 | tid`) to COMMON `target`.
+            hlist.note_memory_access(false, true);
+            let pass1 = [0u32, 0xCAFE_0000, 2];
+            list.SetComputeRoot32BitConstants(0, 3, pass1.as_ptr().cast(), 0);
+            list.Dispatch(1, 1, 1);
+
+            // 2. RAW transition (`UAV -> RO SRV`): must flush UAV write & invalidate RO cache.
+            hlist.note_memory_access(true, false);
+            let pass2 = [1u32, 0, 2];
+            list.SetComputeRoot32BitConstants(0, 3, pass2.as_ptr().cast(), 0);
+            list.Dispatch(1, 1, 1);
+
+            // 3. WAR transition (`RO SRV -> UAV`): must drain RO SRV reads before overwrite.
+            hlist.note_memory_access(false, true);
+            let pass3 = [0u32, 0xBEEF_0000, 2];
+            list.SetComputeRoot32BitConstants(0, 3, pass3.as_ptr().cast(), 0);
+            list.Dispatch(1, 1, 1);
+
+            // Flush final UAV writes before readback copies.
+            hlist.note_memory_access(true, false);
+            list.CopyBufferRegion(&rb_obs, 0, &observed, 0, BYTES);
+            list.CopyBufferRegion(&rb_tgt, 0, &target, 0, BYTES);
+            hlist.close();
+
+            let queue: ID3D12CommandQueue = device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .unwrap();
+            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let event = CreateEventW(None, false, false, None).unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().unwrap())]);
+            queue.Signal(&fence, 1).unwrap();
+            fence.SetEventOnCompletion(1, event).unwrap();
+            WaitForSingleObject(event, INFINITE);
+
+            let mut p_obs = std::ptr::null_mut();
+            let mut p_tgt = std::ptr::null_mut();
+            rb_obs.Map(0, None, Some(&mut p_obs)).unwrap();
+            rb_tgt.Map(0, None, Some(&mut p_tgt)).unwrap();
+            let got_obs = std::slice::from_raw_parts(p_obs.cast::<u32>(), WORDS);
+            let got_tgt = std::slice::from_raw_parts(p_tgt.cast::<u32>(), WORDS);
+            for i in 0..WORDS {
+                assert_eq!(
+                    got_obs[i],
+                    0xCAFE_0000 | i as u32,
+                    "RO SRV read saw stale or post-overwrite dword at lane {i}"
+                );
+                assert_eq!(
+                    got_tgt[i],
+                    0xBEEF_0000 | i as u32,
+                    "final UAV overwrite mismatch at lane {i}"
+                );
+            }
+            rb_obs.Unmap(0, None);
+            rb_tgt.Unmap(0, None);
+            let _ = windows::Win32::Foundation::CloseHandle(event);
+            assert_eq!(device.GetDeviceRemovedReason(), Ok(()));
+            if let Some(iq) = &info_queue {
+                let n = iq.GetNumStoredMessagesAllowedByRetrievalFilter();
+                let mut bad = Vec::new();
+                for idx in 0..n {
+                    let mut len = 0usize;
+                    let _ = iq.GetMessage(idx, None, &mut len);
+                    if len == 0 {
+                        continue;
+                    }
+                    let mut buf = vec![0u8; len];
+                    let msg = buf.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                    if iq.GetMessage(idx, Some(msg), &mut len).is_ok() {
+                        let sev = (*msg).Severity;
+                        if sev == D3D12_MESSAGE_SEVERITY_CORRUPTION
+                            || sev == D3D12_MESSAGE_SEVERITY_ERROR
+                        {
+                            let txt = std::ffi::CStr::from_ptr((*msg).pDescription.cast())
+                                .to_string_lossy()
+                                .into_owned();
+                            bad.push(txt);
+                        }
+                    }
+                }
+                assert!(bad.is_empty(), "D3D12 debug errors: {bad:#?}");
+            }
+        }
     }
 }

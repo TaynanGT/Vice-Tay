@@ -108,6 +108,13 @@ pub const USER_ROOT_ADDRESS: u32 = 0x104;
 /// the group's width. Asked for by the structure builder's programs
 /// ([`crate::spill::is_spilled`]).
 pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
+/// `RootType::Other` code of a user-data dword the host computes: the first
+/// view-heap slot of the parallel read-only raw SRV run (`ByteAddressBuffer`)
+/// for [`SLOT_MEMORY`] copies (slot `base` is a null raw SRV; copy `n` is
+/// `base + n`). Used by read-only shaders that never store through raw
+/// addresses so ray-tracing walkers read through read-only caches instead of
+/// uncached raw UAVs.
+pub const USER_MEMORY_SRV_BASE: u32 = 0x107;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

@@ -3523,6 +3523,13 @@ struct Deferred {
     /// indirect arguments; 0 if none. It stays readable until the next
     /// clamp into it ([`HostList::indirect_state`]).
     indirect_readable: usize,
+    /// Whether this recording dispatched a shader writing buffers/by-address
+    /// memory through raw UAVs since the last read-only SRV cache flush.
+    memory_uav_written: bool,
+    /// Whether this recording dispatched a shader reading by-address memory
+    /// through read-only SRVs (`USER_MEMORY_SRV_BASE`) since the last UAV
+    /// write drain.
+    memory_srv_read: bool,
 }
 
 /// Mark preparations only once their lists reached the graphics queue.
@@ -5291,6 +5298,8 @@ mod torn;
 #[cfg(feature = "diagnostics")]
 mod traffic;
 pub(crate) mod upcheck;
+#[cfg(test)]
+mod rtbench;
 #[cfg(feature = "diagnostics")]
 mod stamps;
 #[cfg(feature = "diagnostics")]
@@ -9142,6 +9151,40 @@ impl HostList {
     /// next clamp moves it back to unordered access.
     pub(crate) fn indirect_readable(&self, scratch: &ID3D12Resource) {
         self.deferred().indirect_readable = scratch.as_raw() as usize;
+    }
+
+    /// Tracks by-address read-only SRV reads (`USER_MEMORY_SRV_BASE`) vs UAV
+    /// buffer writes (by-address `USER_MEMORY_BASE` builders or regular UAV
+    /// stores that may alias numbered `memory::copies`) in this recording.
+    /// Emits one global barrier (`place::wait_for_all`) on **both** RAW
+    /// (`UAV -> SRV`, flushing UAV stores and invalidating L1/L2 RO SRV caches)
+    /// and WAR (`SRV -> UAV`, draining prior RO SRV reads before UAV writes),
+    /// with zero barriers on pure walker or pure non-RT recordings and without
+    /// altering legacy `COMMON` buffer state tracking.
+    pub(crate) fn note_memory_access(&self, reads_srv: bool, writes_uav: bool) {
+        let flush = {
+            let mut deferred = self.deferred();
+            let raw = reads_srv && deferred.memory_uav_written;
+            let war = writes_uav && deferred.memory_srv_read;
+            if raw {
+                deferred.memory_uav_written = false;
+            }
+            if war {
+                deferred.memory_srv_read = false;
+            }
+            if reads_srv {
+                deferred.memory_srv_read = true;
+            }
+            if writes_uav {
+                deferred.memory_uav_written = true;
+            }
+            raw || war
+        };
+        if flush && let Some(host) = host() {
+            // SAFETY: an open list; flushes UAV stores and drains prior RO SRV
+            // reads without altering legacy COMMON state.
+            unsafe { place::wait_for_all(host, &self.list) };
+        }
     }
 
     /// Keeps `object` alive until the list is reset.

@@ -35,8 +35,10 @@
 //!   in its padding (as pull request #53 did). That one is not safe: at 0.5
 //!   on Series S (run res-6) FidelityFX's jitter phase count came back 0 and
 //!   the title divided by it (+0x28f03e8) 49 s in.
-//! - **Upscaler.** `VICTORY_UPSCALER=<kind>` makes the picker return
-//!   `kind` (pull request #53): 6 the title's own, 7 FidelityFX.
+//! - **Upscaler.** `VICTORY_UPSCALER=<kind>` makes the picker and its
+//!   per-frame copy (+0x5400190) return `kind` (pull request #53): 6 the
+//!   title's own, 7 FidelityFX. On a Series S of the known build both return
+//!   6 without it (`VICTORY_TITLE_PATCHES=0` leaves them; `=1` on any console).
 
 use crate::frame_rate::Patched;
 
@@ -192,6 +194,27 @@ pub const PICKER: Site = Site {
     ],
 };
 
+/// The picker's per-frame copy, +0x5400190 (its first 32 bytes): the
+/// title asks it again every frame, so with only [`PICKER`] changed a
+/// Series S still switches to FidelityFX. (victory-fork #798, by KyleS98.)
+pub const PICKER_FRAME: Site = Site {
+    at: 0x540_0190,
+    what: "upscaler picker (the per-frame copy)",
+    bytes: &[
+        0x48, 0x83, 0xec, 0x28, 0x48, 0x8b, 0x05, 0xb5, 0xe2, 0x1d, 0x02, 0x48, 0x8d, 0x0d, 0x5e, 0x00, 0x00, 0x00, 0x48, 0x8b,
+        0x80, 0xa8, 0x00, 0x00, 0x00, 0x48, 0x39, 0xc8, 0x75, 0x3c, 0xe8, 0x4d,
+    ],
+};
+
+/// The upscaler both pickers are made to return: `VICTORY_UPSCALER` if set;
+/// else, on a Series S of the known build (`series_s_default`), 6, the
+/// title's own: FidelityFX's (7) output never reaches the screen here, and
+/// its DLL is refused by the host policy, so the world stays black.
+/// `VICTORY_TITLE_PATCHES=0` leaves the title's choice alone.
+pub fn upscaler_kind(asked: Option<u32>, series_s_default: bool) -> Option<u32> {
+    asked.or(series_s_default.then_some(6))
+}
+
 /// `rel32` from the end of an instruction at image offset `next` to `to`.
 fn rel(to: usize, next: usize) -> [u8; 4] {
     ((to as i64 - next as i64) as i32).to_le_bytes()
@@ -294,6 +317,88 @@ pub unsafe fn write(base: usize, size: usize, site: &Site, code: &[u8]) -> Patch
     Patched::Done
 }
 
+/// Writes every `(offset, old, new)` into the image of `size` bytes at
+/// `base`, all or nothing: every `old` is compared before anything is
+/// written (another build is left as it is), and if a site cannot be made
+/// writable part way, the sites already written get their old bytes back.
+/// `Err` names the first site that stopped it (its index) and why.
+///
+/// # Safety
+/// The image stays mapped and no thread runs its code yet.
+#[cfg(windows)]
+pub unsafe fn write_all(base: usize, size: usize, sites: &[(usize, &[u8], &[u8])]) -> Result<(), (usize, Patched)> {
+    // SAFETY: the caller's promise; `put` is only handed places inside the image.
+    unsafe { write_all_with(base, size, sites, |at, bytes| put(at, bytes)) }
+}
+
+/// [`write_all`] with the writer handed in (tests make it fail).
+///
+/// # Safety
+/// As [`write_all`]; `put` writes `bytes` at the address it is given.
+pub(crate) unsafe fn write_all_with(
+    base: usize,
+    size: usize,
+    sites: &[(usize, &[u8], &[u8])],
+    mut put: impl FnMut(usize, &[u8]) -> Result<(), &'static str>,
+) -> Result<(), (usize, Patched)> {
+    for (i, &(at, old, new)) in sites.iter().enumerate() {
+        if new.len() > old.len() || at.checked_add(old.len()).is_none_or(|end| end > size) {
+            return Err((i, Patched::Failed("outside the image or longer than the bytes compared")));
+        }
+        // SAFETY: inside the mapped image (checked above).
+        let there = unsafe { std::slice::from_raw_parts((base + at) as *const u8, old.len()) };
+        if there != old {
+            return Err((i, Patched::Differs));
+        }
+    }
+    for (i, &(at, _, new)) in sites.iter().enumerate() {
+        if let Err(why) = put(base + at, new) {
+            // The ones written already go back to what they were.
+            for &(at, old, new) in sites[..i].iter().rev() {
+                let _ = put(base + at, &old[..new.len()]);
+            }
+            return Err((i, Patched::Failed(why)));
+        }
+    }
+    Ok(())
+}
+
+/// `bytes` written at `at` in code memory: made writable for it, put back,
+/// the instruction cache flushed.
+///
+/// # Safety
+/// `at..at + bytes.len()` is mapped image memory no thread runs yet.
+#[cfg(windows)]
+unsafe fn put(at: usize, bytes: &[u8]) -> Result<(), &'static str> {
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut old = 0;
+    // SAFETY: the caller's promise.
+    unsafe {
+        if VirtualProtect(at as *const _, bytes.len(), PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+            return Err("Windows would not make it writable");
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, bytes.len());
+        VirtualProtect(at as *const _, bytes.len(), old, &mut old);
+        FlushInstructionCache(GetCurrentProcess(), at as *const _, bytes.len());
+    }
+    Ok(())
+}
+
+/// [`write_all`] for patches given by image offset (`rva`), `Err` as text
+/// naming the site that stopped it. All or nothing, rolled back on a failed
+/// write part way.
+///
+/// # Safety
+/// The image stays mapped and no thread runs its code yet.
+#[cfg(windows)]
+pub unsafe fn write_all_checked(base: usize, size: usize, patches: &[(u32, Vec<u8>, Vec<u8>)]) -> Result<(), String> {
+    let sites: Vec<(usize, &[u8], &[u8])> = patches.iter().map(|(rva, old, new)| (*rva as usize, &old[..], &new[..])).collect();
+    // SAFETY: the caller's promise.
+    unsafe { write_all(base, size, &sites) }.map_err(|(i, why)| format!("+{:#x}: {why:?}", patches[i].0))
+}
+
 /// Applies what the switches ask for; a line each in the log and on
 /// standard output.
 ///
@@ -301,7 +406,7 @@ pub unsafe fn write(base: usize, size: usize, site: &Site, code: &[u8]) -> Patch
 /// The image of `size` bytes at `base` stays mapped and no thread runs its
 /// code yet.
 #[cfg(windows)]
-pub unsafe fn apply_asked(base: usize, size: usize) {
+pub unsafe fn apply_asked(base: usize, size: usize, series_s_default: bool) {
     let mut asked: Vec<(&Site, Vec<u8>, String)> = Vec::new();
     if let Some((w, h)) = asked_output() {
         let split_code = ui_plane::requested(
@@ -338,8 +443,29 @@ pub unsafe fn apply_asked(base: usize, size: usize) {
     if let Some(s) = asked_ffx_scale() {
         asked.push((&FFX_SCALE, ffx_scale_code(s), format!("{s}")));
     }
-    if let Some(kind) = asked_upscaler() {
-        asked.push((&PICKER, picker_code(kind), format!("returns {kind}")));
+    // The two upscaler choices as a pair: both sites are compared first, and
+    // neither is written unless both are the expected bytes (as in
+    // fxceless/victory-fork #798), so the title never runs with one choice
+    // changed and the other not.
+    if let Some(kind) = upscaler_kind(asked_upscaler(), series_s_default) {
+        let code = picker_code(kind);
+        let pair = [(PICKER.at, PICKER.bytes, &code[..]), (PICKER_FRAME.at, PICKER_FRAME.bytes, &code[..])];
+        // SAFETY: the caller's promise.
+        match unsafe { write_all(base, size, &pair) } {
+            Ok(()) => {
+                for site in [&PICKER, &PICKER_FRAME] {
+                    let offset = format!("{:#x}", site.at);
+                    tracing::info!(site = %offset, what = site.what, value = %format!("returns {kind}"), "resolution: patched");
+                    println!("resolution: {} (returns {kind}) at title+{offset}: Done", site.what);
+                }
+            }
+            Err((i, why)) => {
+                let site = [&PICKER, &PICKER_FRAME][i];
+                let offset = format!("{:#x}", site.at);
+                tracing::warn!(site = %offset, what = site.what, ?why, "resolution: upscaler choice not patched at either site (another build?)");
+                println!("resolution: upscaler choice (returns {kind}) not patched: title+{offset} {why:?}; neither site written");
+            }
+        }
     }
     for (site, code, value) in asked {
         // SAFETY: the caller's promise.
@@ -430,7 +556,105 @@ mod tests {
         let changed: Vec<usize> = (0..ffx.len()).filter(|&i| ffx[i] != FFX_SCALE.bytes[i]).collect();
         assert!(changed.iter().all(|&i| (0x2c..0x30).contains(&i) || (0x36..0x3a).contains(&i) || (0x64..0x68).contains(&i)));
         assert_eq!(picker_code(7), [0xb8, 7, 0, 0, 0, 0xc3]);
+        assert!(picker_code(6).len() <= PICKER_FRAME.bytes.len());
+        assert_eq!(PICKER_FRAME.bytes[..6], [0x48, 0x83, 0xec, 0x28, 0x48, 0x8b]);
         assert_eq!(pool_check_code(), [0x48, 0x3d, 0xff, 0xff, 0x1f, 0x00, 0xeb, 0x01]);
+    }
+
+    #[test]
+    fn series_s_takes_the_titles_own_upscaler_unless_asked() {
+        assert_eq!(upscaler_kind(None, true), Some(6));
+        assert_eq!(upscaler_kind(None, false), None);
+        assert_eq!(upscaler_kind(Some(7), true), Some(7));
+        assert_eq!(upscaler_kind(Some(6), false), Some(6));
+    }
+
+    /// Memory of our own standing for an image: the picker pair at 0x100 and
+    /// 0x200, written through a writer that may fail on a given call.
+    fn pair_image(second: &[u8]) -> Vec<u8> {
+        let mut image = vec![0xccu8; 0x300];
+        image[0x100..0x100 + PICKER.bytes.len()].copy_from_slice(PICKER.bytes);
+        image[0x200..0x200 + second.len()].copy_from_slice(second);
+        image
+    }
+
+    fn write_pair(image: &mut [u8], fail_at: Option<usize>) -> Result<(), (usize, Patched)> {
+        let code = picker_code(6);
+        let pair = [(0x100, PICKER.bytes, &code[..]), (0x200, PICKER_FRAME.bytes, &code[..])];
+        let base = image.as_mut_ptr() as usize;
+        let mut calls = 0;
+        // SAFETY: `image` is ours and outlives the call; the writer stays inside it.
+        unsafe {
+            write_all_with(base, image.len(), &pair, |at, bytes| {
+                calls += 1;
+                if Some(calls) == fail_at {
+                    return Err("refused");
+                }
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, bytes.len());
+                Ok(())
+            })
+        }
+    }
+
+    /// Both upscaler choices are written, or neither: a second site that is
+    /// not the expected bytes leaves the first as it was.
+    #[test]
+    fn the_upscaler_pair_is_written_whole_or_not_at_all() {
+        let mut image = pair_image(PICKER_FRAME.bytes);
+        assert_eq!(write_pair(&mut image, None), Ok(()));
+        assert_eq!(image[0x100..0x106], picker_code(6)[..]);
+        assert_eq!(image[0x200..0x206], picker_code(6)[..]);
+
+        let mut other = PICKER_FRAME.bytes.to_vec();
+        other[10] ^= 0xff;
+        let mut image = pair_image(&other);
+        let before = image.clone();
+        assert_eq!(write_pair(&mut image, None), Err((1, Patched::Differs)));
+        assert_eq!(image, before, "nothing written when the second site differs");
+    }
+
+    /// A site that cannot be written after the first has been: the first gets
+    /// its old bytes back.
+    #[test]
+    fn a_failed_write_after_the_first_site_puts_the_first_back() {
+        let mut image = pair_image(PICKER_FRAME.bytes);
+        let before = image.clone();
+        assert_eq!(write_pair(&mut image, Some(2)), Err((1, Patched::Failed("refused"))));
+        assert_eq!(image, before);
+    }
+
+    /// The step patch's four sites (victory-game's `step::patches`) written
+    /// all or nothing: a site that cannot be written after the first ones
+    /// leaves every site with its old bytes.
+    #[test]
+    fn a_failed_step_site_after_the_first_rolls_all_back() {
+        // Four sites at small offsets standing for the real ones.
+        let olds: [Vec<u8>; 4] = [vec![0xcc; 4], vec![0xc5, 0xfa, 0x10, 0x1d, 1, 2, 3, 4], vec![0xc5, 0xfa, 0x10, 0x05, 5, 6, 7, 8], vec![0xc5, 0xfa, 0x10, 0x05, 9, 10, 11, 12]];
+        let news: [Vec<u8>; 4] = [0.1f32.to_le_bytes().to_vec(), vec![0xc5, 0xfa, 0x10, 0x1d, 0xa, 0, 0, 0], vec![0xc5, 0xfa, 0x10, 0x05, 0xb, 0, 0, 0], vec![0xc5, 0xfa, 0x10, 0x05, 0xc, 0, 0, 0]];
+        let at = [0x10usize, 0x40, 0x80, 0xc0];
+        let mut image = vec![0u8; 0x100];
+        for i in 0..4 {
+            image[at[i]..at[i] + olds[i].len()].copy_from_slice(&olds[i]);
+        }
+        let before = image.clone();
+        let sites: Vec<(usize, &[u8], &[u8])> = (0..4).map(|i| (at[i], &olds[i][..], &news[i][..])).collect();
+        for fail in 2..=4 {
+            let base = image.as_mut_ptr() as usize;
+            let mut calls = 0;
+            // SAFETY: `image` is ours; the writer stays inside it.
+            let done = unsafe {
+                write_all_with(base, image.len(), &sites, |p, bytes| {
+                    calls += 1;
+                    if calls == fail {
+                        return Err("refused");
+                    }
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), p as *mut u8, bytes.len());
+                    Ok(())
+                })
+            };
+            assert_eq!(done, Err((fail - 1, Patched::Failed("refused"))), "failing write {fail}");
+            assert_eq!(image, before, "every site back after failing write {fail}");
+        }
     }
 
     #[cfg(windows)]

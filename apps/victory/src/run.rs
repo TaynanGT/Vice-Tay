@@ -177,10 +177,15 @@ pub fn run(
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let mut prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
-    match victory_game::identify(&hash) {
+    let build = victory_game::identify(&hash);
+    match build {
         Some(build) => println!("build          {} ({hash})", build.label),
         None => println!("build          unknown ({hash})"),
     }
+    // The known build's Series S upscaler choice (victory-loader's
+    // `resolution`): both pickers return the title's own upscaler.
+    let upscaler_default = build.is_some()
+        && known_patches_on(console, std::env::var("VICTORY_TITLE_PATCHES").ok().as_deref());
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
@@ -410,7 +415,38 @@ pub fn run(
     if execute && profile.is_none() {
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped and nothing of it has run yet.
-        unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
+        unsafe { victory_loader::resolution::apply_asked(image.base(), size, upscaler_default) };
+    }
+    // VICTORY_MAX_STEP_MS=<ms> (off without it): the title's longest
+    // simulation step (1/15 s) raised, so the world keeps real speed below
+    // 15 frames a second (victory-game's `step`). Only on the known build,
+    // every site compared first (all or nothing).
+    #[cfg(windows)]
+    if execute && let Ok(spec) = std::env::var("VICTORY_MAX_STEP_MS") {
+        match (victory_game::step::parse_ms(&spec), build) {
+            (Err(why), _) => eprintln!("VIctory: {why}; the title's step is left as it is"),
+            (Ok(_), None) => eprintln!("VIctory: VICTORY_MAX_STEP_MS: not a known build of the title; its step is left as it is"),
+            (Ok(ms), Some(_)) => {
+                let size = image.info().size_of_image as usize;
+                let patches = victory_game::step::patches(ms);
+                // SAFETY: the image stays mapped and nothing of it has run yet.
+                match unsafe { victory_loader::resolution::write_all_checked(image.base(), size, &patches) } {
+                    Ok(()) => {
+                        for (rva, old, new) in &patches {
+                            println!(
+                                "title patch    +{rva:#x} longest step {ms} ms (VICTORY_MAX_STEP_MS): {} -> {}",
+                                hex_str(old),
+                                hex_str(new)
+                            );
+                        }
+                        tracing::info!(ms, "title step: longest simulation step raised (VICTORY_MAX_STEP_MS)");
+                    }
+                    Err(why) => {
+                        eprintln!("VIctory: VICTORY_MAX_STEP_MS: {why}; the title's step is left as it is");
+                    }
+                }
+            }
+        }
     }
     if !execute {
         println!("not executing (pass --execute to start the title)");
@@ -420,6 +456,8 @@ pub fn run(
     victory_loader::set_before_thread_shutdown(victory_hle::known_pipelines::flush);
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
+    #[cfg(windows)]
+    step_log(image.base(), image.info().size_of_image as usize, build.is_some());
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);
     let late = LateDlls {
@@ -755,9 +793,112 @@ impl LoaderLock {
     }
 }
 
+/// `VICTORY_STEP_LOG=1` (off without it): every 5 s, how far the title's
+/// game time (victory-game's `step::GAME_TIMER`) moved against the wall
+/// clock. `game/wall` 1.00 is real speed; below 1 the title's longest step
+/// (1/15 s, `VICTORY_MAX_STEP_MS`) holds it back. Only on the known build
+/// (`known`: the timer's offset is that build's). Read only, from a thread of
+/// its own, sampling words the title writes without a lock: a sample counts
+/// only if the time word reads the same before and after the other two (a
+/// sample torn by the title's update is taken again). Works with or without
+/// the patch. A diagnostic, not part of the patch.
+#[cfg(windows)]
+fn step_log(base: usize, size: usize, known: bool) {
+    if std::env::var_os("VICTORY_STEP_LOG").is_none_or(|v| v != "1") {
+        return;
+    }
+    if !known {
+        eprintln!("VIctory: VICTORY_STEP_LOG: not a known build of the title; no step log");
+        return;
+    }
+    let at = victory_game::step::GAME_TIMER as usize;
+    if at + 0x10 > size {
+        return;
+    }
+    let timer = base + at;
+    let spawned = std::thread::Builder::new()
+        .name("victory-step-log".into())
+        .spawn(move || {
+            // SAFETY: inside the mapped image (checked above), which stays
+            // mapped for the process; plain reads of words the title writes.
+            let read = || loop {
+                // SAFETY: as above.
+                let sample = unsafe {
+                    let time = std::ptr::read_volatile(timer as *const u32);
+                    std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+                    let frames = std::ptr::read_volatile((timer + 4) as *const u32);
+                    let step = std::ptr::read_volatile((timer + 0xc) as *const f32);
+                    std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+                    (time, frames, step, std::ptr::read_volatile(timer as *const u32))
+                };
+                if sample.0 == sample.3 {
+                    break (sample.0, sample.1, sample.2);
+                }
+                std::thread::yield_now();
+            };
+            let mut since = (std::time::Instant::now(), read());
+            let mut longest = 0f32;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let now = read();
+                longest = longest.max(now.2);
+                let wall = since.0.elapsed();
+                if wall < std::time::Duration::from_secs(5) {
+                    continue;
+                }
+                let wall_ms = wall.as_secs_f64() * 1000.0;
+                let game_ms = now.0.wrapping_sub(since.1.0);
+                let frames = now.1.wrapping_sub(since.1.1);
+                tracing::info!(
+                    "title step: game/wall {:.2} (game time {} ms in {:.0} ms), {} frames by its counter, mean step {:.1} ms, longest {:.1} ms (VICTORY_STEP_LOG)",
+                    f64::from(game_ms) / wall_ms,
+                    game_ms,
+                    wall_ms,
+                    frames,
+                    if frames > 0 { f64::from(game_ms) / f64::from(frames) } else { 0.0 },
+                    longest * 1000.0,
+                );
+                since = (std::time::Instant::now(), now);
+                longest = 0.0;
+            }
+        });
+    if let Err(e) = spawned {
+        eprintln!("VIctory: VICTORY_STEP_LOG: no thread for it ({e})");
+    }
+}
+
+/// Bytes as lower-case hex.
+#[cfg(windows)]
+fn hex_str(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Whether the known build's Series S upscaler choice applies, given
+/// `VICTORY_TITLE_PATCHES` (`var`): `0` never, `1` on any console; unset
+/// (or anything else), only with `--console series-s`. On a Series X the
+/// pickers already return what is written.
+fn known_patches_on(console: Console, var: Option<&str>) -> bool {
+    match var.map(str::trim) {
+        Some("0") => false,
+        Some("1") => true,
+        _ => matches!(console, Console::SeriesS),
+    }
+}
+
 #[cfg(test)]
 mod absent_tests {
     use super::absent_title_dlls;
+
+    /// The known build's upscaler choice: on with `--console series-s`, off
+    /// on a Series X unless asked for, and off everywhere with `0`.
+    #[test]
+    fn title_patches_follow_the_console_and_the_switch() {
+        use super::{Console, known_patches_on};
+        assert!(known_patches_on(Console::SeriesS, None));
+        assert!(!known_patches_on(Console::SeriesX, None));
+        assert!(!known_patches_on(Console::SeriesS, Some("0")));
+        assert!(known_patches_on(Console::SeriesX, Some("1")));
+    }
 
     #[test]
     fn title_dlls_missing_from_the_folder_are_named_once() {

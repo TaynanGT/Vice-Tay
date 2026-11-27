@@ -101,6 +101,14 @@ How each of these was found, with the numbers:
     are not on the default list.
 - The shader cache rebuilds entries when the translator version changes.
 
+- **Series S upscaler choice** (known build only): with `--console series-s` the
+  title's upscaler picker (+0x7e93f0) and its per-frame copy (+0x5400190) both
+  return 6, its own upscaler, instead of AMD FidelityFX, whose DLL the host
+  policy refuses. The two sites are compared first and written as a pair, or not
+  at all. `VICTORY_TITLE_PATCHES=0` turns the automatic choice off, `=1` applies
+  it on any console; an explicit `VICTORY_UPSCALER=<kind>` (6 or 7) always takes
+  precedence and is written to both sites.
+
 ## Loading and the runtime
 
 - Set `VICTORY_MAPPING_WAIT_MS` to a positive number of milliseconds to limit

@@ -3163,7 +3163,11 @@ impl HostHeap {
 
     /// Starts a stack-buffered batch for [`HostHeap::make_listed_into`] copies.
     pub(crate) fn list_copy_batch(&self) -> ListCopyBatch<'_> {
-        ListCopyBatch::new(self)
+        static BATCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let batched = *BATCH.get_or_init(|| {
+            std::env::var_os("VICTORY_BATCH_LIST_VIEWS").is_none_or(|value| value != "0")
+        });
+        ListCopyBatch::new(self, batched)
     }
 
     /// Makes slot `index` (a dynamic one) the view the record `words` names,
@@ -3209,6 +3213,9 @@ impl HostHeap {
                 self.write_view_metadata(index, made.stride_word, made.address);
                 if let Some(old) = self.swap_kept_ref(index, made.kept.as_ref()) {
                     batch.defer_retire(old);
+                }
+                if !batch.batched {
+                    batch.flush();
                 }
                 made.listed
             };
@@ -6833,6 +6840,7 @@ mod tests {
 /// one descriptor) instead of one driver call per slot.
 pub(crate) struct ListCopyBatch<'a> {
     heap: &'a HostHeap,
+    batched: bool,
     dst: [D3D12_CPU_DESCRIPTOR_HANDLE; 64],
     src: [D3D12_CPU_DESCRIPTOR_HANDLE; 64],
     #[cfg(feature = "diagnostics")]
@@ -6846,9 +6854,10 @@ pub(crate) struct ListCopyBatch<'a> {
 }
 
 impl<'a> ListCopyBatch<'a> {
-    fn new(heap: &'a HostHeap) -> Self {
+    fn new(heap: &'a HostHeap, batched: bool) -> Self {
         Self {
             heap,
+            batched,
             dst: [D3D12_CPU_DESCRIPTOR_HANDLE::default(); 64],
             src: [D3D12_CPU_DESCRIPTOR_HANDLE::default(); 64],
             #[cfg(feature = "diagnostics")]
@@ -6930,15 +6939,17 @@ impl<'a> ListCopyBatch<'a> {
                 }
             }
             if let Some(host) = host() {
-                if len == 1 {
-                    // SAFETY: a slot of our heap, and one of this thread's heap.
-                    unsafe {
-                        host.device.CopyDescriptorsSimple(
-                            1,
-                            self.dst[0],
-                            self.src[0],
-                            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                        );
+                if len == 1 || !self.batched {
+                    for (&dst, &src) in self.dst[..len].iter().zip(&self.src[..len]) {
+                        // SAFETY: a slot of our heap, and one of this thread's heap.
+                        unsafe {
+                            host.device.CopyDescriptorsSimple(
+                                1,
+                                dst,
+                                src,
+                                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                            );
+                        }
                     }
                 } else {
                     // SAFETY: `len` destination slots of our heap and `len` source slots
@@ -7015,7 +7026,7 @@ pub(crate) mod zero_alloc_tests {
         // Warm `ListViews` cache for one recording.
         const BENCH_REC: u64 = 0xbe4c_4001;
         {
-            let mut warmup = heap.list_copy_batch();
+            let mut warmup = ListCopyBatch::new(&heap, true);
             for (k, &rec) in records.iter().enumerate() {
                 let listed = heap.make_listed_into(BENCH_REC, rec, s0 + k as u32, &mut warmup);
                 assert!(listed.is_some());
@@ -7033,7 +7044,7 @@ pub(crate) mod zero_alloc_tests {
 
         let t1 = Instant::now();
         for _ in 0..TABLES {
-            let mut batch = heap.list_copy_batch();
+            let mut batch = ListCopyBatch::new(&heap, true);
             for (k, &rec) in records.iter().enumerate() {
                 black_box(heap.make_listed_into(BENCH_REC, rec, s0 + k as u32, &mut batch));
             }
@@ -7135,7 +7146,7 @@ pub(crate) mod zero_alloc_tests {
 
         const RECORDING: u64 = 0x55aa_0001;
         {
-            let mut batch = heap.list_copy_batch();
+            let mut batch = ListCopyBatch::new(&heap, true);
             for k in 0..SLOTS {
                 let rec = match k % 3 {
                     0 => rec_a,
@@ -7189,7 +7200,7 @@ pub(crate) mod zero_alloc_tests {
         // (62 copies) = 63 queued, then 1 twinned slot must auto-flush the 63
         // (and drain deferred retirements) before queueing the new pair.
         if has_twins {
-            let mut batch = heap.list_copy_batch();
+            let mut batch = ListCopyBatch::new(&heap, true);
             heap.make_listed_into(RECORDING, rec_tex, s0, &mut batch)
                 .expect("non-twinned slot should list");
             assert_eq!(batch.len, 1);
@@ -7227,7 +7238,7 @@ pub(crate) mod zero_alloc_tests {
             assert!(heap.twins[(s0 + 1) as usize].load(Ordering::Relaxed));
         }
         {
-            let mut batch = heap.list_copy_batch();
+            let mut batch = ListCopyBatch::new(&heap, true);
             let listed = heap
                 .make_listed_into(RECORDING, rec_tex, s0 + 1, &mut batch)
                 .expect("texture reuse should succeed");
@@ -7248,6 +7259,17 @@ pub(crate) mod zero_alloc_tests {
         assert_eq!(heap.shows(s0 + 1, &res_tex), Some(true));
 
         heap.release(heap.id(), s0, SLOTS);
+
+        let mut direct = ListCopyBatch::new(&heap, false);
+        let listed = heap.make_listed_into(RECORDING, rec_a, s0 + 1, &mut direct).unwrap();
+        assert!(!listed.texture);
+        assert_eq!(direct.len, 0);
+        assert_eq!(direct.retire_len, 0);
+        assert_eq!(read_address(s0 + 1), addr_a);
+        assert_eq!(
+            heap.kept_in(s0 + 1).as_ref().map(Interface::as_raw),
+            Some(res_a.as_raw()),
+        );
     }
 
     #[test]
@@ -7290,7 +7312,7 @@ pub(crate) mod zero_alloc_tests {
         heap.keep_ref(s0, Some(&old_a));
         assert_eq!(crate::host::references(&old_a), 2);
         {
-            let mut batch = heap.list_copy_batch();
+            let mut batch = ListCopyBatch::new(&heap, true);
             assert!(heap.make_listed_into(RECORDING, rec_tex, s0, &mut batch).is_some());
             assert_eq!(batch.len, 1);
             assert_eq!(batch.retire_len, 1);
@@ -7321,7 +7343,7 @@ pub(crate) mod zero_alloc_tests {
         heap.keep_ref(s0, Some(&old_b));
         assert_eq!(crate::host::references(&old_b), 2);
         {
-            let mut batch = heap.list_copy_batch();
+            let mut batch = ListCopyBatch::new(&heap, true);
             assert!(heap.make_listed_into(RECORDING, rec_tex, s0, &mut batch).is_some());
             assert_eq!(batch.retire_len, 1);
             assert_eq!(

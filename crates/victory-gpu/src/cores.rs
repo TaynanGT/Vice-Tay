@@ -276,22 +276,32 @@ fn ask(what: &str, from: u32) {
 }
 
 /// Whether the threads the submitting thread waits for run at its priority
-/// (`VICTORY_HELPER_PRIORITY`, on unless `0`; `VICTORY_AB` can flip it while
-/// the title runs): above normal, ahead of the title's threads and of the
-/// threads that translate lists. They are the threads that spread its work
+/// (`VICTORY_HELPER_PRIORITY=1`; off by default; `VICTORY_AB` can flip it
+/// while the title runs): above normal, ahead of the title's threads and of
+/// the threads that translate lists. They are the threads that spread its work
 /// (`shadow::wide`, the pools of `land`), the one that makes the heaps'
 /// records and the one that passes over the heap's views beside the lists.
+/// With `VICTORY_WIDE_SPIN` set, the `shadow::wide` workers busy-wait at that
+/// priority between jobs.
 ///
-/// The submitting thread is above normal (`queue::behind`); its helpers were
-/// not. On a six-core processor (i5-12400F, 12 threads) the title's threads
-/// and the list translators keep every core busy, and the submitting thread
-/// stood waiting for helpers that were not running. Measured with `VICTORY_AB`
-/// in one run (RTX 3060, `-Machine 4070`, Series S at half scale, medians of
-/// the steady phases, off / on): 10.8 / 11.4 fps, the submitting thread 87.0 /
-/// 77.3 ms a frame, refreshes 21.9 / 18.5 ms, waiting for the heaps' records
-/// 5.0 / 0.6 ms, the card idle behind the submitting thread 40.3 / 29.6 ms.
+/// The submitting thread is above normal (`queue::behind`); its helpers are
+/// not, so on a busy processor it can stand waiting for helpers that are not
+/// running. Measured on a six-core processor (i5-12400F, 12 threads, RTX 3060,
+/// `-Machine 4070`, Series S at half scale) with `VICTORY_AB`, standing still
+/// in one scene with the same draws in every phase (off / on): 11.6 / 11.7
+/// fps, refreshes 19.1 / 16.9 ms a frame, waiting for the heaps' records 0.5
+/// / 0.0 ms, the title's threads waiting at presents 33.9 / 28.9 ms. The
+/// waits shrink, the frame rate did not move, and the helpers then run ahead
+/// of the title's own normal-priority threads (simulation, audio, streaming),
+/// which on a smaller or busier processor may cost more than it gives: off
+/// until another processor measures it.
 fn helpers_raised() -> bool {
-    crate::toggled!("VICTORY_HELPER_PRIORITY")
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_HELPER_PRIORITY") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_HELPER_PRIORITY"))
 }
 
 /// A helper's priority ([`helpers_raised`]). [`Self::keep`] is called before

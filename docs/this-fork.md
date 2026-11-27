@@ -16,7 +16,10 @@ where there is one; the default is the behaviour described.
   -Machine 4090`; `-Machine auto` uses the same NVIDIA memory and rendering
   settings with worker counts sized to the CPU; `-Machine laptop` for 16 GB of RAM,
   [laptop-16gb.md](laptop-16gb.md); `-Machine 3060` for a six-core desktop with
-  16 GB, [rtx3060-16gb.md](rtx3060-16gb.md)): the thread counts and switches
+  16 GB, [rtx3060-16gb.md](rtx3060-16gb.md); `-Machine 4070tisuper` for a 16 GB
+  card and eight cores, measured on an RTX 5080 in
+  [rtx5080-16gb.md](rtx5080-16gb.md), and named by the launcher when `auto` meets
+  an NVIDIA card under 20 GB): the thread counts and switches
   `scripts\play.ps1` sets. `-Safe` keeps the wave-wide list there: without it four
   wave64 programs do not translate on a 32-lane card and their draws are dropped.
 - **A performance panel** in the top-left corner (diagnostics builds; on by

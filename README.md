@@ -75,7 +75,7 @@ If the title reaches the menu but stops at world load, verify your title files b
 | --- | --- |
 | `-Console series-s` | Select the lighter console profile used in the sessions above. |
 | `-Machine 4090` / `-Machine 4070` / `-Machine 7900xtx` | Select a GPU preset explicitly. See the [RTX 4070 test notes](docs/rtx4070-performance.md). |
-| `-Machine 4070tisuper` | The RTX 4070 Ti SUPER (16 GB) preset, asked for explicitly. With Resizable BAR on, it moves up to 4 GB of shader-read windows from RAM into the card's memory. |
+| `-Machine 4070tisuper` | The RTX 4070 Ti SUPER (16 GB) preset, asked for explicitly. With Resizable BAR on, it moves up to 4 GB of shader-read windows from RAM into the card's memory. Also [measured on an RTX 5080 with eight cores](docs/rtx5080-16gb.md), where it ran one scene at 27 fps against 16 with the RTX 4090 settings. |
 | `-Machine laptop` | Try the [16 GB NVIDIA laptop preset](docs/laptop-16gb.md), measured on one RTX 3050 laptop. |
 | `-Machine 3060` | Try the [six-core, 16 GB NVIDIA desktop preset](docs/rtx3060-16gb.md), measured on one RTX 3060 12 GB / i5-12400F PC. |
 | `-Safe` | Launch with the conservative settings when investigating a graphics or stability issue. |

@@ -49,9 +49,19 @@ $controllers = @(if ($Machine -in 'auto', '7900xtx') {
 })
 $hasNvidia = [bool]($controllers.PNPDeviceID -match 'VEN_10DE')
 $autoNvidia = $Machine -eq 'auto' -and $hasNvidia
+$smallerNvidiaGb = 0
 if ($Machine -eq 'auto') {
     # Keep the vendor defaults for memory and rendering. The measured machine profiles are explicit.
     $Machine = if ($hasNvidia) { '4090' } else { '7900xtx' }
+    if ($autoNvidia) {
+        # The card's memory as its driver records it (Win32_VideoController's AdapterRAM stops at
+        # 4 GB). Under 20 GiB those defaults leave title buffers under 4 MiB in the PC's memory.
+        $cardBytes = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}\0*' -ErrorAction SilentlyContinue |
+            Where-Object { $_.MatchingDeviceId -match 'ven_10de' } |
+            ForEach-Object { $_.'HardwareInformation.qwMemorySize' -as [uint64] } |
+            Sort-Object -Descending | Select-Object -First 1
+        if ($cardBytes -and $cardBytes -lt 20GB) { $smallerNvidiaGb = [int][math]::Round($cardBytes / 1GB) }
+    }
 }
 if ($Machine -eq '7900xtx') {
     # i9-12900K, RX 7900 XTX, 64 GB: the page-mapping lock was fastest with one
@@ -194,6 +204,12 @@ foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
 $profile = if ($autoNvidia) { 'automatic NVIDIA profile' } else { $Machine }
 Write-Host "Settings for the $profile$(if ($Safe) { ', safe' })$(if ($RayTracing) { ', with ray tracing' })."
+if ($smallerNvidiaGb) {
+    $preset = if ($smallerNvidiaGb -ge 15) { '4070tisuper' } else { '4070' }
+    Write-Host ("This NVIDIA card has $smallerNvidiaGb GB. The automatic profile keeps the RTX 4090's memory settings: " +
+        "title buffers under 4 MiB stay in the PC's memory. On an RTX 5080 (16 GB) one scene ran at 16 fps with the " +
+        "RTX 4090 settings and at 27 with -Machine 4070tisuper (docs/rtx5080-16gb.md). Try -Machine $preset.")
+}
 if ($Console -eq 'series-s' -and $Machine -ne '7900xtx') {
     Write-Host ("Series S requests {0} list translation threads, {1} for memory updates, and {2} for landing." -f
         $settings.VICTORY_THIN_THREADS, $settings.VICTORY_UNDER_THREADS, $settings.VICTORY_LAND_THREADS)

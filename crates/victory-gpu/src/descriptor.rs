@@ -12,6 +12,8 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
 pub(crate) mod host;
+#[cfg(any(windows, test))]
+mod slots;
 
 const HEAP_IIDS: [Iid; 4] = [
     guid(
@@ -908,6 +910,7 @@ pub(crate) fn with_heap<T>(heap: usize, f: impl FnOnce(&Heap) -> T) -> Option<T>
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if its host heap still has the identity that took the slots.
 #[cfg(windows)]
+#[allow(dead_code)]
 pub(crate) fn release_dynamic(heap: usize, id: u64, first: u32, n: u32) {
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     if heaps.iter().any(|&(_, _, h)| h == heap)
@@ -915,6 +918,49 @@ pub(crate) fn release_dynamic(heap: usize, id: u64, first: u32, n: u32) {
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
     {
         host.release(id, first, n);
+    }
+}
+
+/// Gives back a batch of `(heap, id, first, n)` dynamic slot ranges, acquiring
+/// `SHADER_HEAPS` once for the whole batch and each host heap's dynamic-slot
+/// lock once per distinct `(heap, id)` pair.
+#[cfg(windows)]
+pub(crate) fn release_dynamic_batch(ranges: &[(usize, u64, u32, u32)]) {
+    let Some(&(first_heap, first_id, _, _)) = ranges.first() else {
+        return;
+    };
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let host_for = |heap: usize| -> Option<&host::HostHeap> {
+        if heaps.iter().any(|&(_, _, h)| h == heap) {
+            // SAFETY: registered heaps are live (removed when dropped, which
+            // takes the `SHADER_HEAPS` write lock we hold shared here).
+            unsafe { &*(heap as *const Heap) }.host.get()?.as_ref()
+        } else {
+            None
+        }
+    };
+
+    // Fast path (the 99% case): every entry belongs to the same `(heap, id)`.
+    // Single `SHADER_HEAPS` lookup, single `HostHeap` lock, zero allocations.
+    if ranges
+        .iter()
+        .all(|&(h, id, _, _)| h == first_heap && id == first_id)
+    {
+        if let Some(host) = host_for(first_heap) {
+            host.release_batch(first_id, ranges.iter().map(|&(_, _, first, n)| (first, n)));
+        }
+        return;
+    }
+
+    // General path: group entries by `(heap, id)` so each distinct live host
+    // heap is looked up and locked at most once per identity.
+    let mut grouped = ranges.to_vec();
+    grouped.sort_unstable_by_key(|&(h, id, _, _)| (h, id));
+    for group in grouped.chunk_by(|a, b| a.0 == b.0 && a.1 == b.1) {
+        let (heap, id, _, _) = group[0];
+        if let Some(host) = host_for(heap) {
+            host.release_batch(id, group.iter().map(|&(_, _, first, n)| (first, n)));
+        }
     }
 }
 
@@ -2589,5 +2635,103 @@ mod tests {
         }
         eprintln!("words that tell shapes apart: {identity:?}");
         assert!(padding.0 <= 4, "padding alone made {} shapes out of {N}", padding.0);
+    }
+
+    /// Batched dynamic-slot reclamation handles empty batches, single-heap
+    /// fast path, multi-heap grouping, wrong host-heap identities, and mixed
+    /// valid/stale/dropped heap entries.
+    #[cfg(windows)]
+    #[test]
+    fn release_dynamic_batch_handles_empty_single_multi_wrong_id_and_stale() {
+        // Empty batch is a safe no-op.
+        release_dynamic_batch(&[]);
+
+        let desc = HeapDesc { kind: VIEWS_KIND, count: 16, flags: SHADER_VISIBLE, nodes: 1 };
+        let make_heap = || -> This {
+            let mut h = std::ptr::null();
+            assert_eq!(create(desc, Placement { address: 0, size: 0 }, &mut h), S_OK);
+            h
+        };
+
+        let h1 = make_heap();
+        let Some(host1) = heap(h1).host() else {
+            release(h1);
+            return; // no host GPU
+        };
+        let h2 = make_heap();
+        let Some(host2) = heap(h2).host() else {
+            release(h2);
+            release(h1);
+            return;
+        };
+        let h_stale = make_heap();
+        let Some(host_stale) = heap(h_stale).host() else {
+            release(h_stale);
+            release(h2);
+            release(h1);
+            return;
+        };
+        let stale_addr = h_stale as usize;
+        let stale_id = host_stale.id();
+        let stale_slot = host_stale.dynamic(4).expect("stale heap slots");
+        // Drop `h_stale` so its address is removed from `SHADER_HEAPS`.
+        release(h_stale);
+
+        let addr1 = h1 as usize;
+        let id1 = host1.id();
+        let addr2 = h2 as usize;
+        let id2 = host2.id();
+        let free1_init = host1.free_dynamic();
+        let free2_init = host2.free_dynamic();
+
+        // Single-heap fast path: allocate several ranges, test wrong-id fast
+        // path first (no-op), then release with the right id (including duplicate).
+        let a1 = host1.dynamic(5).unwrap();
+        let a2 = host1.dynamic(7).unwrap();
+        let a3 = host1.dynamic(3).unwrap();
+        assert_eq!(host1.free_dynamic(), free1_init - 15);
+
+        release_dynamic_batch(&[
+            (addr1, id1.wrapping_add(999), a1, 5),
+            (addr1, id1.wrapping_add(999), a2, 7),
+        ]);
+        assert_eq!(host1.free_dynamic(), free1_init - 15, "wrong id must not free");
+
+        release_dynamic_batch(&[
+            (addr1, id1, a1, 5),
+            (addr1, id1, a2, 7),
+            (addr1, id1, a2, 7), // duplicate
+            (addr1, id1, a3, 3),
+        ]);
+        assert_eq!(host1.free_dynamic(), free1_init, "single-heap fast path frees all once");
+
+        // Multi-heap + wrong-id + stale dropped heap + unknown address mixed in one batch.
+        let b1 = host1.dynamic(6).unwrap();
+        let b2 = host1.dynamic(4).unwrap();
+        let c1 = host2.dynamic(8).unwrap();
+        let c2 = host2.dynamic(2).unwrap();
+        let keep1 = host1.dynamic(3).unwrap();
+        assert_eq!(host1.free_dynamic(), free1_init - 13);
+        assert_eq!(host2.free_dynamic(), free2_init - 10);
+
+        release_dynamic_batch(&[
+            (addr2, id2, c1, 8),
+            (stale_addr, stale_id, stale_slot, 4), // dropped heap
+            (addr1, id1, b1, 6),
+            (addr1, id2, keep1, 3),                // wrong id for h1
+            (0xDEAD_BEEF, 12345, 16, 4),           // unregistered address
+            (addr2, id2, c2, 2),
+            (addr1, id1, b2, 4),
+            (addr2, id1, c2, 2),                   // wrong id for h2
+        ]);
+        assert_eq!(host1.free_dynamic(), free1_init - 3, "only valid h1 ranges freed; keep1 stays taken");
+        assert_eq!(host2.free_dynamic(), free2_init, "all valid h2 ranges freed");
+
+        // Release remaining slot via single-range helper and verify cleanup.
+        release_dynamic(addr1, id1, keep1, 3);
+        assert_eq!(host1.free_dynamic(), free1_init);
+
+        release(h2);
+        release(h1);
     }
 }

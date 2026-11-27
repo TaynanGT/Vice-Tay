@@ -250,11 +250,17 @@ mod host {
             // SAFETY: `data` was obtained above and is released after its last use.
             let status = unsafe { HidP_GetCaps(data, &mut caps) };
             unsafe { HidD_FreePreparsedData(data) };
-            if status != HIDP_STATUS_SUCCESS
-                || matches!(kind, ReportKind::DualShock4Usb)
-                    && (caps.UsagePage != 1 || caps.Usage != 5)
-                || caps.InputReportByteLength == 0
-                || caps.FeatureReportByteLength == 0
+            if status != HIDP_STATUS_SUCCESS {
+                return None;
+            }
+            Self::from_caps(&caps, kind)
+        }
+
+        fn from_caps(caps: &HIDP_CAPS, kind: ReportKind) -> Option<Self> {
+            let dualshock4 = matches!(kind, ReportKind::DualShock4Usb);
+            if caps.InputReportByteLength == 0
+                || dualshock4 && (caps.UsagePage != 1 || caps.Usage != 5)
+                || !dualshock4 && caps.FeatureReportByteLength == 0
             {
                 return None;
             }
@@ -263,6 +269,23 @@ mod host {
                 feature: vec![0; usize::from(caps.FeatureReportByteLength)],
             })
         }
+    }
+
+    #[test]
+    fn dualshock4_can_open_an_input_only_gamepad_collection() {
+        let mut caps = HIDP_CAPS {
+            UsagePage: 1,
+            Usage: 5,
+            InputReportByteLength: 64,
+            ..Default::default()
+        };
+        let reports = Reports::from_caps(&caps, ReportKind::DualShock4Usb).unwrap();
+        assert_eq!(reports.input.len(), 64);
+        assert!(reports.feature.is_empty());
+        assert!(Reports::from_caps(&caps, ReportKind::DualSenseUsb).is_none());
+
+        caps.Usage = 6;
+        assert!(Reports::from_caps(&caps, ReportKind::DualShock4Usb).is_none());
     }
 
     /// Feature report `id` into `buffer` (its first byte), `false` when the

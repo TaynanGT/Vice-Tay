@@ -51,6 +51,8 @@ pub mod fence;
 pub mod frame;
 #[cfg(windows)]
 pub mod framegen;
+#[cfg(windows)]
+mod streamline;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod book;
 #[cfg(windows)]

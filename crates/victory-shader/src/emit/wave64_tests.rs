@@ -1575,3 +1575,644 @@ fn the_console_threads_of_a_two_dimensional_group_are_each_given_once() {
     }
     eprintln!("ran on the hardware device: 64 console threads with the expected wave indices");
 }
+
+/// Helper for Wave32 LDS hardware parity tests: lowers `native` strictly via `lower::lower`
+/// (no `loose_lds`, no `local_waves`, no `widen`), asserts `wave_size == Some(32)`, validates
+/// DXIL when `dxil.dll` is present, and returns a `(Host, root, pso, HostShader)` ready to
+/// dispatch on a real 32-lane hardware adapter (panicking if `VICTORY_REQUIRE_HW_GPU=1` and no
+/// 32-lane hardware adapter is available).
+fn lower_and_prepare_wave32_lds_hw(
+    native: &NativeProgram,
+    label: &str,
+) -> Option<(Host, windows::Win32::Graphics::Direct3D12::ID3D12RootSignature, windows::Win32::Graphics::Direct3D12::ID3D12PipelineState, HostShader)> {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+    };
+
+    let p = crate::spill::build(native).expect("spill::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, native).expect("io::raise");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let lowered = lower::lower(&lower::Parts {
+        native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    });
+    lower::TEST_HOST_WAVE.set(was);
+    let lowered = lowered.unwrap_or_else(|e| panic!("{label}: lower failed: {e}"));
+    assert_eq!(
+        lowered.wave_size,
+        Some(32),
+        "{label}: expected exact Wave32 lowering without fallback"
+    );
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        root_indexed_views: res.root_indexed_views,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy)
+            .unwrap_or_else(|e| panic!("{label}: DXIL validation failed: {e}"));
+    }
+    let require_hw = std::env::var_os("VICTORY_REQUIRE_HW_GPU").is_some_and(|v| v == "1");
+    let use_warp = !require_hw && std::env::var_os("VICTORY_D3D12_WARP").is_some_and(|v| v == "1");
+    let host = match Host::new(use_warp) {
+        Ok(h) => h,
+        Err(e) => {
+            assert!(!require_hw, "{label}: VICTORY_REQUIRE_HW_GPU=1 set but Host::new failed: {e}");
+            eprintln!("{label}: no SM 6.6 adapter ({e}), skipping dispatch");
+            return None;
+        }
+    };
+    let mut waves = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: the output points at a feature structure of the specified size.
+    unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut waves).cast(),
+            size_of_val(&waves) as u32,
+        )
+    }
+    .expect("query host wave sizes");
+    let supports_wave32 =
+        waves.WaveOps.as_bool() && waves.WaveLaneCountMin <= 32 && waves.WaveLaneCountMax >= 32;
+    if !supports_wave32 {
+        assert!(
+            !require_hw,
+            "{label}: VICTORY_REQUIRE_HW_GPU=1 set but adapter wave range is {}..={} (expected 32)",
+            waves.WaveLaneCountMin,
+            waves.WaveLaneCountMax
+        );
+        eprintln!(
+            "{label}: adapter wave range {}..={} lacks Wave32, skipping dispatch",
+            waves.WaveLaneCountMin, waves.WaveLaneCountMax
+        );
+        return None;
+    }
+    let (root, pso) = host
+        .compute_pipeline(&shader)
+        .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+    Some((host, root, pso, shader))
+}
+
+const fn ds_off(op: u8, vdst: u8, addr: u8, data0: u8, off: u16) -> [u32; 2] {
+    [
+        0x36 << 26 | (op as u32) << 18 | off as u32,
+        (vdst as u32) << 24 | (data0 as u32) << 8 | addr as u32,
+    ]
+}
+
+const fn uav_store_offen(vdata: u8, voff: u8) -> [u32; 2] {
+    [
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | (vdata as u32) << 8 | voff as u32,
+    ]
+}
+
+fn dispatch_wave32_lds(
+    host: &Host,
+    root: &windows::Win32::Graphics::Direct3D12::ID3D12RootSignature,
+    pso: &windows::Win32::Graphics::Direct3D12::ID3D12PipelineState,
+    shader: &HostShader,
+    constants: &[u32],
+    uav_dwords: u32,
+) -> Vec<u32> {
+    let mut ud = vec![0u32; shader.user_data_dwords().max(4) as usize];
+    for u in &shader.user_data {
+        if let RootType::Constants = u.root
+            && u.slot == 0
+            && let Some(&val) = constants.get(u.dword as usize)
+        {
+            ud[u.index as usize] = val;
+        }
+    }
+    let out = host
+        .dispatch(
+            root,
+            pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(uav_dwords)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("dispatch wave32 LDS shader");
+    out[0][..uav_dwords as usize].to_vec()
+}
+
+/// Negative control: a shared returning LDS atomic inside `!all` must keep Wave64.
+#[test]
+fn lds_shared_returning_atomic_stays_wave64() {
+    let mut body = vec![
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7E06_0281, // v_mov_b32 v3, 1
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0002, // s_cbranch_execz +2
+    ];
+    body.extend_from_slice(&ds_off(0x20, 4, 2, 3, 0)); // ds_add_rtn_u32 v4, v2, v3
+    body.push(0xBEFE_040C); // s_mov_b64 exec, s[12:13]
+    body.push(0x3402_0082); // v_lshlrev_b32 v1, 2, v0
+    body.extend_from_slice(&uav_store_offen(4, 1));
+    let mut prog = native(&body);
+    if let StageIo::Cs(cs) = &mut prog.io {
+        cs.rsrc2 |= 1 << 15;
+    }
+    assert_eq!(flag_wave(&prog), Some(64));
+}
+
+/// Negative control for Refinement A & default write-only fallback:
+/// - unresolved dynamic WAW across branches (`if (lane == 0) LDS[v_dyn] = 1; else if (lane == 32)
+///   LDS[v_dyn] = 2;`) stays Wave64 by default (running `then` strictly before `else` on WARP so
+///   `LDS[0] == 2`) and lowers to Wave32 only under opt-in `VICTORY_LDS_WRITE_ONLY_OK=1`;
+/// - uniform-address store with lane-varying data (`ds_write_b32 [0], v0` + disjoint read at `[16]`)
+///   stays Wave64 even though offsets are disjoint.
+#[test]
+fn lds_unresolved_dynamic_waw_and_varying_store_stay_wave64() {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+    };
+
+    // 1. Unresolved dynamic WAW across divergent branches:
+    //    v2 = (v0 ^ v0) << 2 == 0 at runtime, opaque to linear address resolution (`expr == None`).
+    //    if (v0 == 0) LDS[v2] = 1; else if (v0 == 32) LDS[v2] = 2;
+    let mut waw_body = vec![
+        0x3A04_0100, // v_xor_b32 v2, v0, v0 (0, non-linear)
+        0x3404_0482, // v_lshlrev_b32 v2, 2, v2
+        0x7E06_0281, // v_mov_b32 v3, 1
+        0x7E08_0282, // v_mov_b32 v4, 2
+        0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0 (lane 0)
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0002, // s_cbranch_execz +2
+    ];
+    waw_body.extend_from_slice(&ds_off(DS_WRITE_B32, 0, 2, 3, 0));
+    waw_body.extend_from_slice(&[
+        0x8A8E_7E0C, // s_andn2_b64 s[14:15], s[12:13], exec
+        0xBEFE_040E, // s_mov_b64 exec, s[14:15]
+        0x7D84_00A0, // v_cmp_eq_u32 vcc, 32, v0 (lane 32)
+        0xBE8E_246A, // s_and_saveexec_b64 s[14:15], vcc
+        0xBF88_0002, // s_cbranch_execz +2
+    ]);
+    waw_body.extend_from_slice(&ds_off(DS_WRITE_B32, 0, 2, 4, 0));
+    waw_body.push(0xBEFE_040C); // s_mov_b64 exec, s[12:13]
+    waw_body.extend_from_slice(&ds_off(DS_READ_B32, 5, 2, 0, 0));
+    waw_body.push(0x3402_0082); // v_lshlrev_b32 v1, 2, v0
+    waw_body.extend_from_slice(&uav_store_offen(5, 1));
+
+    let mut waw_prog = native(&waw_body);
+    if let StageIo::Cs(cs) = &mut waw_prog.io {
+        cs.rsrc2 |= 1 << 15;
+    }
+
+    let prev_opt = super::lds::set_test_write_only_ok(Some(false));
+    let default_wave = flag_wave(&waw_prog);
+    super::lds::set_test_write_only_ok(Some(true));
+    let opt_in_wave = flag_wave(&waw_prog);
+    super::lds::set_test_write_only_ok(prev_opt);
+    assert_eq!(default_wave, Some(64), "unresolved dynamic WAW must stay Wave64 by default");
+    assert_eq!(opt_in_wave, Some(32), "opt-in VICTORY_LDS_WRITE_ONLY_OK=1 allows write-only Wave32");
+
+    // Validate the default Wave64 shader and verify `then`-before-`else` semantics on WARP
+    // (every lane observes final LDS[0] == 2).
+    let p = crate::spill::build(&waw_prog).expect("build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &waw_prog.layout, waw_prog.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &waw_prog).expect("io");
+    let was = lower::TEST_HOST_WAVE.replace(Some(64));
+    let lowered_w64 = lower::lower(&lower::Parts {
+        native: &waw_prog,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    });
+    lower::TEST_HOST_WAVE.set(was);
+    let lowered_w64 = lowered_w64.expect("lower Wave64 WAW shader");
+    assert_eq!(lowered_w64.wave_size, Some(64));
+    let shader_w64 = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered_w64.dxil,
+        user_data: lowered_w64.user_data,
+        samplers: lowered_w64.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered_w64.root_cbvs,
+        root_srvs: lowered_w64.root_srvs,
+        root_uavs: lowered_w64.root_uavs,
+        root_indexed_views: res.root_indexed_views,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader_w64.dxil.clone();
+        v.validate(&mut copy)
+            .expect("Wave64 dynamic WAW DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Ok(warp) = Host::new(true) {
+        let mut waves = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: querying wave capabilities of a live D3D12 WARP device.
+        unsafe {
+            warp.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut waves).cast(),
+                size_of_val(&waves) as u32,
+            )
+        }
+        .expect("query WARP wave sizes");
+        if waves.WaveOps.as_bool() && waves.WaveLaneCountMax >= 64 {
+            let (root, pso) = warp
+                .compute_pipeline(&shader_w64)
+                .expect("create Wave64 WAW pipeline on WARP");
+            let got = dispatch_wave32_lds(&warp, &root, &pso, &shader_w64, &[64], 64);
+            assert!(
+                got.iter().all(|&v| v == 2),
+                "Wave64 must execute then-branch (1) strictly before else-branch (2); got {got:?}"
+            );
+        }
+    }
+
+    // 2. Uniform-address store with lane-varying data + disjoint read must stay Wave64.
+    let mut varying_body = vec![
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0004, // s_cbranch_execz +4
+    ];
+    varying_body.extend_from_slice(&ds_off(DS_WRITE_B32, 0, 2, 0, 0)); // ds_write_b32 [0], v0
+    varying_body.extend_from_slice(&ds_off(DS_READ_B32, 4, 2, 0, 16)); // ds_read_b32 v4, [16]
+    varying_body.push(0xBEFE_040C); // s_mov_b64 exec, s[12:13]
+    varying_body.push(0x3402_0082); // v_lshlrev_b32 v1, 2, v0
+    varying_body.extend_from_slice(&uav_store_offen(4, 1));
+    let mut varying_prog = native(&varying_body);
+    if let StageIo::Cs(cs) = &mut varying_prog.io {
+        cs.rsrc2 |= 1 << 15;
+    }
+    assert_eq!(
+        flag_wave(&varying_prog),
+        Some(64),
+        "uniform-address store of lane-varying data must stay Wave64"
+    );
+}
+
+/// Refinement A hardware parity: disjoint constant byte ranges in a divergent `!all` branch
+/// (`ds_write_b32` at offset 0 and `ds_read_b32` at offset 4) lower natively to Wave32 and
+/// produce bit-exact Wave64 results across both halves on D3D12 hardware.
+#[test]
+fn lds_disjoint_constant_ranges_wave32_hw_parity() {
+    let mut body = vec![
+        0x7E04_0280, // v_mov_b32 v2, 0 (base addr = 0)
+        0x7E06_02FF,
+        0x1111_0000, // v_mov_b32 v3, 0x1111_0000
+        0x7E08_02FF,
+        0x2222_0000, // v_mov_b32 v4, 0x2222_0000
+        0x7E0A_0280, // v_mov_b32 v5, 0 (default result for inactive lanes)
+    ];
+    // All-lane init of LDS[0] and LDS[4].
+    body.extend_from_slice(&ds_off(DS_WRITE_B32, 0, 2, 3, 0));
+    body.extend_from_slice(&ds_off(DS_WRITE_B32, 0, 2, 4, 4));
+    // Divergent branch: if (v0 < s0) { LDS[0] = 0xAAAA_BBBB; v5 = LDS[4] + v0; }
+    let mut branch = vec![0x7E0C_02FF, 0xAAAA_BBBB]; // v_mov_b32 v6, 0xAAAA_BBBB
+    branch.extend_from_slice(&ds_off(DS_WRITE_B32, 0, 2, 6, 0));
+    branch.extend_from_slice(&ds_off(DS_READ_B32, 5, 2, 0, 4));
+    branch.push(0x4A0A_0105); // v_add_nc_u32 v5, v5, v0
+    body.extend_from_slice(&[
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0000 | branch.len() as u32,
+    ]);
+    body.extend_from_slice(&branch);
+    body.push(0xBEFE_040C); // s_mov_b64 exec, s[12:13]
+    // All-lane read of LDS[0] after exit barrier, store v5 to UAV[t] and LDS[0] to UAV[64 + t].
+    body.extend_from_slice(&ds_off(DS_READ_B32, 7, 2, 0, 0));
+    body.push(0x3402_0082); // v_lshlrev_b32 v1, 2, v0
+    body.extend_from_slice(&uav_store_offen(5, 1));
+    body.extend_from_slice(&[0x4A02_02FF, 256]); // v_add_nc_u32 v1, 256, v1
+    body.extend_from_slice(&uav_store_offen(7, 1));
+
+    let mut prog = native(&body);
+    if let StageIo::Cs(cs) = &mut prog.io {
+        cs.rsrc2 |= 1 << 15;
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some((host, root, pso, shader)) =
+        lower_and_prepare_wave32_lds_hw(&prog, "lds_disjoint_constant_ranges")
+    else {
+        return;
+    };
+    for active in [0u32, 1, 31, 32, 33, 63, 64] {
+        let got = dispatch_wave32_lds(&host, &root, &pso, &shader, &[active], 128);
+        let expect_slot0 = if active > 0 { 0xAAAA_BBBB } else { 0x1111_0000 };
+        for t in 0..64u32 {
+            let want_v5 = if t < active { 0x2222_0000 + t } else { 0 };
+            assert_eq!(got[t as usize], want_v5, "active={active} lane={t} v5");
+            assert_eq!(
+                got[(64 + t) as usize],
+                expect_slot0,
+                "active={active} lane={t} slot0"
+            );
+        }
+    }
+    eprintln!("lds_disjoint_constant_ranges_wave32_hw_parity: 7 dispatches exact on Wave32 HW");
+}
+
+/// Refinement B hardware parity: lane-private LDS slots with a returning `ds_add_rtn_u32` and
+/// plain `ds_read_b32` inside a divergent `!all` loop match Wave64 bit-for-bit on Wave32 HW.
+#[test]
+fn lds_lane_private_and_rtn_atomic_loop_wave32_hw_parity() {
+    let mut body = vec![
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0 (private byte offset = tid * 4)
+        0x4A06_00FF,
+        100,         // v_add_nc_u32 v3, 100, v0 (initial value = 100 + tid)
+        0x7E08_0280, // v_mov_b32 v4, 0 (accumulator)
+        0x7E0A_0280, // v_mov_b32 v5, 0 (loop counter k)
+    ];
+    // All-lane init: LDS[tid * 4] = 100 + tid.
+    body.extend_from_slice(&ds_off(DS_WRITE_B32, 0, 2, 3, 0));
+    // Divergent branch: if (v0 < s0) { for k in 0..s1 { prev = atomic_add(LDS[tid*4], tid+1); cur = LDS[tid*4]; acc += prev + cur; } }
+    let v_add_vv = |vdst: u8, v0: u8, v1: u8| -> u32 {
+        0x4A00_0000 | (u32::from(vdst) << 17) | (u32::from(v1) << 9) | (256 + u32::from(v0))
+    };
+    let mut loop_body = vec![0x4A0C_0081]; // v_add_nc_u32 v6, 1, v0 (inc = tid + 1)
+    loop_body.extend_from_slice(&ds_off(0x20, 7, 2, 6, 0)); // ds_add_rtn_u32 v7, v2, v6
+    loop_body.extend_from_slice(&ds_off(DS_READ_B32, 8, 2, 0, 0)); // ds_read_b32 v8, v2
+    loop_body.push(v_add_vv(9, 7, 8)); // v9 = prev + cur
+    loop_body.push(v_add_vv(4, 4, 9)); // v4 += v9
+    loop_body.push(0x4A0A_0A81); // v_add_nc_u32 v5, 1, v5 (k += 1)
+    loop_body.push(0x7D88_0A01); // v_cmp_gt_u32 vcc, s1, v5 (k < s1)
+    let back = -(loop_body.len() as i16 + 1);
+    loop_body.push(0xBF87_0000 | (back as u16 as u32)); // s_cbranch_vccnz loop_body
+    // Guard s1 > 0 via loop header: since all test dispatches use s1 >= 1, do-while runs s1 times.
+    body.extend_from_slice(&[
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0000 | loop_body.len() as u32,
+    ]);
+    body.extend_from_slice(&loop_body);
+    body.push(0xBEFE_040C); // s_mov_b64 exec, s[12:13]
+    // Read final LDS[tid * 4] into v10, store v4 to UAV[tid] and v10 to UAV[64 + tid].
+    body.extend_from_slice(&ds_off(DS_READ_B32, 10, 2, 0, 0));
+    body.extend_from_slice(&uav_store_offen(4, 2));
+    body.extend_from_slice(&[0x4A04_04FF, 256]); // v_add_nc_u32 v2, 256, v2
+    body.extend_from_slice(&uav_store_offen(10, 2));
+
+    let mut prog = native(&body);
+    if let StageIo::Cs(cs) = &mut prog.io {
+        cs.rsrc2 |= 1 << 15;
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some((host, root, pso, shader)) =
+        lower_and_prepare_wave32_lds_hw(&prog, "lds_lane_private_and_rtn_atomic_loop")
+    else {
+        return;
+    };
+    for (active, iters) in [(0u32, 3u32), (17, 4), (32, 3), (45, 5), (64, 4)] {
+        let got = dispatch_wave32_lds(&host, &root, &pso, &shader, &[active, iters], 128);
+        for t in 0..64u32 {
+            let mut slot = 100 + t;
+            let mut acc = 0u32;
+            if t < active {
+                for _ in 0..iters {
+                    let prev = slot;
+                    slot = slot.wrapping_add(t + 1);
+                    acc = acc.wrapping_add(prev.wrapping_add(slot));
+                }
+            }
+            assert_eq!(got[t as usize], acc, "active={active} iters={iters} lane={t} acc");
+            assert_eq!(
+                got[(64 + t) as usize],
+                slot,
+                "active={active} iters={iters} lane={t} final_slot"
+            );
+        }
+    }
+    eprintln!("lds_lane_private_and_rtn_atomic_loop_wave32_hw_parity: 5 dispatches exact on Wave32 HW");
+}
+
+/// Refinement C1 hardware parity: dynamic-address non-returning `ds_add_u32` + `ds_sub_u32`
+/// histogram inside a divergent `!all` loop (heavy cross-half collisions across 8 bins) lowers
+/// natively to exact Wave32 and matches the Wave64 reference bit-for-bit on D3D12 hardware.
+#[test]
+fn lds_commutative_dynamic_histogram_wave32_hw_parity() {
+    let v_add_vv = |vdst: u8, v0: u8, v1: u8| -> u32 {
+        0x4A00_0000 | (u32::from(vdst) << 17) | (u32::from(v1) << 9) | (256 + u32::from(v0))
+    };
+    // All-lane zero init of LDS[0..32] (every lane writes its own bin `(v0 & 7) * 4` = 0).
+    let mut body = vec![
+        0x3604_0087, // v_and_b32 v2, 7, v0
+        0x3404_0482, // v_lshlrev_b32 v2, 2, v2
+        0x7E06_0280, // v_mov_b32 v3, 0
+    ];
+    body.extend_from_slice(&ds_off(DS_WRITE_B32, 0, 2, 3, 0));
+    body.push(0x7E08_0280); // v_mov_b32 v4, 0 (k = 0)
+    // Divergent branch + loop: if (v0 < s0) { for k in 0..s1 { b = (v0+k)&7; ds_add_u32(b*4, v0+1); ds_sub_u32(((b+1)&7)*4, 1); } }
+    let mut lp = vec![
+        v_add_vv(5, 0, 4), // v5 = v0 + k
+        0x360A_0A87,       // v_and_b32 v5, 7, v5 (b)
+        0x340C_0A82,       // v_lshlrev_b32 v6, 2, v5 (b * 4)
+        0x4A0E_0081,       // v_add_nc_u32 v7, 1, v0 (v0 + 1)
+    ];
+    lp.extend_from_slice(&ds_off(0x00, 0, 6, 7, 0)); // ds_add_u32 v6, v7
+    lp.extend_from_slice(&[
+        0x4A0A_0A81, // v_add_nc_u32 v5, 1, v5 (b + 1)
+        0x360A_0A87, // v_and_b32 v5, 7, v5 ((b + 1) & 7)
+        0x340C_0A82, // v_lshlrev_b32 v6, 2, v5
+        0x7E10_0281, // v_mov_b32 v8, 1
+    ]);
+    lp.extend_from_slice(&ds_off(0x01, 0, 6, 8, 0)); // ds_sub_u32 v6, v8
+    lp.extend_from_slice(&[
+        0x4A08_0881, // v_add_nc_u32 v4, 1, v4 (k += 1)
+        0x7D88_0801, // v_cmp_gt_u32 vcc, s1, v4 (k < s1)
+    ]);
+    let back = -(lp.len() as i16 + 1);
+    lp.push(0xBF87_0000 | (back as u16 as u32));
+    body.extend_from_slice(&[
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0000 | lp.len() as u32,
+    ]);
+    body.extend_from_slice(&lp);
+    body.push(0xBEFE_040C); // s_mov_b64 exec, s[12:13]
+    // All-lane readback: every lane reads bin `(v0 & 7) * 4` and stores to UAV[v0 & 7].
+    body.extend_from_slice(&ds_off(DS_READ_B32, 9, 2, 0, 0));
+    body.extend_from_slice(&uav_store_offen(9, 2));
+
+    let mut prog = native(&body);
+    if let StageIo::Cs(cs) = &mut prog.io {
+        cs.rsrc2 |= 1 << 15;
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some((host, root, pso, shader)) =
+        lower_and_prepare_wave32_lds_hw(&prog, "lds_commutative_dynamic_histogram")
+    else {
+        return;
+    };
+    for (active, iters) in [(0u32, 3u32), (1, 4), (31, 3), (32, 4), (33, 5), (49, 4), (64, 6)] {
+        let got = dispatch_wave32_lds(&host, &root, &pso, &shader, &[active, iters], 8);
+        let mut want = [0u32; 8];
+        for t in 0..active {
+            for k in 0..iters {
+                let b = ((t + k) & 7) as usize;
+                want[b] = want[b].wrapping_add(t + 1);
+                want[(b + 1) & 7] = want[(b + 1) & 7].wrapping_sub(1);
+            }
+        }
+        assert_eq!(got, want, "active={active} iters={iters}");
+    }
+    eprintln!("lds_commutative_dynamic_histogram_wave32_hw_parity: 7 dispatches exact on Wave32 HW");
+}
+
+/// Refinement C3 hardware parity: multi-family commutative `ds_max_u32` (offset 0) + `ds_min_u32`
+/// (offset 4) on a dynamic stride-8 tile index (`(v0 & 7) << 3`, proven disjoint via modular
+/// congruence `(3, 0)` vs `(3, 4)`) inside a divergent `!all` branch matches Wave64 bit-for-bit.
+#[test]
+fn lds_commutative_multifamily_mod_stride_wave32_hw_parity() {
+    // All-lane init: each tile t in 0..8 gets LDS[t*8 + 0] = 0 (max id), LDS[t*8 + 4] = u32::MAX (min id).
+    let mut body = vec![
+        0x3604_0087, // v_and_b32 v2, 7, v0
+        0x3404_0483, // v_lshlrev_b32 v2, 3, v2 (tile * 8)
+        0x7E06_0280, // v_mov_b32 v3, 0
+        0x7E08_02C1, // v_mov_b32 v4, -1 (0xFFFF_FFFF)
+    ];
+    body.extend_from_slice(&ds_off(DS_WRITE_B32, 0, 2, 3, 0));
+    body.extend_from_slice(&ds_off(DS_WRITE_B32, 0, 2, 4, 4));
+    // Divergent branch: if (v0 < s0) { val = (v0 * 37 + 13) ^ 0x5A; ds_max_u32(v2+0, val); ds_min_u32(v2+4, val); }
+    let mut br = vec![
+        0x160A_00A5, // v_mul_u32_u24 v5, 37, v0 (inline const 128 + 37 = 165 = 0xA5)
+        0x4A0A_0A8D, // v_add_nc_u32 v5, 13, v5 (inline const 128 + 13 = 141 = 0x8D)
+        0x3A0A_0AFF,
+        0x0000_005A, // v_xor_b32 v5, 0x5A, v5
+    ];
+    br.extend_from_slice(&ds_off(0x08, 0, 2, 5, 0)); // ds_max_u32 v2, v5 offset:0
+    br.extend_from_slice(&ds_off(0x07, 0, 2, 5, 4)); // ds_min_u32 v2, v5 offset:4
+    body.extend_from_slice(&[
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0000 | br.len() as u32,
+    ]);
+    body.extend_from_slice(&br);
+    body.push(0xBEFE_040C); // s_mov_b64 exec, s[12:13]
+    // All-lane readback: lanes store tile max at UAV[tile*2] and tile min at UAV[tile*2 + 1].
+    body.extend_from_slice(&ds_off(DS_READ_B32, 6, 2, 0, 0));
+    body.extend_from_slice(&ds_off(DS_READ_B32, 7, 2, 0, 4));
+    body.extend_from_slice(&uav_store_offen(6, 2));
+    body.push(0x4A04_0484); // v_add_nc_u32 v2, 4, v2
+    body.extend_from_slice(&uav_store_offen(7, 2));
+
+    let mut prog = native(&body);
+    if let StageIo::Cs(cs) = &mut prog.io {
+        cs.rsrc2 |= 1 << 15;
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some((host, root, pso, shader)) =
+        lower_and_prepare_wave32_lds_hw(&prog, "lds_commutative_multifamily_mod_stride")
+    else {
+        return;
+    };
+    for active in [0u32, 1, 7, 31, 32, 33, 48, 63, 64] {
+        let got = dispatch_wave32_lds(&host, &root, &pso, &shader, &[active], 16);
+        let mut want_max = [0u32; 8];
+        let mut want_min = [u32::MAX; 8];
+        for t in 0..active {
+            let tile = (t & 7) as usize;
+            let val = (t * 37 + 13) ^ 0x5A;
+            want_max[tile] = want_max[tile].max(val);
+            want_min[tile] = want_min[tile].min(val);
+        }
+        for tile in 0..8 {
+            assert_eq!(got[tile * 2], want_max[tile], "active={active} tile={tile} max");
+            assert_eq!(
+                got[tile * 2 + 1],
+                want_min[tile],
+                "active={active} tile={tile} min"
+            );
+        }
+    }
+    eprintln!("lds_commutative_multifamily_mod_stride_wave32_hw_parity: 9 dispatches exact on Wave32 HW");
+}
+
+/// Mixed Refinement B + C hardware parity: lane-private LDS scratch (`tid * 4`, `[0, 256)`)
+/// combined with a disjoint shared non-returning `ds_add_u32` counter at offset 256 inside a
+/// divergent `!all` branch matches Wave64 bit-for-bit on D3D12 Wave32 hardware.
+#[test]
+fn lds_mixed_private_and_commutative_counter_wave32_hw_parity() {
+    let mut body = vec![
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0 (tid * 4)
+        0x7E06_0280, // v_mov_b32 v3, 0
+        0x7E08_02FF,
+        256,         // v_mov_b32 v4, 256 (shared counter addr)
+    ];
+    // All-lane init: zero private slot LDS[tid * 4] and shared counter LDS[256].
+    body.extend_from_slice(&ds_off(DS_WRITE_B32, 0, 2, 3, 0));
+    body.extend_from_slice(&ds_off(DS_WRITE_B32, 0, 4, 3, 0));
+    // Divergent branch: if (v0 < s0) { LDS[tid*4] = tid*3 + 5; tmp = LDS[tid*4]; ds_add_u32(LDS[256], tmp); }
+    let mut br = vec![
+        0x160A_0083, // v_mul_u32_u24 v5, 3, v0
+        0x4A0A_0A85, // v_add_nc_u32 v5, 5, v5
+    ];
+    br.extend_from_slice(&ds_off(DS_WRITE_B32, 0, 2, 5, 0));
+    br.extend_from_slice(&ds_off(DS_READ_B32, 6, 2, 0, 0));
+    br.extend_from_slice(&ds_off(0x00, 0, 4, 6, 0)); // ds_add_u32 v4, v6
+    body.extend_from_slice(&[
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0000 | br.len() as u32,
+    ]);
+    body.extend_from_slice(&br);
+    body.push(0xBEFE_040C); // s_mov_b64 exec, s[12:13]
+    // All-lane readback: UAV[tid] = LDS[tid * 4]; UAV[64] = LDS[256].
+    body.extend_from_slice(&ds_off(DS_READ_B32, 7, 2, 0, 0));
+    body.extend_from_slice(&ds_off(DS_READ_B32, 8, 4, 0, 0));
+    body.extend_from_slice(&uav_store_offen(7, 2));
+    body.extend_from_slice(&uav_store_offen(8, 4));
+
+    let mut prog = native(&body);
+    if let StageIo::Cs(cs) = &mut prog.io {
+        cs.rsrc2 |= 1 << 15;
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some((host, root, pso, shader)) =
+        lower_and_prepare_wave32_lds_hw(&prog, "lds_mixed_private_and_commutative_counter")
+    else {
+        return;
+    };
+    for active in [0u32, 1, 31, 32, 33, 63, 64] {
+        let got = dispatch_wave32_lds(&host, &root, &pso, &shader, &[active], 65);
+        let mut sum = 0u32;
+        for t in 0..64u32 {
+            let want = if t < active { t * 3 + 5 } else { 0 };
+            sum = sum.wrapping_add(want);
+            assert_eq!(got[t as usize], want, "active={active} lane={t}");
+        }
+        assert_eq!(got[64], sum, "active={active} shared counter");
+    }
+    eprintln!("lds_mixed_private_and_commutative_counter_wave32_hw_parity: 7 dispatches exact on Wave32 HW");
+}

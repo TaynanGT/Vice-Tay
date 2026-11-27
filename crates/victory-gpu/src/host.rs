@@ -1504,10 +1504,12 @@ fn create() -> windows::core::Result<Host> {
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
-        let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-            Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-            ..Default::default()
-        })?;
+        let queue: ID3D12CommandQueue = match crate::streamline::device_made(&device) {
+            Some(queue) => queue,
+            None => device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default()
+            })?,
+        };
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
         let rtvs: ID3D12DescriptorHeap =
@@ -11033,6 +11035,8 @@ struct Presenter {
     meter: Meter,
     composer: Option<crate::compose::Composer>,
     game_ui: Option<crate::compose::UiFrames>,
+    // NVIDIA needs a postprocessed scene copy and a fully composited back buffer.
+    nvidia_scene: Option<crate::compose::UiFrames>,
     ui_slot: usize,
     #[cfg(feature = "diagnostics")]
     panel: panel::Panel,
@@ -11532,6 +11536,7 @@ impl Host {
                         p.composer = None;
                     }
                     p.game_ui = None;
+                    p.nvidia_scene = None;
                     (p.width, p.height, p.format) = (width, height, format);
                     tracing::info!(
                         width,
@@ -11597,6 +11602,12 @@ impl Host {
             } else {
                 None
             };
+            let nvidia_scene = if crate::streamline::requested() && game_ui.is_some() {
+                if p.nvidia_scene.as_ref().is_none_or(|scene| scene.size != (width, height)) {
+                    p.nvidia_scene = crate::compose::UiFrames::new(self, (width, height));
+                }
+                p.nvidia_scene.as_ref().map(|scene| scene.images[p.ui_slot].clone())
+            } else { None };
             let slot = if late_free_present() && !read_now {
                 let finished = FINISHED.load(Ordering::Acquire);
                 p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
@@ -11632,15 +11643,23 @@ impl Host {
                     copy.keep(ui);
                     pre.push(transition(ui, UI_READ, D3D12_RESOURCE_STATE_RENDER_TARGET));
                 }
+                if let Some(scene) = &nvidia_scene {
+                    copy.keep(scene);
+                    pre.push(transition(scene, UI_READ, D3D12_RESOURCE_STATE_RENDER_TARGET));
+                }
                 list.ResourceBarrier(&pre);
-                let compose_slot = 2 * slot.map_or(0, |i| i + 1);
+                let compose_stride = if crate::streamline::requested() { 3 } else { 2 };
+                let compose_slot = compose_stride * slot.map_or(0, |i| i + 1);
                 let base = (texture, base_view?);
                 let picture = match planes {
-                    Some((over, _, _, over_fmt)) if game_ui.is_none() => Picture::Composed(base, (over, over_fmt)),
+                    Some((over, _, _, over_fmt)) if game_ui.is_none() || crate::streamline::requested() => Picture::Composed(base, (over, over_fmt)),
                     _ => Picture::Scene(base),
                 };
                 let drawn = composer.record(self, compose_slot, list, picture, &back, (width, height))
                     .and_then(|()| {
+                        if let Some(scene) = &nvidia_scene {
+                            composer.record(self, compose_slot + 2, list, Picture::Scene(base), scene, (width, height))?;
+                        }
                         if let (Some(ui), Some((over, _, _, over_fmt))) = (&game_ui, planes) {
                             composer.record(self, compose_slot + 1, list, Picture::Overlay((over, over_fmt)), ui, (width, height))?;
                         }
@@ -11677,6 +11696,9 @@ impl Host {
                 }
                 if let Some(ui) = &game_ui {
                     post.push(transition(ui, D3D12_RESOURCE_STATE_RENDER_TARGET, UI_READ));
+                }
+                if let Some(scene) = &nvidia_scene {
+                    post.push(transition(scene, D3D12_RESOURCE_STATE_RENDER_TARGET, UI_READ));
                 }
                 post.push(transition(
                     &back,
@@ -11750,6 +11772,7 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             let panel_copy = {
                 let target = match game_ui.as_ref() {
+                    Some(ui) if crate::streamline::requested() => panel::Target::GameUiAndBackBuffer(ui),
                     Some(ui) => panel::Target::GameUi(ui),
                     None if p.framegen && planes.is_none() => panel::Target::SeparateUi,
                     None => panel::Target::BackBuffer,
@@ -11817,7 +11840,11 @@ impl Host {
                     drop(presenter);
                     return self.present_planes(texture, state_u32, overlay, frame, token);
                 }
-                let generation = registered && (planes.is_none() || game_ui.is_some());
+                let generation = registered && (planes.is_none() || game_ui.is_some())
+                    && (!crate::streamline::requested() || nvidia_scene.is_some());
+                if let Some(scene) = &nvidia_scene {
+                    crate::streamline::set_scene(scene, crate::compose::UI_READ.0 as u32);
+                }
                 let status = crate::framegen::present(&p.swap_chain, frame, token, generation);
                 if game_ui.is_some() {
                     p.ui_slot ^= 1;
@@ -11906,6 +11933,7 @@ impl Host {
                 meter: Meter::new(),
                 composer: None,
                 game_ui: None,
+                nvidia_scene: None,
                 ui_slot: 0,
                 #[cfg(feature = "diagnostics")]
                 panel: panel::Panel::new(),

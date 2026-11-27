@@ -147,6 +147,7 @@ static FRAME_RATES: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(feature = "diagnostics")]
 pub(crate) fn frame_rates() -> Option<(f32, f32)> {
+    if crate::streamline::requested() { return crate::streamline::frame_rates(); }
     let rates = FRAME_RATES.load(Ordering::Relaxed);
     let rendered = f32::from_bits((rates >> 32) as u32);
     let presented = f32::from_bits(rates as u32);
@@ -376,12 +377,14 @@ impl PreparedFrame {
 /// A host list owns the SDK resources it recorded through GPU completion.
 /// Resetting an unsent list frees its frame slot without touching the SDK.
 pub(crate) struct Preparation {
-    _context: Arc<Context>,
+    _context: Option<Arc<Context>>,
+    nvidia: Option<Arc<crate::streamline::Preparation>>,
     recording: Option<Recording>,
 }
 
 impl Preparation {
     pub(crate) fn submitted(&self) {
+        if let Some(nvidia) = &self.nvidia { nvidia.submitted(); }
         if let Some(recording) = &self.recording {
             recording.submitted();
         }
@@ -461,6 +464,7 @@ pub(crate) fn swap_chain(
     device: &ID3D12Device,
     frame: u64,
 ) -> Option<IDXGISwapChain3> {
+    if crate::streamline::requested() { return crate::streamline::swap_chain(hwnd, desc, factory); }
     let api = api()?;
     let format = surface_format(desc.Format.0)?;
     let _sdk = SDK.lock().unwrap_or_else(|e| e.into_inner());
@@ -524,6 +528,8 @@ pub(crate) fn swap_chain(
 
 /// Depth, motion and camera data from the title's successful upscaler call.
 pub struct Inputs<'a> {
+    /// Original title objects for tracking their submitted host-resource state.
+    pub title_resources: [usize; 2],
     pub depth: &'a ID3D12Resource,
     pub motion: &'a ID3D12Resource,
     pub depth_desc: [u32; 8],
@@ -623,6 +629,11 @@ pub(crate) fn prepare(
 ) -> Option<Preparation> {
     if !requested() {
         return None;
+    }
+    if crate::streamline::requested() {
+        return crate::streamline::prepare(title_list, &input).map(|nvidia| Preparation {
+            _context: None, nvidia: Some(nvidia), recording: None,
+        });
     }
     let api = api()?;
     // The title increments this number before it queues the host Present.
@@ -752,7 +763,7 @@ pub(crate) fn prepare(
             tracing::warn!(result, "frame generation: AMD prepare refused the frame")
         });
         // The SDK may already have recorded work before a failed return.
-        return Some(Preparation { _context: context, recording: None });
+        return Some(Preparation { _context: Some(context), nvidia: None, recording: None });
     }
     let submission = Arc::new(AtomicU8::new(RECORDED));
     state.prepared = Some(PreparedFrame {
@@ -768,12 +779,13 @@ pub(crate) fn prepare(
     }
     static FIRST: std::sync::Once = std::sync::Once::new();
     FIRST.call_once(|| tracing::info!(frame, render = ?input.render_size, "frame generation: first AMD prepare recorded"));
-    Some(Preparation { _context: context, recording: Some(Recording(submission)) })
+    Some(Preparation { _context: Some(context), nvidia: None, recording: Some(Recording(submission)) })
 }
 
 /// Bind the recorded upscaler input to the token supplied by the title on
 /// submission. Reusing the same list must not change an already bound token.
 pub(crate) fn bind_submission(lists: &[crate::object::This], token: u64) {
+    if crate::streamline::requested() { crate::streamline::bind_submission(lists, token); return; }
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(prepared) = state.prepared.as_mut()
         && prepared.token.is_none()
@@ -921,6 +933,7 @@ fn register_ui(api: &Api, state: &mut State, ui: Option<&ID3D12Resource>) -> boo
 }
 
 pub(crate) fn set_ui(ui: Option<&ID3D12Resource>) -> bool {
+    if crate::streamline::requested() { return crate::streamline::set_ui(ui); }
     let _sdk = SDK.lock().unwrap_or_else(|e| e.into_inner());
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
     api().is_some_and(|api| register_ui(api, &mut state, ui))
@@ -932,6 +945,7 @@ pub(crate) fn present(
     token: Option<u64>,
     allow_generation: bool,
 ) -> HRESULT {
+    if crate::streamline::requested() { return crate::streamline::present(swap_chain, frame, token, allow_generation); }
     let _sdk = SDK.lock().unwrap_or_else(|e| e.into_inner());
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
     let (enabled, disable) = match state.prepared.take() {
@@ -1064,6 +1078,7 @@ pub(crate) fn resize(
     format: i32,
     resize_buffers: impl FnOnce() -> windows::core::Result<()>,
 ) -> windows::core::Result<()> {
+    if crate::streamline::requested() { return crate::streamline::resize(width, height, resize_buffers); }
     let _retired;
     let _sdk = SDK.lock().unwrap_or_else(|e| e.into_inner());
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -1096,6 +1111,12 @@ pub(crate) fn resize(
 
 /// Release the proxy and its registered resources while the device is live.
 pub fn shut_down() {
+    if crate::streamline::requested() {
+        crate::external::finish_submitted();
+        if let Some(host) = crate::host::made_host() { host.release_framegen_presenter(); }
+        crate::streamline::shut_down();
+        return;
+    }
     STOPPED.store(true, Ordering::Release);
     // An earlier retirement may have left a live proxy to retry.
     if STATE.lock().unwrap_or_else(|e| e.into_inner()).swap_context == 0 {
@@ -1109,6 +1130,7 @@ pub fn shut_down() {
 }
 
 pub(crate) fn release_swap_chain(release_presenter: impl FnOnce()) -> bool {
+    if crate::streamline::requested() { return crate::streamline::release(release_presenter); }
     STOPPED.store(true, Ordering::Release);
     let Some(api) = api() else { return false };
     let _sdk = SDK.lock().unwrap_or_else(|e| e.into_inner());

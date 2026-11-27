@@ -922,6 +922,7 @@ fn record_framegen(
         return;
     }
     list.prepare_framegen(victory_gpu::framegen::Inputs {
+            title_resources: [dispatch.resources[1].resource as usize, dispatch.resources[2].resource as usize],
         depth,
         motion,
         depth_desc: dispatch.resources[1].description,

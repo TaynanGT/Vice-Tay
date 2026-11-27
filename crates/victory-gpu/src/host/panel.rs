@@ -751,6 +751,8 @@ pub(super) enum Target<'a> {
     BackBuffer,
     SeparateUi,
     GameUi(&'a ID3D12Resource),
+    // NVIDIA presents an already composed frame and also needs a UI tag.
+    GameUiAndBackBuffer(&'a ID3D12Resource),
 }
 
 /// A panel update uses an upload and can supply a separate UI texture.
@@ -927,6 +929,7 @@ impl Panel {
         let scale = scale(height);
         let framegen = !matches!(target, Target::BackBuffer);
         let separate = matches!(target, Target::SeparateUi);
+        let also_back = matches!(target, Target::GameUiAndBackBuffer(_));
         let format = if framegen { UI_FORMAT } else { format };
         if separate && self.ui.as_ref().is_none_or(|ui| ui.frames.size != (width, height)) {
             // The presenter drains the proxy before replacing its back buffers.
@@ -1003,7 +1006,7 @@ impl Panel {
                     list.ResourceBarrier(&[transition(ui, rtv, D3D12_RESOURCE_STATE_COPY_DEST)]);
                     ui
                 }
-                (_, Target::GameUi(ui)) => {
+                (_, Target::GameUi(ui) | Target::GameUiAndBackBuffer(ui)) => {
                     list.ResourceBarrier(&[transition(ui, UI_READ, D3D12_RESOURCE_STATE_COPY_DEST)]);
                     ui
                 }
@@ -1039,6 +1042,14 @@ impl Panel {
                 back: 1,
             };
             list.CopyTextureRegion(&to, 0, 0, 0, &from, Some(&part));
+            if also_back {
+                let composed = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(back),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                };
+                list.CopyTextureRegion(&composed, 0, 0, 0, &from, Some(&part));
+            }
             if framegen {
                 list.ResourceBarrier(&[transition(target, D3D12_RESOURCE_STATE_COPY_DEST, UI_READ)]);
             }

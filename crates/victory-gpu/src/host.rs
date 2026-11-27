@@ -2698,6 +2698,74 @@ struct CardPlan {
     sends: Option<send::Memory>,
     /// With [`upq`]: the copy list and buffer what went up came through.
     up: Option<upq::Slot>,
+    /// With `VICTORY_ASYNC_COMPUTE=1`: post-list compare offloaded to the
+    /// dedicated compute queue via GPU-side `ID3D12Fence` handoff.
+    async_check: Option<crate::async_timeline::PendingCheck>,
+    /// With `VICTORY_ASYNC_COMPUTE=1`: VRAM bounce buffer uploaded on the
+    /// dedicated copy queue before Direct copies/scatters into card buffers.
+    async_bounce: Option<crate::async_timeline::BounceHandle>,
+    /// Resource key for `CARD_WORK.differs.0` so fallback Direct compares track
+    /// cross-queue UAV dependencies without re-locking `CARD_WORK`.
+    differs_key: usize,
+}
+
+impl CardPlan {
+    /// Dispatches a prepared async-compute `CARD_COMPARE` pass behind Direct's
+    /// title lists using the `direct_tok` already signaled atomically under
+    /// `AsyncTimeline`'s hazard lock.
+    fn dispatch_async_check_after(&mut self, direct_tok: crate::async_timeline::TimelineToken) {
+        let Some(crate::async_timeline::PendingCheck::Prepared { .. }) = &self.async_check else {
+            return;
+        };
+        let Some(tl) = crate::async_timeline::existing() else {
+            return;
+        };
+        let Some(crate::async_timeline::PendingCheck::Prepared {
+            prepared,
+            reads,
+            writes,
+            keep,
+        }) = self.async_check.take()
+        else {
+            return;
+        };
+        match tl.dispatch_prepared_compute(prepared, &[direct_tok], &reads, &writes, keep) {
+            Ok(token) => {
+                self.async_check = Some(crate::async_timeline::PendingCheck::Dispatched(token));
+            }
+            Err(err) => {
+                fail(format_args!(
+                    "the async compute compare of host copies in the card's memory could not be dispatched ({err})"
+                ));
+            }
+        }
+    }
+
+    /// Ensures any async-compute `CARD_COMPARE` results for this plan are visible
+    /// on the CPU before reading `work.differs`.
+    fn ensure_async_check_ready(&self) {
+        match &self.async_check {
+            Some(crate::async_timeline::PendingCheck::Dispatched(token)) => {
+                if let Some(tl) = crate::async_timeline::existing() {
+                    if let Err(err) = tl.wait_cpu(*token) {
+                        fail(format_args!(
+                            "waiting for the async compute compare of host copies failed ({err})"
+                        ));
+                    }
+                } else {
+                    fail(format_args!(
+                        "the async timeline disappeared while an async compute compare was in flight"
+                    ));
+                }
+            }
+            Some(crate::async_timeline::PendingCheck::Prepared { .. }) => {
+                fail(format_args!(
+                    "an async compute compare of host copies was prepared but never dispatched before readback"
+                ));
+            }
+            None => {}
+        }
+    }
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -5113,16 +5181,122 @@ impl Host {
         let mut used: Vec<(bool, Prelude)> = Vec::new();
         let mut looks = None;
         let mut up = None;
+        let mut async_bounce = None;
+        let async_tl = crate::async_timeline::on()
+            .then(|| crate::async_timeline::global(&self.device))
+            .flatten();
         // The bytes as they are now, whatever later submissions put there.
         let taking = crate::timeline::span("copies in the card's memory: taken");
         let own = if send::own() { send::take(self, &dirty) } else { None };
         taking.end();
+        #[cfg(feature = "diagnostics")]
+        let gpu_timing = timing();
+        #[cfg(not(feature = "diagnostics"))]
+        let gpu_timing = false;
         if !dirty.is_empty() {
+            // Shadows not declared/looked-at in this submission can have their
+            // post-upload rehash offloaded to the dedicated async compute queue.
+            // Prepare the compute list BEFORE recording `sync` so any preparation
+            // error falls back seamlessly to Direct inline rehash with zero stale hashes.
+            let mut async_rehash_ids: Vec<u64> = Vec::new();
+            let mut prepared_rehash: Option<(
+                crate::async_timeline::PreparedCompute,
+                Vec<usize>,
+                Vec<usize>,
+                Vec<ID3D12Resource>,
+            )> = None;
+            if let Some(tl) = async_tl
+                && !gpu_timing
+                && !upcheck::on()
+            {
+                let mut async_rehash: Vec<(Arc<crate::shadow::Shadow>, Vec<crate::shadow::CardSpan>, u32)> =
+                    Vec::new();
+                for (shadow, ranges) in &dirty {
+                    let touched_this_sub = declared.iter().any(|(s, _)| Arc::ptr_eq(s, shadow))
+                        || looked.iter().any(|l| Arc::ptr_eq(&l.0, shadow))
+                        || whole.iter().any(|s| Arc::ptr_eq(s, shadow));
+                    if touched_this_sub || ranges.is_empty() {
+                        continue;
+                    }
+                    let (Some((_, Some(_), _)), size) = (shadow.card_sides(), shadow.card_hash_size()) else {
+                        continue;
+                    };
+                    let joins = rehash_runs() || own.is_some();
+                    let mut runs: Vec<crate::shadow::CardSpan> = Vec::new();
+                    for run in ranges.iter().map(|&(a, b)| shadow.card_run(a, b)) {
+                        match runs.last_mut() {
+                            Some(last) if joins && (last.first, last.pieces) == (run.first, run.pieces) => {
+                                last.to = last.to.max(run.to);
+                            }
+                            _ => runs.push(run),
+                        }
+                    }
+                    let runs = if joins { crate::shadow::joined_piece_runs(runs) } else { runs };
+                    if !runs.is_empty() {
+                        async_rehash_ids.push(shadow.id());
+                        async_rehash.push((shadow.clone(), runs, size as u32));
+                    }
+                }
+                if !async_rehash.is_empty() {
+                    let mut reads = Vec::with_capacity(async_rehash.len());
+                    let mut writes = Vec::with_capacity(async_rehash.len());
+                    let mut keep = Vec::with_capacity(async_rehash.len() * 2 + 1);
+                    let dummy_uav = tl.rehash_dummy_uav();
+                    keep.push(dummy_uav.clone());
+                    for (shadow, _, _) in &async_rehash {
+                        reads.push(crate::async_timeline::resource_key(&shadow.buffer));
+                        keep.push(shadow.buffer.clone());
+                        if let Some((_, Some(before), _)) = shadow.card_sides() {
+                            writes.push(crate::async_timeline::resource_key(&before));
+                            keep.push(before);
+                        }
+                    }
+                    // SAFETY: `dummy_uav` is a live compute-only 256-byte UAV buffer
+                    // (mode-0 rehash never writes slot 3, avoiding cross-queue UAV
+                    // aliasing on `work.differs.0`).
+                    let dummy_va = unsafe { dummy_uav.GetGPUVirtualAddress() };
+                    let prep = tl.prepare_compute(|clist| {
+                        // SAFETY: Open compute list; buffers are in `COMMON` after Direct's
+                        // `sync` batch completes and promote cleanly on Compute.
+                        unsafe {
+                            clist.SetComputeRootSignature(&work.root);
+                            clist.SetPipelineState(&work.pso);
+                            clist.SetComputeRootUnorderedAccessView(3, dummy_va);
+                            for (shadow, runs, size) in &async_rehash {
+                                let Some((_, Some(before), _)) = shadow.card_sides() else {
+                                    continue;
+                                };
+                                clist.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
+                                clist.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+                                CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                                CARD_PASSES[1].fetch_add(
+                                    runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(),
+                                    Ordering::Relaxed,
+                                );
+                                for run in runs {
+                                    card_pass(clist, run, *size, 0, 0);
+                                }
+                            }
+                        }
+                        Ok(())
+                    });
+                    match prep {
+                        Ok(prepared) => {
+                            prepared_rehash = Some((prepared, reads, writes, keep));
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "async compute rehash recording failed; falling back to direct sync");
+                            async_rehash_ids.clear();
+                        }
+                    }
+                }
+            }
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
             };
             let _recording = crate::timeline::span("copies in the card's memory: the list");
             let (allocator, list) = &sync;
+            let mut sync_tok = None;
             // SAFETY: the list's last run finished (it ran ahead of a
             // submission that was waited for, and came back after that);
             // live buffers, and the ranges lie in them.
@@ -5139,19 +5313,27 @@ impl Host {
                     let mut sent = Vec::new();
                     let mut transitioned = Vec::new();
                     if let Some(own) = &own {
-                        // With `upq`: the submission's own memory (the PC's)
-                        // comes whole into a buffer of ours in the card's on
-                        // the copy queue; the sends come from there.
+                        // With `upq` or `VICTORY_ASYNC_COMPUTE=1`: the submission's
+                        // own memory (the PC's) comes whole into a VRAM bounce buffer
+                        // on the copy queue; the sends come from there.
                         if looks.is_none() && upq::on() {
                             let (memory, used) = own.source();
                             up = upq::send(self, &self.queue, &[(memory, 0, memory, used)], |_, _, _| {});
+                        } else if looks.is_none()
+                            && let Some(tl) = async_tl
+                        {
+                            let (memory, used) = own.source();
+                            async_bounce = tl.submit_upload_bounce(self, &self.queue, &[(memory, 0, used)], |_, _, _| {});
                         }
-                        let from = up.as_ref().and_then(upq::Slot::bounce);
+                        let from = up
+                            .as_ref()
+                            .and_then(upq::Slot::bounce)
+                            .or_else(|| async_bounce.as_ref().map(crate::async_timeline::BounceHandle::resource));
                         own.record(self, list, &dirty, |shadow| looks.as_ref().is_some_and(|l| l.hold(shadow)), from);
                     }
-                    // With `upq`: the PC's bytes come into a buffer of ours
-                    // on the copy queue, and this list copies them from
-                    // there (the card's memory), after a wait for that.
+                    // With `upq` or `VICTORY_ASYNC_COMPUTE=1`: the PC's bytes come
+                    // into a VRAM bounce buffer on the copy queue, and this list
+                    // copies them from there after a GPU-side fence wait.
                     if own.is_none() && looks.is_none() && upq::on() {
                         let sides: Vec<_> = dirty.iter().map(|(shadow, _)| shadow.card_sides()).collect();
                         let mut ranges: Vec<upq::Range<'_>> = Vec::new();
@@ -5164,12 +5346,29 @@ impl Host {
                             let (card, offset, _, bytes) = ranges[i];
                             list.CopyBufferRegion(card, offset, bounce, at, bytes);
                         });
+                    } else if own.is_none()
+                        && looks.is_none()
+                        && let Some(tl) = async_tl
+                    {
+                        let sides: Vec<_> = dirty.iter().map(|(shadow, _)| shadow.card_sides()).collect();
+                        let mut ranges: Vec<(&ID3D12Resource, u64, &ID3D12Resource, u64)> = Vec::new();
+                        for ((shadow, rs), side) in dirty.iter().zip(&sides) {
+                            if let Some((staging, _, _)) = side {
+                                ranges.extend(rs.iter().map(|&(a, b)| (&shadow.buffer, a as u64, *staging, (b - a) as u64)));
+                            }
+                        }
+                        let copy_ranges: Vec<(&ID3D12Resource, u64, u64)> =
+                            ranges.iter().map(|&(_, offset, staging, bytes)| (staging, offset, bytes)).collect();
+                        async_bounce = tl.submit_upload_bounce(self, &self.queue, &copy_ranges, |i, bounce, at| {
+                            let (card, offset, _, bytes) = ranges[i];
+                            list.CopyBufferRegion(card, offset, bounce, at, bytes);
+                        });
                     }
                     for (shadow, ranges) in &dirty {
                         let Some((staging, before, _)) = shadow.card_sides() else {
                             continue;
                         };
-                        if own.is_none() && up.is_none() {
+                        if own.is_none() && up.is_none() && async_bounce.is_none() {
                             for &(a, b) in ranges {
                                 list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
                             }
@@ -5179,7 +5378,11 @@ impl Host {
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
                         #[cfg(feature = "diagnostics")]
                         traffic::moved(traffic::UP, shadow.span(), ranges.iter().copied());
-                        if own.is_none() && before.is_some() && !ranges.is_empty() {
+                        if own.is_none()
+                            && before.is_some()
+                            && !ranges.is_empty()
+                            && !async_rehash_ids.contains(&shadow.id())
+                        {
                             let raw = shadow.buffer.as_raw();
                             if !transitioned.contains(&raw) {
                                 transitioned.push(raw);
@@ -5194,13 +5397,20 @@ impl Host {
                     if !sent.is_empty() {
                         list.ResourceBarrier(&sent);
                     }
-                    list.SetComputeRootSignature(&work.root);
-                    list.SetPipelineState(&work.pso);
-                    list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                    let mut bound_compare = false;
                     for (shadow, ranges) in &dirty {
+                        if async_rehash_ids.contains(&shadow.id()) {
+                            continue;
+                        }
                         let (Some((_, Some(before), _)), size) = (shadow.card_sides(), shadow.card_hash_size()) else {
                             continue;
                         };
+                        if !bound_compare {
+                            list.SetComputeRootSignature(&work.root);
+                            list.SetPipelineState(&work.pso);
+                            list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                            bound_compare = true;
+                        }
                         // No twin (it cost the card the copy's size again,
                         // 399 MB in run 75): `before` holds a 128-bit hash
                         // of each 64 KiB piece. The pieces just sent up are
@@ -5233,12 +5443,50 @@ impl Host {
                         }
                     }
                     list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    let cmd_list: ID3D12CommandList = list.cast()?;
+                    if let Some(tl) = crate::async_timeline::existing() {
+                        // Atomically wait on in-flight Compute/Copy hazards, submit Direct
+                        // `sync`, signal `direct_fence`, and record Direct writes (including
+                        // `work.differs.0` whenever `bound_compare` bound it as UAV slot 3).
+                        let mut sync_writes = Vec::with_capacity(dirty.len() * 2 + 1);
+                        for (shadow, _) in &dirty {
+                            sync_writes.push(crate::async_timeline::resource_key(&shadow.buffer));
+                            if !async_rehash_ids.contains(&shadow.id())
+                                && let Some((_, Some(before), _)) = shadow.card_sides()
+                            {
+                                sync_writes.push(crate::async_timeline::resource_key(&before));
+                            }
+                        }
+                        if bound_compare {
+                            sync_writes.push(crate::async_timeline::resource_key(&work.differs.0));
+                        }
+                        let ((), tok, _) = tl.execute_direct_tracked(&self.queue, &[], &sync_writes, || {
+                            self.queue.ExecuteCommandLists(&[Some(cmd_list)]);
+                        })?;
+                        sync_tok = Some(tok);
+                    } else {
+                        self.queue.ExecuteCommandLists(&[Some(cmd_list)]);
+                    }
                     Ok(())
                 })()
             };
             if let Err(e) = recorded {
+                if let (Some((prepared, ..)), Some(tl)) = (prepared_rehash, crate::async_timeline::existing()) {
+                    tl.discard_prepared_compute(prepared);
+                }
                 fail(format_args!("host copies in the card's memory could not be brought up to date ({e})"));
+            }
+            // Dispatch the pre-recorded async compute rehash pass behind `sync_tok`
+            // via a GPU-side Direct->Compute fence wait.
+            if let (Some((prepared, reads, writes, keep)), Some(tl), Some(tok)) =
+                (prepared_rehash, async_tl, sync_tok)
+            {
+                match tl.dispatch_prepared_compute(prepared, &[tok], &reads, &writes, keep) {
+                    Ok(_) => crate::async_timeline::count_rehash(),
+                    Err(e) => fail(format_args!(
+                        "async compute rehash of host copies in the card's memory could not be dispatched ({e})"
+                    )),
+                }
             }
             used.push((false, sync));
         }
@@ -5252,6 +5500,9 @@ impl Host {
             looks,
             sends: own.map(send::Own::memory),
             up,
+            async_check: None,
+            async_bounce,
+            differs_key: crate::async_timeline::resource_key(&work.differs.0),
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
@@ -5304,50 +5555,107 @@ impl Host {
         }
         work.taken = at;
         if plan.ranges.iter().any(|r| r.compared) {
-            let Some(check) = work.check.pop().or_else(|| self.make_prelude()) else {
-                fail(format_args!("no host list for the compare of host copies in the card's memory"));
-            };
-            let (allocator, list) = &check;
-            // SAFETY: the list's last run finished (its submission was
-            // waited for, and it came back after that); live buffers; the
-            // compare's own root signature.
-            let recorded = unsafe {
-                (|| -> windows::core::Result<ID3D12CommandList> {
-                    allocator.Reset()?;
-                    list.Reset(allocator, None)?;
-                    // What the submission's shaders wrote, first.
-                    list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
-                        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-                        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                        Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                                pResource: std::mem::ManuallyDrop::new(None),
-                            }),
-                        },
-                    }]);
-                    list.SetComputeRootSignature(&work.root);
-                    list.SetPipelineState(&work.pso);
-                    list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
-                    for r in plan.ranges.iter().filter(|r| r.compared) {
-                        let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
-                            continue;
-                        };
-                        list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        // (What is only looked at keeps its hashes: what
-                        // changed there is the next declared range's to land.)
-                        card_pass(list, &r.span, size as u32, r.at, if flown && !r.picked { 2 } else { 1 });
-                        CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
+            if let Some(tl) = async_tl
+                && !gpu_timing
+            {
+                let mut reads = Vec::new();
+                let mut writes = vec![crate::async_timeline::resource_key(&work.differs.0)];
+                let mut keep = vec![work.differs.0.clone()];
+                for r in plan.ranges.iter().filter(|r| r.compared) {
+                    let Some((_, Some(before), _)) = r.shadow.card_sides() else {
+                        continue;
+                    };
+                    let rk = crate::async_timeline::resource_key(&r.shadow.buffer);
+                    if !reads.contains(&rk) {
+                        reads.push(rk);
+                        keep.push(r.shadow.buffer.clone());
                     }
-                    list.Close()?;
-                    list.cast()
-                })()
-            };
-            match recorded {
-                Ok(list) => plan.check = Some(list),
-                Err(e) => fail(format_args!("the compare of host copies in the card's memory could not be recorded ({e})")),
+                    let wk = crate::async_timeline::resource_key(&before);
+                    if !writes.contains(&wk) {
+                        writes.push(wk);
+                        keep.push(before);
+                    }
+                }
+                let prepared = tl.prepare_compute(|clist| {
+                    // SAFETY: Open compute list; live buffers in `COMMON` after Direct's
+                    // title lists finish, synchronized by Direct->Compute GPU fence wait.
+                    unsafe {
+                        clist.SetComputeRootSignature(&work.root);
+                        clist.SetPipelineState(&work.pso);
+                        clist.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                        for r in plan.ranges.iter().filter(|r| r.compared) {
+                            let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
+                                continue;
+                            };
+                            clist.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
+                            clist.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+                            card_pass(clist, &r.span, size as u32, r.at, if flown && !r.picked { 2 } else { 1 });
+                            CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    Ok(())
+                });
+                match prepared {
+                    Ok(prepared) => {
+                        plan.async_check = Some(crate::async_timeline::PendingCheck::Prepared {
+                            prepared,
+                            reads,
+                            writes,
+                            keep,
+                        });
+                        crate::async_timeline::count_compare();
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "async compute compare recording failed; falling back to direct queue");
+                    }
+                }
             }
-            plan.lists.push((true, check));
+            if plan.async_check.is_none() {
+                let Some(check) = work.check.pop().or_else(|| self.make_prelude()) else {
+                    fail(format_args!("no host list for the compare of host copies in the card's memory"));
+                };
+                let (allocator, list) = &check;
+                // SAFETY: the list's last run finished (its submission was
+                // waited for, and it came back after that); live buffers; the
+                // compare's own root signature.
+                let recorded = unsafe {
+                    (|| -> windows::core::Result<ID3D12CommandList> {
+                        allocator.Reset()?;
+                        list.Reset(allocator, None)?;
+                        // What the submission's shaders wrote, first.
+                        list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                                    pResource: std::mem::ManuallyDrop::new(None),
+                                }),
+                            },
+                        }]);
+                        list.SetComputeRootSignature(&work.root);
+                        list.SetPipelineState(&work.pso);
+                        list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                        for r in plan.ranges.iter().filter(|r| r.compared) {
+                            let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
+                                continue;
+                            };
+                            list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
+                            list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+                            // (What is only looked at keeps its hashes: what
+                            // changed there is the next declared range's to land.)
+                            card_pass(list, &r.span, size as u32, r.at, if flown && !r.picked { 2 } else { 1 });
+                            CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
+                        }
+                        list.Close()?;
+                        list.cast()
+                    })()
+                };
+                match recorded {
+                    Ok(list) => plan.check = Some(list),
+                    Err(e) => fail(format_args!("the compare of host copies in the card's memory could not be recorded ({e})")),
+                }
+                plan.lists.push((true, check));
+            }
         }
         work.out += 1;
         Some(plan)
@@ -5377,6 +5685,24 @@ impl Host {
         }
         if let Some(slot) = plan.up {
             upq::give_back(slot);
+        }
+        if let Some(bounce) = plan.async_bounce
+            && let Some(tl) = crate::async_timeline::existing()
+        {
+            tl.return_bounce(bounce);
+        }
+        if let Some(check) = plan.async_check
+            && let Some(tl) = crate::async_timeline::existing()
+        {
+            match check {
+                crate::async_timeline::PendingCheck::Prepared { prepared, .. } => {
+                    tl.discard_prepared_compute(prepared);
+                }
+                crate::async_timeline::PendingCheck::Dispatched(token) => {
+                    let _ = tl.wait_cpu(token);
+                }
+            }
+            tl.reclaim();
         }
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(work) = work.as_mut() else {
@@ -5459,6 +5785,10 @@ impl Host {
         if let (Some(fetch), Some(first)) = (fetch.as_mut(), plans.iter().map(|p| p.1).min()) {
             fetch.had.landing(first);
         }
+        // Wait for any async-compute compares covering `plans` before reading `differs`.
+        for &(plan, _) in plans {
+            plan.ensure_async_check_ready();
+        }
         // SAFETY: the mapping of the results. The compares of these plans
         // have run, and their dwords are given to no other plan before these
         // are done with (`card_done`).
@@ -5531,7 +5861,11 @@ impl Host {
         }
         // On the copy queue a later flight may be at a piece while it is
         // fetched: the pieces come down whole, to be hashed.
-        let check = (torn::on() && fetch.as_ref().is_some_and(|f| f.queue.is_some()))
+        let async_copy = (!relay_copy() && crate::async_timeline::on())
+            .then(|| crate::async_timeline::global(&self.device))
+            .flatten();
+        let on_copy_queue = async_copy.is_some() || fetch.as_ref().is_some_and(|f| f.queue.is_some());
+        let check = (torn::on() && on_copy_queue)
             .then(|| torn::Check::new(plans.iter().map(|p| p.0), differs.unwrap_or_default(), &mut pieces));
         if let Some(check) = &check {
             total = check.total;
@@ -5546,7 +5880,7 @@ impl Host {
         if pieces.is_empty() {
             // Nothing to fetch: every send so far is older than the next
             // fetch, if that goes to the queue the sends went to.
-            let after = match fetch.as_ref().is_some_and(|f| f.queue.is_some()) {
+            let after = match on_copy_queue {
                 true => behind,
                 false => *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()),
             };
@@ -5569,48 +5903,64 @@ impl Host {
         let waiting = std::time::Instant::now();
         // The flights the fetch runs behind: those in the line by now have
         // been given to the queue. On the copy queue, those landed here.
-        let ahead = match copy_queue {
-            Some(_) => 0,
-            None => line().target,
+        let ahead = match on_copy_queue {
+            true => 0,
+            false => line().target,
         };
         // SAFETY: the list's last run was waited for by this thread; live
         // buffers (the copies are held by the plans); the fence and the
         // event are this thread's.
-        let ran = unsafe {
-            (|| -> windows::core::Result<u64> {
-                allocator.Reset()?;
-                list.Reset(&allocator, None)?;
-                for (shadow, lo, hi, at) in check.as_ref().map_or(&pieces, |c| &c.copies) {
-                    list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
-                }
-                list.Close()?;
-                let lists = [Some(list.cast::<ID3D12CommandList>()?)];
-                let _fetching = crate::timeline::span("landing: fetching pieces");
-                if let Some(queue) = &copy_queue {
-                    queue.ExecuteCommandLists(&lists);
-                    queue.Signal(&fence, sent)?;
+        let ran = if let Some(tl) = async_copy {
+            let _fetching = crate::timeline::span("landing: fetching pieces (async copy)");
+            let src_list = check.as_ref().map_or(&pieces, |c| &c.copies);
+            let copy_ops: Vec<(&ID3D12Resource, u64, u64, u64)> = src_list
+                .iter()
+                .map(|(shadow, lo, hi, at)| (&shadow.buffer, *lo as u64, *at, (*hi - *lo) as u64))
+                .collect();
+            tl.submit_copy_readback(&[], &buffer, &copy_ops).and_then(|rb_tok| {
+                meanwhile();
+                #[cfg(feature = "diagnostics")]
+                let _card = crate::timeline::card_wait(None);
+                tl.wait_cpu(rb_tok)?;
+                Ok(behind)
+            })
+        } else {
+            unsafe {
+                (|| -> windows::core::Result<u64> {
+                    allocator.Reset()?;
+                    list.Reset(&allocator, None)?;
+                    for (shadow, lo, hi, at) in check.as_ref().map_or(&pieces, |c| &c.copies) {
+                        list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                    }
+                    list.Close()?;
+                    let lists = [Some(list.cast::<ID3D12CommandList>()?)];
+                    let _fetching = crate::timeline::span("landing: fetching pieces");
+                    if let Some(queue) = &copy_queue {
+                        queue.ExecuteCommandLists(&lists);
+                        queue.Signal(&fence, sent)?;
+                        meanwhile();
+                        fence.SetEventOnCompletion(sent, event)?;
+                        #[cfg(feature = "diagnostics")]
+                        let _card = crate::timeline::card_wait(None);
+                        WaitForSingleObject(event, INFINITE);
+                        return Ok(behind);
+                    }
+                    // In the order of the queue: the sends of title bytes so
+                    // far are ahead of this fetch, every later one behind it.
+                    let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+                    self.queue.ExecuteCommandLists(&lists);
+                    let after = *order;
+                    drop(order);
+                    self.card_sent();
+                    self.queue.Signal(&fence, sent)?;
                     meanwhile();
                     fence.SetEventOnCompletion(sent, event)?;
                     #[cfg(feature = "diagnostics")]
                     let _card = crate::timeline::card_wait(None);
                     WaitForSingleObject(event, INFINITE);
-                    return Ok(behind);
-                }
-                // In the order of the queue: the sends of title bytes so
-                // far are ahead of this fetch, every later one behind it.
-                let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
-                self.queue.ExecuteCommandLists(&lists);
-                let after = *order;
-                drop(order);
-                self.card_sent();
-                self.queue.Signal(&fence, sent)?;
-                meanwhile();
-                fence.SetEventOnCompletion(sent, event)?;
-                #[cfg(feature = "diagnostics")]
-                let _card = crate::timeline::card_wait(None);
-                WaitForSingleObject(event, INFINITE);
-                Ok(after)
-            })()
+                    Ok(after)
+                })()
+            }
         };
         let after = match ran {
             Ok(after) => after,
@@ -5849,6 +6199,7 @@ impl Host {
         if plan.ranges.is_empty() {
             return;
         }
+        plan.ensure_async_check_ready();
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(work) = work.as_mut() else {
             return;
@@ -6546,7 +6897,48 @@ impl Host {
             shadow.writing(*at, *len);
         }
         let declared = declared_writes(runs);
-        let card = self.card_before(&declared, &picked, flown);
+        let mut card = self.card_before(&declared, &picked, flown);
+        // Collect Direct resource keys for atomic Wait + Execute + Signal + Record
+        // whenever `AsyncTimeline` has been initialized (including across `VICTORY_AB`
+        // toggles and Direct fallback compares writing `work.differs.0`).
+        let (direct_reads, direct_writes) = if crate::async_timeline::existing().is_some() {
+            let mut reads = Vec::new();
+            let mut writes: Vec<usize> = declared
+                .iter()
+                .filter(|(s, _)| s.carded())
+                .map(|(s, _)| crate::async_timeline::resource_key(&s.buffer))
+                .chain(
+                    picked
+                        .written
+                        .iter()
+                        .filter(|(s, ..)| s.carded())
+                        .map(|(s, ..)| crate::async_timeline::resource_key(&s.buffer)),
+                )
+                .chain(
+                    picked
+                        .looked
+                        .iter()
+                        .filter(|(s, ..)| s.carded())
+                        .map(|(s, ..)| crate::async_timeline::resource_key(&s.buffer)),
+                )
+                .collect();
+            if let Some(plan) = &card
+                && plan.check.is_some()
+            {
+                if plan.differs_key != 0 {
+                    writes.push(plan.differs_key);
+                }
+                for r in plan.ranges.iter().filter(|r| r.compared) {
+                    reads.push(crate::async_timeline::resource_key(&r.shadow.buffer));
+                    if let Some((_, Some(before), _)) = r.shadow.card_sides() {
+                        writes.push(crate::async_timeline::resource_key(&before));
+                    }
+                }
+            }
+            (reads, writes)
+        } else {
+            (Vec::new(), Vec::new())
+        };
         // The sends are taken: from here on the references hold what the
         // copies in the lists put.
         for (shadow, at, bytes) in batch.placed.drain(..) {
@@ -6604,11 +6996,25 @@ impl Host {
                 compare_at
             };
             // SAFETY: closed lists; the fence is ours.
-            let signalled = unsafe {
-                for batch in submission_batches(&lists, &firsts, &parts, compare_at) {
-                    self.queue.ExecuteCommandLists(batch);
+            let signalled = if let Some(tl) = crate::async_timeline::existing() {
+                tl.execute_direct_tracked(&self.queue, &direct_reads, &direct_writes, || unsafe {
+                    for batch in submission_batches(&lists, &firsts, &parts, compare_at) {
+                        self.queue.ExecuteCommandLists(batch);
+                    }
+                })
+                .and_then(|((), direct_tok, _)| {
+                    if let Some(card) = card.as_mut() {
+                        card.dispatch_async_check_after(direct_tok);
+                    }
+                    unsafe { self.queue.Signal(&self.fence, *submitted) }
+                })
+            } else {
+                unsafe {
+                    for batch in submission_batches(&lists, &firsts, &parts, compare_at) {
+                        self.queue.ExecuteCommandLists(batch);
+                    }
+                    self.queue.Signal(&self.fence, *submitted)
                 }
-                self.queue.Signal(&self.fence, *submitted)
             };
             awake::sent(&self.device);
             #[cfg(feature = "diagnostics")]
@@ -6673,9 +7079,39 @@ impl Host {
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(group);
-                if _i + 1 == groups.len() && !comparison.is_empty() {
-                    self.queue.ExecuteCommandLists(comparison);
+                if let Some(tl) = crate::async_timeline::existing() {
+                    let is_last = _i + 1 == groups.len();
+                    let tracked = tl.execute_direct_tracked(
+                        &self.queue,
+                        &direct_reads,
+                        &direct_writes,
+                        || {
+                            self.queue.ExecuteCommandLists(group);
+                            if is_last && !comparison.is_empty() {
+                                self.queue.ExecuteCommandLists(comparison);
+                            }
+                        },
+                    );
+                    match tracked {
+                        Ok(((), direct_tok, _)) => {
+                            if is_last
+                                && comparison.is_empty()
+                                && let Some(card) = card.as_mut()
+                            {
+                                card.dispatch_async_check_after(direct_tok);
+                            }
+                        }
+                        Err(e) => {
+                            fail(format_args!(
+                                "a host submission could not be synchronized with the async timeline ({e})"
+                            ));
+                        }
+                    }
+                } else {
+                    self.queue.ExecuteCommandLists(group);
+                    if _i + 1 == groups.len() && !comparison.is_empty() {
+                        self.queue.ExecuteCommandLists(comparison);
+                    }
                 }
                 self.card_sent();
                 let waited = self
@@ -10153,6 +10589,7 @@ impl Meter {
             crate::queue::behind_line(frames);
             card_clock_line(frames, ms);
             upq::line(frames);
+            crate::async_timeline::line(frames);
             rec::line(frames);
             #[cfg(feature = "diagnostics")]
             spans::line(frames);

@@ -24,6 +24,8 @@ static HEAP: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[cfg(windows)]
 mod ambient;
 #[cfg(windows)]
+mod async_timeline;
+#[cfg(windows)]
 mod lightprobe;
 #[cfg(windows)]
 mod texlate;

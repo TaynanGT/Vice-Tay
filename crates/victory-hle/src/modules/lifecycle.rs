@@ -164,14 +164,21 @@ fn place(
     height: i32,
 ) -> (Windowed, Option<WindowState>) {
     let windowed = (ex_style, style, fit(parent, x, y, width, height));
-    // SAFETY: plain queries of the primary monitor's size.
-    let screen = unsafe { (wm::GetSystemMetrics(wm::SM_CXSCREEN), wm::GetSystemMetrics(wm::SM_CYSCREEN)) };
-    let Some(full) = full_screen(ex_style, style, !parent.is_null(), screen) else {
+    // The monitor `VICTORY_MONITOR` names (whole area), else the primary.
+    let chosen = chosen_monitor().map(|(_, whole)| whole);
+    let (origin, screen) = match chosen {
+        Some(m) => ((m.left, m.top), (m.right - m.left, m.bottom - m.top)),
+        // SAFETY: plain queries of the primary monitor's size.
+        None => ((0, 0), unsafe { (wm::GetSystemMetrics(wm::SM_CXSCREEN), wm::GetSystemMetrics(wm::SM_CYSCREEN)) }),
+    };
+    let Some(full) = full_screen(ex_style, style, !parent.is_null(), screen)
+        .map(|(e, s, (_, _, w, h))| (e, s, (origin.0, origin.1, w, h)))
+    else {
         return (windowed, None);
     };
     let full_screen = full_screen_on();
     if full_screen {
-        tracing::info!(width = screen.0, height = screen.1, "title window made full screen");
+        tracing::info!(width = screen.0, height = screen.1, left = origin.0, top = origin.1, "title window made full screen");
     }
     (if full_screen { full } else { windowed }, Some(WindowState { windowed, full_screen }))
 }
@@ -292,6 +299,18 @@ fn full_screen(ex_style: u32, style: u32, parented: bool, screen: (i32, i32)) ->
 /// chain stretches). `VICTORY_WINDOW_MAX=WIDTHxHEIGHT` applies a smaller
 /// limit without changing the title's render targets.
 fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32, i32) {
+    // A monitor named by `VICTORY_MONITOR`: the window goes there, fitted
+    // and centred, whatever the title asked for.
+    if parent.is_null()
+        && let Some((area, _)) = chosen_monitor()
+    {
+        let (w, h) = fit_with_limit(&area, width, height, window_limit());
+        let (w, h) = if w > 0 && h > 0 { (w, h) } else { (area.right - area.left, area.bottom - area.top) };
+        let left = area.left + (area.right - area.left - w) / 2;
+        let top = area.top + (area.bottom - area.top - h) / 2;
+        tracing::info!(width, height, to = ?(left, top, w, h), "title window put on the monitor VICTORY_MONITOR names");
+        return (left, top, w, h);
+    }
     let mut area = RECT::default();
     // SAFETY: `area` receives the primary monitor's work area.
     let known =
@@ -306,6 +325,56 @@ fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32,
     let left = area.left + (area.right - area.left - w) / 2;
     let top = area.top + (area.bottom - area.top - h) / 2;
     (left, top, w, h)
+}
+
+/// The monitor `VICTORY_MONITOR` names: its device name (`DISPLAY3` or
+/// `\\.\DISPLAY3`), or its 1-based place in the order Windows lists the
+/// monitors; its work area and its whole area. Unset or not found: none
+/// (the primary monitor, as before). (Ours, 31790ae7.)
+fn chosen_monitor() -> Option<(RECT, RECT)> {
+    use windows_sys::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW};
+    let want = std::env::var("VICTORY_MONITOR").ok()?;
+    let want = want.trim().trim_start_matches(r"\\.\").to_ascii_uppercase();
+    if want.is_empty() {
+        return None;
+    }
+    unsafe extern "system" fn each(monitor: HMONITOR, _: HDC, _: *mut RECT, data: LPARAM) -> windows_sys::core::BOOL {
+        // SAFETY: `data` is the list below, alive for the enumeration.
+        let list = unsafe { &mut *(data as *mut Vec<(String, RECT, RECT)>) };
+        // SAFETY: a plain struct of numbers.
+        let mut info: MONITORINFOEXW = unsafe { std::mem::zeroed() };
+        info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+        // SAFETY: a monitor handle from the enumeration and a sized struct.
+        if unsafe { GetMonitorInfoW(monitor, (&raw mut info).cast::<MONITORINFO>()) } != 0 {
+            let end = info.szDevice.iter().position(|&c| c == 0).unwrap_or(info.szDevice.len());
+            list.push((String::from_utf16_lossy(&info.szDevice[..end]), info.monitorInfo.rcWork, info.monitorInfo.rcMonitor));
+        }
+        1
+    }
+    let mut list: Vec<(String, RECT, RECT)> = Vec::new();
+    // SAFETY: the callback only touches `list`, which outlives the call.
+    unsafe { EnumDisplayMonitors(std::ptr::null_mut(), std::ptr::null(), Some(each), (&raw mut list) as LPARAM) };
+    let found = pick_monitor(&list, &want);
+    if found.is_none() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let names: Vec<&str> = list.iter().map(|m| m.0.as_str()).collect();
+            tracing::warn!(want, ?names, "VICTORY_MONITOR names no monitor: the primary one is used");
+        });
+    }
+    found
+}
+
+/// The entry of `list` (device name, work area, whole area) that `want`
+/// (upper case, without `\\.\`) names: a 1-based place, or a device name.
+fn pick_monitor(list: &[(String, RECT, RECT)], want: &str) -> Option<(RECT, RECT)> {
+    match want.parse::<usize>() {
+        Ok(n) if n >= 1 => list.get(n - 1).map(|m| (m.1, m.2)),
+        _ => list
+            .iter()
+            .find(|(name, _, _)| name.trim_start_matches(r"\\.\").eq_ignore_ascii_case(want))
+            .map(|m| (m.1, m.2)),
+    }
 }
 
 fn parse_window_limit(value: &str) -> Option<(i32, i32)> {
@@ -622,6 +691,23 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `VICTORY_MONITOR`: a device name with or without its prefix, any
+    /// case, or a 1-based place; anything else names none.
+    #[test]
+    fn a_monitor_is_picked_by_name_or_place() {
+        let rect = |l: i32, w: i32| RECT { left: l, top: 0, right: l + w, bottom: 1440 };
+        let list = vec![
+            (r"\\.\DISPLAY1".to_owned(), rect(0, 3440), rect(0, 3440)),
+            (r"\\.\DISPLAY3".to_owned(), rect(3440, 2560), rect(3440, 2560)),
+        ];
+        assert_eq!(pick_monitor(&list, "DISPLAY3").map(|m| m.1.left), Some(3440));
+        assert_eq!(pick_monitor(&list, "display1").map(|m| m.1.left), Some(0));
+        assert_eq!(pick_monitor(&list, "2").map(|m| m.1.left), Some(3440));
+        assert!(pick_monitor(&list, "3").is_none());
+        assert!(pick_monitor(&list, "0").is_none());
+        assert!(pick_monitor(&list, "DISPLAY2").is_none());
+    }
 
     extern "system" fn noop(_: u8, _: *mut c_void) {}
 

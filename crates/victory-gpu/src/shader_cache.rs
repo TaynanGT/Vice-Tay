@@ -103,6 +103,8 @@ fn build() -> [u8; 32] {
         };
         bytes.extend_from_slice(&FORMAT.to_le_bytes());
         bytes.extend_from_slice(&limit.to_le_bytes());
+        bytes.extend_from_slice(&victory_shader::emit::compute_loop_limit().to_le_bytes());
+        bytes.extend_from_slice(&victory_shader::emit::trace_loop_limit().to_le_bytes());
         // Which group barriers wait is part of the translation too.
         bytes.push(victory_shader::emit::group_sync());
         // So are the switches that pick the form of a wave64 program:

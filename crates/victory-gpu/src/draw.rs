@@ -3340,6 +3340,8 @@ impl State {
             return;
         }
         #[cfg(feature = "diagnostics")]
+        self.probe_root(p);
+        #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_builder(self.pipeline as This) {
@@ -3947,6 +3949,96 @@ impl State {
             let r = self.scissors.first().map_or([0; 4], |r| [r.left, r.top, r.right, r.bottom]);
             *census.1.entry(r).or_insert(0) += 1;
         }
+    }
+
+    /// `VICTORY_PROBE_ROOT=<hash>,<user data>` (diagnostics): at a dispatch of
+    /// the compute program with that title shader hash, the first 256 bytes
+    /// of title memory at the root view its user-data index names (the
+    /// buffer a `s_buffer_load` through that descriptor reads), as the CPU
+    /// sees them when the dispatch is recorded (the card may see them as of
+    /// the submission), logged for the first dispatch and every 64th.
+    #[cfg(feature = "diagnostics")]
+    fn probe_root(&self, p: &HostPipeline) {
+        static PROBE: std::sync::OnceLock<Option<(String, u8, Option<u64>)>> = std::sync::OnceLock::new();
+        let probe = PROBE.get_or_init(|| {
+            let v = std::env::var("VICTORY_PROBE_ROOT").ok()?;
+            let mut parts = v.split(',').map(str::trim);
+            let hash = parts.next()?.to_ascii_lowercase();
+            let user = parts.next()?.parse().ok()?;
+            // A third part: the byte in the table the user data points at
+            // where the buffer's descriptor (V#) lies (`s_load_dwordx4
+            // s[n:n+3], s[table], <byte>`).
+            let table = parts
+                .next()
+                .and_then(|t| t.strip_prefix("0x").map_or_else(|| t.parse().ok(), |h| u64::from_str_radix(h, 16).ok()));
+            Some((hash, user, table))
+        });
+        let Some((hash, user, table)) = probe else { return };
+        let Some(stage) = p.stages.first() else { return };
+        if stage.shader.hash != *hash {
+            return;
+        }
+        static SEEN: AtomicU64 = AtomicU64::new(0);
+        let n = SEEN.fetch_add(1, Ordering::Relaxed);
+        if !n.is_multiple_of(64) {
+            return;
+        }
+        let used = stage.translated().used.iter().find(|u| u.user_data == *user);
+        let Some(used) = used else {
+            tracing::info!(hash = %hash, user, "probe: the program uses no resource at that user-data index");
+            return;
+        };
+        let root = self.roots_ref(true).get(usize::from(used.slot)).cloned();
+        let base = match (&root, table) {
+            (Some(Root::View(base)), None) => *base,
+            (Some(Root::Table(at)) | Some(Root::View(at)), Some(byte)) => {
+                // The slot holds a view of ours (the title made it with the
+                // device), not the console's descriptor words.
+                match crate::descriptor::view(at + byte) {
+                    Some(View::Constant(address, size)) => {
+                        tracing::info!(
+                            hash = %hash,
+                            table = format_args!("{at:#x}"),
+                            byte,
+                            size,
+                            "probe: a constant buffer view at {address:#x}"
+                        );
+                        address
+                    }
+                    other => {
+                        let kind = match other {
+                            None => "none",
+                            Some(View::Constant(..)) => "constant",
+                            Some(View::Shader(..)) => "shader resource",
+                            Some(View::Unordered(..)) => "unordered access",
+                            Some(_) => "another kind",
+                        };
+                        tracing::info!(hash = %hash, table = format_args!("{at:#x}"), byte, kind, "probe: not a constant buffer view");
+                        return;
+                    }
+                }
+            }
+            _ => {
+                tracing::info!(hash = %hash, user, slot = used.slot, root = ?root, kind = ?used.kind, "probe: not a root view (give the table byte for a table)");
+                return;
+            }
+        };
+        let mut bytes = [0u8; 0x100];
+        let ok = crate::host::read_into(base as *const u8, &mut bytes);
+        let words: Vec<String> = bytes
+            .chunks_exact(4)
+            .map(|w| format!("{:08x}", u32::from_le_bytes([w[0], w[1], w[2], w[3]])))
+            .collect();
+        tracing::info!(
+            hash = %hash,
+            dispatch = n,
+            user,
+            slot = used.slot,
+            base = format_args!("{base:#x}"),
+            ok,
+            "probe: root view words {}",
+            words.join(" ")
+        );
     }
 
     fn roots_ref(&self, compute: bool) -> &Vec<Root> {
@@ -4797,6 +4889,10 @@ impl State {
             );
             why("prepare failed");
             return false;
+        }
+        #[cfg(feature = "diagnostics")]
+        if kind == DISPATCH {
+            self.probe_root(p);
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {

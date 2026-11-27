@@ -55,9 +55,13 @@
 //! unpacked a second time, into garbage all over their neighbours).
 //!
 //! **Stores are bounded**: a structure the builder misreads makes it store
-//! anywhere. Pages of title buffers take its stores only once one of its
-//! dispatches was given that buffer as an unordered access view (its scratch
-//! memory, its results); what else a store reaches is an arena's.
+//! anywhere. With `VICTORY_BVH_OPEN_ALL=0`, pages of title buffers take its
+//! stores only once one of its dispatches was given that buffer as an
+//! unordered access view (its scratch memory, its results); what else a
+//! store reaches is an arena's. By default every title buffer's copy takes
+//! them ([`open_all`]): the builder writes structures into buffers it is
+//! given only by address, and closed those stores were dropped. Stores still
+//! go to the copies on the card, not back to title memory.
 //!
 //! A packed structure is gone when title memory has no header of it any more
 //! (looked at over [`SWEEP`] frames); the pages it alone has are given back.
@@ -354,21 +358,34 @@ impl Memory {
             // Every page the copy holds whole, not only the one asked for.
             // shortcut: a page of a title buffer inside this one that has a
             // copy of its own is given this copy too.
+            let open = open_all();
             if fresh {
+                if open {
+                    // (Its pages hold what the CPU writes beside the stores.)
+                    self.copies[n].keep_stores();
+                }
                 let (first, len) = shadow.span();
                 let mut at = first.next_multiple_of(PAGE);
                 while at + PAGE <= first + len && at / PAGE < u64::from(MEMORY_PAGES) - 1 {
                     let entry = self.entry(at / PAGE);
                     // SAFETY: an entry of the directory.
                     if unsafe { entry.read() } == 0 {
-                        close(entry, n, at - first);
+                        if open {
+                            fill(entry, n, at - first);
+                        } else {
+                            close(entry, n, at - first);
+                        }
                     }
                     at += PAGE;
                 }
             }
             // SAFETY: as above.
             if unsafe { self.entry(page).read() } == 0 {
-                close(self.entry(page), n, start - shadow.span().0);
+                if open {
+                    fill(self.entry(page), n, start - shadow.span().0);
+                } else {
+                    close(self.entry(page), n, start - shadow.span().0);
+                }
             }
             return true;
         }
@@ -670,6 +687,30 @@ impl Memory {
         }
     }
 
+    /// `VICTORY_MEMORY_CLOSED_NOTES=1`: a shader stored to `page`, which its
+    /// stores do not reach; by title buffer, how often (logged now and then).
+    fn closed_store(&mut self, page: u64) {
+        static SEEN: Mutex<Option<(HashMap<u64, u64>, u64)>> = Mutex::new(None);
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let (by_buffer, n) = seen.get_or_insert_with(|| (HashMap::new(), 0));
+        let at = page * PAGE;
+        let key = crate::shadow::in_buffer(at, 1).map_or(at, |b| b.0);
+        *by_buffer.entry(key).or_default() += 1;
+        *n += 1;
+        if *n <= 20 || n.is_power_of_two() {
+            let buffer = crate::shadow::in_buffer(at, 1);
+            tracing::info!(
+                frame = self.frame,
+                page = format_args!("{at:#x}"),
+                buffer = ?buffer.map(|b| (format!("{:#x}", b.0), b.1)),
+                in_arena = self.pages.contains_key(&page),
+                total = *n,
+                buffers = by_buffer.len(),
+                "title memory by address: a store dropped on a page stores do not reach"
+            );
+        }
+    }
+
     /// The pages shaders found empty since the last frame.
     fn take_faults(&mut self) {
         let mut pages = Vec::new();
@@ -679,7 +720,12 @@ impl Memory {
             let at = unsafe { self.faults.1.add(i) };
             // SAFETY: as above.
             let page = unsafe { at.read_volatile() };
-            if page != 0 {
+            if page & 0x8000_0000 != 0 {
+                // A store to a page stores do not reach (closed notes).
+                self.closed_store(u64::from(page & 0x7FFF_FFFF));
+                // SAFETY: as above.
+                unsafe { at.write_volatile(0) };
+            } else if page != 0 {
                 pages.push(u64::from(page));
                 // SAFETY: as above.
                 unsafe { at.write_volatile(0) };
@@ -883,6 +929,25 @@ pub(crate) fn asked_sizes<'a>(lists: impl Iterator<Item = &'a HostList>) -> bool
         }
     }
     asked
+}
+
+/// Whether stores by address reach every title buffer's copy, not only
+/// those a builder dispatch was given as unordered access views
+/// (`VICTORY_BVH_OPEN_ALL=0`: only those, as before).
+///
+/// Closed, the builder's stores into the other buffers were dropped: with
+/// `VICTORY_MEMORY_CLOSED_NOTES=1`, some 1,000 pages of 10 title buffers
+/// (1.5-12 MiB) in two minutes of ray tracing, and the structures built
+/// there came out with children outside them, wrong parent links and nodes
+/// reached twice. The trace programs then went round them until their loop
+/// limit (RTX 4070 Ti, the screen probes' trace at a limit of 4,096: 41.8 ms
+/// a frame closed, 6.0 open; the same opening's median 12.1 fps closed,
+/// 14.1 open, the slowest quarter 8.2 against 10.9). Open, a dump's
+/// compacted structures had 140 children outside them instead of 2,972 and
+/// 77 wrong parent links instead of 2,884.
+fn open_all() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_OPEN_ALL").is_none_or(|v| v != "0"))
 }
 
 /// [`fill`] of a page stores by address do not reach.
@@ -1126,6 +1191,22 @@ mod trace {
         asked: Vec<(u64, u64, u64, u64)>,
         /// By structure, what its size was when last seen to change.
         sizes: HashMap<u64, (u64, u64)>,
+        /// By structure, its last compacted-size ask: where the size goes,
+        /// what title memory had there then, the frame.
+        slots: HashMap<u64, (u64, u64, u64)>,
+        /// Copies of an asked structure recorded while its slot still held
+        /// what it held before the ask (the title read that, a stale size),
+        /// and those recorded with something new there.
+        stale: u64,
+        fresh: u64,
+        /// Stale copies watched on: the slot, what it held, the copy's frame.
+        /// If the slot changes later the title used an outdated size
+        /// (`outdated`); if it stays, the size had not changed (`same`).
+        watched: Vec<(u64, u64, u64)>,
+        outdated: u64,
+        /// Of `outdated`, those smaller than the size that came later.
+        short: u64,
+        same: u64,
         said: u32,
     }
 
@@ -1168,6 +1249,38 @@ mod trace {
             for i in gone.into_iter().rev() {
                 self.asked.swap_remove(i);
             }
+            let (mut outdated, mut same, mut short) = (0, 0, 0);
+            self.watched.retain(|&(at, was, copied)| {
+                let now = value(at);
+                if now != was {
+                    outdated += 1;
+                    // Smaller than the structure: the copy ran past the place.
+                    short += u64::from(was < now);
+                    if outdated <= 3 {
+                        tracing::info!(frame, copied, at = format_args!("{at:#x}"), was = format_args!("{was:#x}"), now = format_args!("{now:#x}"), "bvh trace: a copy used an outdated size");
+                    }
+                    false
+                } else if frame > copied + 10 {
+                    same += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+            self.outdated += outdated;
+            self.same += same;
+            self.short += short;
+            if frame.is_multiple_of(300) && self.stale + self.fresh > 0 {
+                tracing::info!(
+                    frame,
+                    stale = self.stale,
+                    fresh = self.fresh,
+                    outdated = self.outdated,
+                    short = self.short,
+                    same = self.same,
+                    "bvh trace: copies of asked structures recorded with the slot still as before the ask (stale) or changed (fresh), so far"
+                );
+            }
         }
 
         pub(super) fn dispatch(
@@ -1196,13 +1309,30 @@ mod trace {
                 self.say(format!("frame {frame} list {list:x}: asks mode {mode} of {structure:#x} to {at:#x}, there {was:#x}"));
                 if mode == 1 {
                     self.asked.push((frame, at, structure, was));
+                    self.slots.insert(structure, (at, was, frame));
                 }
             } else if threads == Some([32, 1, 1])
                 && let [from, to] = *written
                 && [from, to].iter().all(|&a| a >= 1 << 32 && crate::shadow::in_buffer(a, 1).is_none())
             {
                 let known = self.sizes.get(&from).copied();
-                self.say(format!("frame {frame} list {list:x}: copies {from:#x} to {to:#x} constants {:x?}, its size was {known:x?}", &constants[..constants.len().min(4)]));
+                // The title read the size before it recorded this copy: a
+                // slot that still holds what it held before the ask now held
+                // it then too.
+                let slot = self.slots.remove(&from).map(|(at, was, asked)| {
+                    let now = value(at);
+                    if now == was {
+                        self.stale += 1;
+                        self.watched.push((at, was, frame));
+                    } else {
+                        self.fresh += 1;
+                    }
+                    (asked, was, now, now == was)
+                });
+                self.say(format!(
+                    "frame {frame} list {list:x}: copies {from:#x} to {to:#x} constants {:x?}, its size was {known:x?}, slot (asked, before, now, stale) {slot:x?}",
+                    &constants[..constants.len().min(4)]
+                ));
             }
         }
     }
@@ -1289,6 +1419,22 @@ mod dump {
                     let bytes = unsafe { std::slice::from_raw_parts(*data as *const u8, ARENA as usize) };
                     let _ = std::fs::write(folder.join(format!("arena-{n}.bin")), bytes);
                 }
+                // Title memory as the CPU holds it now, laid out like the
+                // arenas (`title-<n>.bin`), to compare each page's two copies.
+                let mut title: Vec<Vec<u8>> = (0..self.arenas.len()).map(|_| vec![0u8; ARENA as usize]).collect();
+                let mut unreadable = 0;
+                for (page, held) in &self.pages {
+                    let Some(arena) = self.arenas.iter().position(|a| a.0 == held.copy) else { continue };
+                    let at = held.at - self.arenas[arena].1;
+                    let Some(to) = title[arena].get_mut(at..at + PAGE as usize) else { continue };
+                    if !crate::host::read_into((page * PAGE) as *const u8, to) {
+                        unreadable += 1;
+                    }
+                }
+                for (n, bytes) in title.iter().enumerate() {
+                    let _ = std::fs::write(folder.join(format!("title-{n}.bin")), bytes);
+                }
+                tracing::info!(unreadable, "title memory by address: title memory written out beside the arenas");
                 tracing::info!(arenas = copies.len(), "title memory by address: the arenas are written out");
                 return;
             }

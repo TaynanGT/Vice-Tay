@@ -127,6 +127,9 @@ fn build() -> [u8; 32] {
             "VICTORY_THREAD_TICKET",
             "VICTORY_WAVE_LDS_LOOSE",
             "VICTORY_SCC_LOCAL_ANY",
+            "VICTORY_WAVE_PAIRS",
+            "VICTORY_WAVE_PAIRS_ONLY",
+            "VICTORY_WAVE_PAIRS_FP32",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');

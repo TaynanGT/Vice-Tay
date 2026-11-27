@@ -173,6 +173,8 @@ Restart Steam and pick `GE-Proton11-14-viewtree`. GE-Proton's `master` already c
 GAME=/path/to/title linux/play.sh series-s
 ```
 
+DLSS also runs under Proton. Set `PROTON_ENABLE_NVAPI=1` and point `VICTORY_DLSS_DIR` at a folder that holds `nvngx_dlss.dll` (from [NVIDIA's DLSS SDK](https://github.com/NVIDIA/DLSS), `lib/Windows_x86_64/rel`). NGX's core comes from the driver's `/usr/lib/nvidia/wine`, and NGX turns its updater off under Wine. For example, add `PROTON_ENABLE_NVAPI=1 VICTORY_DLSS=quality VICTORY_DLSS_DIR="Z:/path/to/dlss"` to the launch options. On one RTX 5080 (Series S profile, GE-Proton11-14-viewtree, NVIDIA 620.73.04, DLSS 310.9.16, 1280 × 720 to 1920 × 1080), the in-world median went from 19.8 to 22.8 fps and the copies from 27.5 to 18.5 ms a frame: DLSS replaces the title's own upscaler passes, along with the copies of their results.
+
 </details>
 
 ## Known problems

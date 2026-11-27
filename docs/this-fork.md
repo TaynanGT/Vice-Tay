@@ -163,6 +163,13 @@ Compare it alongside the number of joined submissions in the same interval.
 - Every host list that ran is kept for reuse.
 - Frame dumps (`VICTORY_CAPTURE`) are encoded on a thread of their own, and the
   ones still queued are written before the process exits.
+- `VICTORY_POOL_STATS=1` (any build, off by default) logs the texture pool
+  every five seconds: its blocks and how full they are in quarters, the free
+  bytes and the number of free ranges, the largest range, pieces still resting,
+  and live textures by piece size. It also counts textures that could sit at
+  4 KiB placements but do not, which shows the gap under `VICTORY_POOL_SMALL=0`
+  or on AMD cards. Piece placement does not change; the switch adds one
+  `GetResourceAllocationInfo` call per texture made.
 - Diagnostics builds: `VICTORY_WALLS_TRACE=1` logs the source of each read-back;
   a placed texture view that gets no host view says why once per kind.
 - [VIctory-NVIDIA changes](victory-nvidia.md) covers the source revisions,

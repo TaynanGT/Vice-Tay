@@ -4610,15 +4610,37 @@ fn read_backs(list: &HostList, scratch: &mut crate::texback::Scratch) {
     if !deferred.texture_backs.is_empty() {
         #[cfg(feature = "diagnostics")]
         let began = std::time::Instant::now();
-        for back in &deferred.texture_backs {
-            crate::texback::land(back, scratch);
-        }
+        let backs: Vec<&crate::texback::Back> = deferred.texture_backs.iter().collect();
+        crate::texback::land_many(&backs, scratch);
         #[cfg(feature = "diagnostics")]
         {
             crate::land::spent(crate::land::stat::TEXTURE_READBACK_US, began);
             crate::land::count(crate::land::stat::TEXTURE_READBACKS, deferred.texture_backs.len() as u64);
         }
     }
+    read_backs_buffers(&deferred);
+}
+
+fn read_flight_backs(flight: &Flight, texture_scratch: &mut crate::texback::Scratch) {
+    let guards: Vec<_> = flight.lists.iter().map(|l| l.host().deferred()).collect();
+    let texture_backs: Vec<&crate::texback::Back> =
+        flight.order.iter().flat_map(|&i| guards[i].texture_backs.iter()).collect();
+    if !texture_backs.is_empty() {
+        #[cfg(feature = "diagnostics")]
+        let began = std::time::Instant::now();
+        crate::texback::land_many(&texture_backs, texture_scratch);
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::land::spent(crate::land::stat::TEXTURE_READBACK_US, began);
+            crate::land::count(crate::land::stat::TEXTURE_READBACKS, texture_backs.len() as u64);
+        }
+    }
+    for &i in &flight.order {
+        read_backs_buffers(&guards[i]);
+    }
+}
+
+fn read_backs_buffers(deferred: &Deferred) {
     #[cfg(feature = "diagnostics")]
     let began = (!deferred.backs.is_empty()).then(std::time::Instant::now);
     for (buffer, at, [row, rows, pitch]) in &deferred.backs {
@@ -5722,9 +5744,7 @@ impl Host {
             telling = match item {
                 Late::Run(mut flight) => {
                     last = flight.number;
-                    for &i in &flight.order {
-                        read_backs(flight.lists[i].host(), texture_scratch);
-                    }
+                    read_flight_backs(&flight, texture_scratch);
                     if let Some(card) = flight.card {
                         self.card_done(card);
                     }
@@ -6209,9 +6229,7 @@ impl Host {
                 match item {
                     Late::Run(mut flight) => {
                         last = flight.number;
-                        for &i in &flight.order {
-                            read_backs(flight.lists[i].host(), &mut texture_scratch);
-                        }
+                        read_flight_backs(&flight, &mut texture_scratch);
                         if let Some(card) = flight.card {
                             self.card_done(card);
                         }

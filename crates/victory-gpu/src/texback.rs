@@ -208,8 +208,6 @@ pub(crate) struct Scratch {
 pub(crate) fn land(back: &Back, scratch: &mut Scratch) {
     static COPIED: AtomicU64 = AtomicU64::new(0);
     static STALE: AtomicU64 = AtomicU64::new(0);
-    let _mapping = crate::watch::title_memory_reading();
-    let _ticket_guard = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
     if !back.ticket.valid.load(Ordering::Acquire) {
         let skipped = STALE.fetch_add(1, Ordering::Relaxed) + 1;
         if skipped.is_power_of_two() {
@@ -217,6 +215,7 @@ pub(crate) fn land(back: &Back, scratch: &mut Scratch) {
         }
         return;
     }
+    let _mapping = crate::watch::title_memory_reading();
     let (at, end) = back.range();
     let size = end - at;
     if scratch.pixels.len() < size {
@@ -257,7 +256,16 @@ pub(crate) fn land(back: &Back, scratch: &mut Scratch) {
     }
     // SAFETY: mapped above.
     unsafe { buffer.Unmap(0, None) };
+    let ticket_guard = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
+    if !back.ticket.valid.load(Ordering::Acquire) {
+        let skipped = STALE.fetch_add(1, Ordering::Relaxed) + 1;
+        if skipped.is_power_of_two() {
+            tracing::info!(skipped, "skipping texture readbacks whose title allocation changed");
+        }
+        return;
+    }
     crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
+    drop(ticket_guard);
     let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
     if copied == 1 || copied.is_multiple_of(128) {
         let stats = back.buffer.stats();
@@ -276,6 +284,50 @@ pub(crate) fn land(back: &Back, scratch: &mut Scratch) {
             peak_idle_bytes = stats.peak_idle_bytes,
             "texture readback landed"
         );
+    }
+}
+
+/// Lands a flight's texture readbacks in order, skipping earlier readbacks to
+/// the exact same allocation and tiling non-overlapping textures in parallel.
+pub(crate) fn land_many(backs: &[&Back], scratch: &mut Scratch) {
+    if backs.is_empty() {
+        return;
+    }
+    if backs.len() == 1 {
+        land(backs[0], scratch);
+        return;
+    }
+    // Keep only the last readback for any identical `(at, end)` range since
+    // `record` copies all subresources of the texture.
+    let mut active: Vec<&Back> = Vec::with_capacity(backs.len());
+    for (i, &back) in backs.iter().enumerate() {
+        let range = back.range();
+        if backs[i + 1..].iter().any(|later| later.range() == range) {
+            continue;
+        }
+        active.push(back);
+    }
+    if active.len() <= 1 {
+        if let Some(&back) = active.first() {
+            land(back, scratch);
+        }
+        return;
+    }
+    // If any two distinct ranges overlap, fall back to sequential order.
+    let mut sorted: Vec<(usize, usize)> = active.iter().map(|b| b.range()).collect();
+    sorted.sort_unstable();
+    let overlaps = sorted.windows(2).any(|w| w[0].1 > w[1].0);
+    if overlaps {
+        for back in active {
+            land(back, scratch);
+        }
+    } else {
+        thread_local! {
+            static LAND_SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
+        }
+        crate::land::each_view(false, active.len(), &|i| {
+            LAND_SCRATCH.with_borrow_mut(|s| land(active[i], s));
+        });
     }
 }
 
@@ -336,5 +388,31 @@ mod tests {
         released(93);
         assert!(!far.valid.load(Ordering::Acquire));
         assert!(track(94, 0x2000, 0x3000).valid.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn land_many_deduplicates_identical_ranges_and_lands_disjoint_ones() {
+        let Some(host) = crate::host::host() else { return };
+        let mut dst_a = [0u8; 256];
+        let mut dst_b = [0u8; 256];
+        let buf_old = host.texture_readback_buffer(256).unwrap();
+        let buf_new = host.texture_readback_buffer(256).unwrap();
+        let buf_b = host.texture_readback_buffer(256).unwrap();
+        // SAFETY: write 4 test bytes into each mapped readback buffer.
+        unsafe {
+            for (buf, val) in [(&buf_old, 0x11u8), (&buf_new, 0x22u8), (&buf_b, 0x33u8)] {
+                let mut ptr = std::ptr::null_mut();
+                buf.resource().Map(0, None, Some(&mut ptr)).unwrap();
+                std::ptr::write_bytes(ptr.cast::<u8>(), val, 4);
+                buf.resource().Unmap(0, None);
+            }
+        }
+        let back_old = buffer_back_for_test(buf_old, &mut dst_a);
+        let back_new = buffer_back_for_test(buf_new, &mut dst_a);
+        let back_b = buffer_back_for_test(buf_b, &mut dst_b);
+        let mut scratch = Scratch::default();
+        land_many(&[&back_old, &back_new, &back_b], &mut scratch);
+        assert_eq!(&dst_a[..4], &[0x22; 4]);
+        assert_eq!(&dst_b[..4], &[0x33; 4]);
     }
 }

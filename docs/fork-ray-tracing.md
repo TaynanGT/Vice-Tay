@@ -212,6 +212,11 @@ on black pixels, preserved bright and saturated light, and dispatch bounds.
 Settings and routing tests cover disabled or invalid levels, the maximum
 clamp, valid depth, and incompatible dimensions, samples or texture type.
 
+The flat pipeline is created only when the option is requested. If its
+creation fails, the existing ambient passes remain available; the missing-depth
+resolve is left unchanged instead. A synthetic setup test rejects the optional
+shader to verify this failure path and verifies it is never attempted when off.
+
 ## Optional neutral probe replacement
 
 With the depth-free minimum enabled, `VICTORY_AMBIENT_FLAT_REPLACE=1`

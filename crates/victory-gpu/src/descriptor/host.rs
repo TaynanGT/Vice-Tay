@@ -941,14 +941,36 @@ fn stale_rule() -> Rule {
 /// ([`HostHeap::texture_slots_remapped`]). Called with the runtime's own
 /// locks held: this locks one mutex of its own and calls nothing.
 pub(crate) fn remapped(at: usize, len: usize) {
+    note_remapped(at, len, &[]);
+}
+
+/// A write through one title address also changes the exact bytes visible
+/// through other views of those pages. Resolve aliases before taking the
+/// notification lock so each subscribed heap can receive the batch once.
+pub(crate) fn memory_written(at: usize, len: usize) {
+    if len != 0 && SPANNED[0].load(Ordering::Relaxed) != u64::MAX {
+        let aliases = crate::inplace::written_aliases(at, len);
+        note_remapped(at, len, &aliases);
+    }
+}
+
+fn note_remapped(at: usize, len: usize, aliases: &[(usize, usize)]) {
     use std::sync::atomic::Ordering::Relaxed;
-    let (start, end) = (at as u64, at.saturating_add(len) as u64);
-    if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
+    let start = SPANNED[0].load(Relaxed);
+    let end = SPANNED[1].load(Relaxed);
+    let ranges = std::iter::once((at, len)).chain(aliases.iter().copied())
+        .filter(|&(_, len)| len != 0)
+        .map(|(at, len)| (at as u64, at.saturating_add(len) as u64))
+        .filter(|&(a, b)| a < end && b > start);
+    let count = ranges.clone().count();
+    if count == 0 {
         return;
     }
     let mut heaps = HEAP_CHANGES.lock().unwrap_or_else(|e| e.into_inner());
-    STALE[1].fetch_add(1, Relaxed);
-    let compacted: usize = heaps.values_mut().map(|heap| remember_texture_change(&mut heap.remapped, start, end)).sum();
+    STALE[1].fetch_add(count as u64, Relaxed);
+    let compacted: usize = heaps.values_mut().map(|heap| {
+        ranges.clone().map(|(a, b)| remember_texture_change(&mut heap.remapped, a, b)).sum::<usize>()
+    }).sum();
     if compacted != 0 {
         STALE[2].fetch_add(compacted as u64, Relaxed);
     }
@@ -6387,16 +6409,141 @@ mod tests {
         assert_eq!(spans.slots_holding(at + 0x2000, at + 0x2000), [] as [u32; 0]);
     }
 
-    fn heap_with_uploaded_view(slot: u32, address: u64) -> HostHeap {
-        let heap = HostHeap::new(false, 8).expect("view heap");
+    fn placed_test_view(address: u64) -> View {
         let mut desc = [0u32; 16];
         (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
-        let view = View::Placed(false, [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc);
-        assert!(heap.note_buffer(slot, Some(&view), false).is_empty());
+        View::Placed(false, [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc)
+    }
+
+    fn note_uploaded_test_view(heap: &HostHeap, slot: u32, address: u64) {
+        assert!(heap.note_buffer(slot, Some(&placed_test_view(address)), false).is_empty());
         let (queued, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
         assert_eq!(queued, slot);
         heap.texture_slot_done(slot, write, None);
+    }
+
+    fn heap_with_uploaded_view(slot: u32, address: u64) -> HostHeap {
+        let heap = HostHeap::new(false, 8).expect("view heap");
+        note_uploaded_test_view(&heap, slot, address);
         heap
+    }
+
+    #[test]
+    fn writing_texture_bytes_updates_alias_heaps_without_certifying_a_replaced_slot() {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
+            MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
+        };
+        if host().is_none() {
+            eprintln!("No D3D12 device for the texture alias check");
+            return;
+        }
+        const PAGE: usize = 64 << 10;
+        struct Views(HANDLE, [(usize, usize); 2]);
+        impl Drop for Views {
+            fn drop(&mut self) {
+                let _mapping = crate::title_memory_remapping();
+                for (at, len) in self.1 {
+                    crate::title_memory_unmapping(at, len);
+                    // SAFETY: the test owns both mapped views.
+                    unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut _ }) };
+                }
+                crate::title_memory_section_gone(self.0 as usize);
+                // SAFETY: the test owns the pagefile section handle.
+                unsafe { CloseHandle(self.0) };
+            }
+        }
+        // SAFETY: a private pagefile section and two views of its first page.
+        let memory = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _, std::ptr::null(), PAGE_READWRITE, 0, (2 * PAGE) as u32, std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let sizes = [2 * PAGE, PAGE];
+            let views = sizes.map(|len| {
+                let at = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len).Value as usize;
+                assert_ne!(at, 0);
+                (at, len)
+            });
+            let _mapping = crate::title_memory_remapping();
+            crate::title_memory_section(section as usize, (2 * PAGE) as u64, true);
+            for (at, len) in views {
+                crate::title_memory_remapped(at, len);
+                crate::title_memory_view(at, len, section as usize, 0);
+            }
+            Views(section, views)
+        };
+        let [(source, _), (alias, _)] = memory.1;
+        let direct = source + PAGE;
+        let first = heap_with_uploaded_view(1, source as u64);
+        note_uploaded_test_view(&first, 2, direct as u64);
+        let second = heap_with_uploaded_view(3, alias as u64);
+        assert_eq!(crate::inplace::written_aliases(source + 17, 3), [(alias + 17, 3)]);
+
+        let before = crate::texture::fingerprint(alias as u64, PAGE as u64);
+        let payload = [0x4a, 0x17, 0x2f];
+        crate::host::copy_mapped((source + 17) as *mut u8, payload.as_ptr(), payload.len(), true);
+        assert_ne!(crate::texture::fingerprint(alias as u64, PAGE as u64), before);
+        assert_eq!(first.texture_slots_remapped(50), 1);
+        assert_eq!(second.texture_slots_remapped(50), 1);
+        let a = first.texture_slots_due(51, 8).0;
+        let b = second.texture_slots_due(51, 8).0;
+        assert_eq!((a.len(), b.len()), (1, 1));
+        assert_eq!((a[0].0, b[0].0), (1, 3));
+        first.texture_slot_done(1, a[0].1, None);
+
+        let mut record = [0u32; 8];
+        let handle = record.as_mut_ptr() as u64;
+        let set_record = |address| {
+            let View::Placed(_, resource, desc) = placed_test_view(address) else { unreachable!() };
+            crate::descriptor::create_placed_srv(std::ptr::null(), &resource, &desc, handle);
+        };
+        set_record(alias as u64);
+        let (_, old_key) = second.prepare_texture_slot(3, handle).unwrap();
+        set_record(direct as u64);
+        let (replacement, _) = second.prepare_texture_slot(3, handle).unwrap();
+        assert!(second.note_buffer(3, Some(&replacement), false).is_empty());
+        assert!(!second.publish_uploaded_slot(3, handle, old_key));
+        second.texture_slot_done(3, b[0].1, None);
+        let new = second.texture_slots_due(u64::MAX, 8).0;
+        assert_eq!(new.len(), 1);
+        assert_eq!(new[0].0, 3);
+        assert_ne!(new[0].1, b[0].1);
+        second.texture_slot_done(3, new[0].1, None);
+        assert!(second.note_buffer(3, Some(&placed_test_view(alias as u64)), false).is_empty());
+        let new = second.texture_slots_due(u64::MAX, 8).0;
+        second.texture_slot_done(3, new[0].1, None);
+
+        // Model a texture pass between opening the guards and finishing a
+        // copy. It can drain both heaps and see the old content in that gap.
+        let copying = crate::watch::copying_to_title(source + 17, payload.len());
+        assert_eq!(first.texture_slots_remapped(52), 0);
+        assert_eq!(second.texture_slots_remapped(52), 0);
+        let before = crate::texture::fingerprint(alias as u64, PAGE as u64);
+        let changed = [0x91, 0x22, 0x3f];
+        // SAFETY: a writable view of this test's section.
+        unsafe { std::ptr::copy_nonoverlapping(changed.as_ptr(), (source + 17) as *mut u8, changed.len()) };
+        assert_ne!(crate::texture::fingerprint(alias as u64, PAGE as u64), before);
+        drop(copying);
+        for (heap, slot) in [(&first, 1), (&second, 3)] {
+            assert_eq!(heap.texture_slots_remapped(52), 1);
+            let due = heap.texture_slots_due(53, 8).0;
+            assert_eq!(due.len(), 1);
+            assert_eq!(due[0].0, slot);
+            heap.texture_slot_done(slot, due[0].1, None);
+        }
+
+        let writing = crate::kernel_writing(direct + 17, payload.len());
+        // SAFETY: the guard above keeps the committed destination writable.
+        unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(), (direct + 17) as *mut u8, payload.len()) };
+        drop(writing);
+        assert_eq!(first.texture_slots_remapped(54), 1);
+        assert_eq!(second.texture_slots_remapped(54), 0);
+        let due = first.texture_slots_due(55, 8).0;
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].0, 2);
+        eprintln!("Both texture heaps observed the completed write through a mapped alias");
     }
 
     #[test]

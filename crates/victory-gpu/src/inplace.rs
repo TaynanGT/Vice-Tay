@@ -430,6 +430,44 @@ pub(crate) fn shown_elsewhere(start: usize, end: usize) -> Vec<(usize, Vec<usize
     out
 }
 
+/// The exact bytes a write through one view changes at other addresses.
+/// Use the mapped ranges and physical-page index, including views omitted
+/// from guard tracking when a page appears at many addresses.
+pub(crate) fn written_aliases(start: usize, len: usize) -> Vec<(usize, usize)> {
+    let v = views();
+    let end = start.saturating_add(len);
+    let mut out = Vec::new();
+    if start >= end || v.pages_twice == 0 {
+        return out;
+    }
+    let first = v.views.range(..=start).next_back()
+        .filter(|(base, view)| start - *base < view.0).map_or(start, |(&base, _)| base);
+    for (&base, &(view_len, section, offset)) in v.views.range(first..end) {
+        let from = start.max(base);
+        let to = end.min(base.saturating_add(view_len));
+        let first_page = base + (from - base) / K64 * K64;
+        for page in (first_page..to).step_by(K64) {
+            let Some(aliases) = v.pages.get(&(section, offset + (page - base) as u64)) else {
+                continue;
+            };
+            let lo = from.saturating_sub(page);
+            let hi = (to - page).min(K64);
+            for &alias in aliases.iter().filter(|&&alias| alias != page) {
+                let Some((&other, &(other_len, ..))) = v.views.range(..=alias).next_back() else {
+                    continue;
+                };
+                let limit = other.saturating_add(other_len);
+                let start = alias.saturating_add(lo);
+                let end = alias.saturating_add(hi).min(limit);
+                if start < end {
+                    out.push((start, end - start));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The address of the 64 KiB page shown at `page` in every title view that
 /// shows it, `page`'s own address included; empty if `page` is not a view.
 pub(crate) fn pages_of(page: usize) -> Vec<usize> {

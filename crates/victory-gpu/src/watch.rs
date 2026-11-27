@@ -3395,6 +3395,33 @@ fn unguard(g: &Guards, blocks: &[usize]) {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    open_for_write(at, len);
+    crate::descriptor::host::memory_written(at, len);
+}
+
+/// Open the guards before a copy we perform ourselves. Its texture notice
+/// must follow the copy, even if the copy only reaches part of the range.
+pub(crate) fn copying_to_title(at: usize, len: usize) -> TitleCopy {
+    open_for_write(at, len);
+    TitleCopy(at, len)
+}
+
+pub(crate) struct TitleCopy(usize, usize);
+
+impl Drop for TitleCopy {
+    fn drop(&mut self) {
+        crate::descriptor::host::memory_written(self.0, self.1);
+    }
+}
+
+/// A physical write reported once for each view by the runtime. It has
+/// already enumerated the aliases of the destination.
+pub fn title_page_view_written(at: usize, len: usize) {
+    open_for_write(at, len);
+    crate::descriptor::host::remapped(at, len);
+}
+
+fn open_for_write(at: usize, len: usize) {
     // The length is the title's (`fread`'s size times count, saturated).
     let last = at.saturating_add(len).div_ceil(BLOCK);
     if !light() || PROTECTED.any(at / BLOCK, last) {
@@ -3407,8 +3434,6 @@ pub fn writing(at: usize, len: usize) {
         }
         let _ = opened;
     }
-    // A placed texture there changes with no descriptor written.
-    crate::descriptor::host::remapped(at, len);
 }
 
 /// The kernel writes title memory `[at, at + len)` until what this returns
@@ -3438,7 +3463,7 @@ pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
             g.kernel.push((first, last));
         }
     }
-    crate::descriptor::host::remapped(at, len);
+    crate::descriptor::host::memory_written(at, len);
     KernelWrite(first, if len == 0 { first } else { last })
 }
 

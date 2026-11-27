@@ -105,7 +105,23 @@ static STATS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 /// Whether `[at, at + len)` may be ported: in the title's 32-bit graphics
 /// memory.
 pub(crate) fn wanted(at: u64, len: u64) -> bool {
-    on() && at.checked_add(len).is_some_and(|end| end <= LOW && len > 0)
+    on() && at.checked_add(len).is_some_and(|end| (end <= LOW || high()) && len > 0)
+}
+
+/// `VICTORY_PORT_HIGH` (with `VICTORY_PORT_CONSTANTS=1`): view memory above
+/// 4 GiB too, wherever it is one stretch of a section. Above the 32-bit
+/// graphics heap lie the title's windows outside buffers (some 3 GB of host
+/// copies, refreshed and sent up at every submission that reads them); in
+/// place the card reads them where the title wrote them. `1`: windows only;
+/// `2`: title buffers too (they leave the card's memory for the PC's).
+/// Unset or `0`: off, as before.
+pub(crate) fn high_level() -> u8 {
+    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| std::env::var("VICTORY_PORT_HIGH").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+fn high() -> bool {
+    high_level() > 0
 }
 
 /// Title memory `[start, start + len)` in place, if [`wanted`] and the
@@ -113,6 +129,10 @@ pub(crate) fn wanted(at: u64, len: u64) -> bool {
 /// heap. `None` leaves the caller to do what it did before.
 pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if !wanted(start, len) {
+        return None;
+    }
+    // Above 4 GiB: title buffers only at level 2.
+    if !window && high_level() < 2 && start.saturating_add(len) > LOW {
         return None;
     }
     let host = crate::host::host()?;
@@ -176,7 +196,7 @@ fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usiz
     // The whole stretch, kept to what may be ported: the next buffer in it
     // finds the region made.
     let (mut first, mut bytes, mut offset) = (first as u64, bytes as u64, offset);
-    if first < LOW && first + bytes > LOW {
+    if !high() && first < LOW && first + bytes > LOW {
         bytes = LOW.saturating_sub(first);
     }
     if bytes > MOST {

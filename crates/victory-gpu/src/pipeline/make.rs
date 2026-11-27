@@ -21,7 +21,7 @@
 //! its end (run textures-d2, the first after a new translation; Belobug
 //! 18e57db8 found the same).
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -57,7 +57,7 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
         .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
 }
 
-fn left_out(shaders: &[Arc<Shader>], skip_hashes: &[String]) -> Option<&'static str> {
+fn left_out(shaders: &[Arc<Shader>], skip_hashes: &HashSet<String>) -> Option<&'static str> {
     static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
     let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
         let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
@@ -118,7 +118,7 @@ impl Pending {
     fn new_with_skip_hashes(
         shaders: Vec<Arc<Shader>>,
         graphics: Option<Box<GraphicsState>>,
-        skip_hashes: &[String],
+        skip_hashes: &HashSet<String>,
     ) -> Pending {
         let mut key = blake3::Hasher::new();
         for s in &shaders {

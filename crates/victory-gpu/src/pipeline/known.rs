@@ -267,7 +267,7 @@ pub fn warm_entries(dir: &Path) -> Vec<WarmEntry> {
     entries
 }
 
-fn matches_skip_list(entry: &[u8], skips: &[String]) -> bool {
+fn matches_skip_list(entry: &[u8], skips: &HashSet<String>) -> bool {
     if skips.is_empty() {
         return false;
     }
@@ -280,7 +280,7 @@ fn matches_skip_list(entry: &[u8], skips: &[String]) -> bool {
     shaders.chunks_exact(33).any(|shader| {
         let hash = blake3::Hash::from_bytes(shader[1..].try_into().expect("recorded shader hash"));
         let hex = hash.to_hex();
-        skips.iter().any(|skip| skip == &hex[..16])
+        skips.contains(&hex[..16])
     })
 }
 
@@ -627,10 +627,10 @@ mod tests {
         entry.extend([0x22; 32]);
         entry.push(0);
 
-        let skips = vec!["22".repeat(8)];
+        let skips = HashSet::from(["22".repeat(8)]);
         assert!(matches_skip_list(&entry, &skips));
-        assert!(!matches_skip_list(&entry, &["33".repeat(8)]));
-        assert!(!matches_skip_list(&entry, &[]));
+        assert!(!matches_skip_list(&entry, &HashSet::from(["33".repeat(8)])));
+        assert!(!matches_skip_list(&entry, &HashSet::new()));
         assert!(!matches_skip_list(&entry[..entry.len() - 2], &skips));
     }
 

@@ -17,6 +17,8 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::collections::HashMap;
+#[cfg(windows)]
+use std::collections::HashSet;
 use std::mem::offset_of;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -480,7 +482,7 @@ static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
 #[cfg(windows)]
-pub(super) fn parse_skip_hashes(value: &str) -> Vec<String> {
+pub(super) fn parse_skip_hashes(value: &str) -> HashSet<String> {
     value
         .split(',')
         .map(str::trim)
@@ -500,8 +502,8 @@ pub(super) fn parse_skip_hashes(value: &str) -> Vec<String> {
 }
 
 #[cfg(windows)]
-pub(super) fn skip_hashes() -> &'static [String] {
-    static HASHES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+pub(super) fn skip_hashes() -> &'static HashSet<String> {
+    static HASHES: std::sync::OnceLock<HashSet<String>> = std::sync::OnceLock::new();
     HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
         parse_skip_hashes(&value)
@@ -511,14 +513,14 @@ pub(super) fn skip_hashes() -> &'static [String] {
 #[cfg(windows)]
 pub(super) fn skipped_in_list<'a>(
     shaders: &'a [std::sync::Arc<Shader>],
-    hashes: &[String],
+    hashes: &HashSet<String>,
 ) -> Option<&'a str> {
     if hashes.is_empty() {
         return None;
     }
     shaders
         .iter()
-        .find(|shader| hashes.contains(&shader.hash))
+        .find(|shader| hashes.contains(shader.hash.as_str()))
         .map(|shader| shader.hash.as_str())
 }
 
@@ -948,8 +950,10 @@ mod tests {
     fn skip_hashes_accepts_full_hashes_only() {
         assert!(super::parse_skip_hashes(" , ").is_empty());
         assert_eq!(
-            super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
-            ["0123456789abcdef", "0011223344556677"]
+            super::parse_skip_hashes(
+                " 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677, 0123456789abcdef,"
+            ),
+            HashSet::from(["0123456789abcdef".to_owned(), "0011223344556677".to_owned()])
         );
     }
 

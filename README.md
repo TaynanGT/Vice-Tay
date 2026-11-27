@@ -170,7 +170,8 @@ scripts\play.ps1 -Exe <path of your copy's executable> -Console series-s
 
 When the shader cache is still empty, `play.ps1` runs the shader command itself
 before the title starts: a cold cache otherwise drops about half of each frame's
-draws while shaders are translated, a black picture for the first minutes.
+draws for minutes while shaders are translated. The first run still spends about
+a minute slow while the driver builds its pipelines; later runs load them.
 `-SkipShaders` starts without it.
 
 `Play-VIctory.cmd` takes the same options from a Command Prompt; on a double-click

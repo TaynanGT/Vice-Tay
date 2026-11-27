@@ -156,7 +156,8 @@ if ($Machine -eq '7900xtx') {
     $physical = if ($coreCount) { $coreCount } else {
         (Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Measure-Object -Property NumberOfCores -Sum).Sum
     }
-    if (-not $Safe -and $hasNvidia -and $physical -ge 10) {
+    # (This branch is the NVIDIA presets': -Machine auto without an NVIDIA card is 7900xtx.)
+    if (-not $Safe -and $physical -ge 10) {
         $settings.VICTORY_PORT_GUARD = '1'; $settings.VICTORY_PORT_JOURNAL = '1'
     }
 }

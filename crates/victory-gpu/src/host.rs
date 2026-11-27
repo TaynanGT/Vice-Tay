@@ -565,7 +565,7 @@ pub(crate) fn submissions() -> (u64, u64) {
     (STARTED.load(Ordering::Acquire), FINISHED.load(Ordering::Acquire))
 }
 
-fn insert_retired(queue: &mut VecDeque<(u64, Retired)>, entry: (u64, Retired)) {
+fn insert_retired(queue: &mut std::collections::VecDeque<(u64, Retired)>, entry: (u64, Retired)) {
     if queue.back().is_none_or(|(at, _)| *at <= entry.0) {
         queue.push_back(entry);
     } else {
@@ -576,7 +576,7 @@ fn insert_retired(queue: &mut VecDeque<(u64, Retired)>, entry: (u64, Retired)) {
 
 /// Keep each shard ordered by the original submission stamp. A worker can
 /// hand off an older batch after that shard has already received newer entries.
-fn merge_retired_batch(queue: &mut VecDeque<(u64, Retired)>, batch: &mut Vec<(u64, Retired)>) {
+fn merge_retired_batch(queue: &mut std::collections::VecDeque<(u64, Retired)>, batch: &mut Vec<(u64, Retired)>) {
     if batch.is_empty() {
         return;
     }
@@ -750,7 +750,7 @@ mod retire_batch_tests {
     #[test]
     fn a_late_batch_does_not_hide_eligible_retirements() {
         let item = |stamp| (stamp, Retired::Any(Box::new(())));
-        let mut queue = VecDeque::new();
+        let mut queue = std::collections::VecDeque::new();
         insert_retired(&mut queue, item(10));
         insert_retired(&mut queue, item(14));
         insert_retired(&mut queue, item(9));

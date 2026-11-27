@@ -456,7 +456,15 @@ fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
         if read.len() < size {
             read.resize(size, 0);
         }
-        f(&mut read[..size])
+        let result = f(&mut read[..size]);
+        const CAP_CEILING: usize = 8 * crate::ram_trim::MIB;
+        if crate::ram_trim::trim_staging()
+            && read.capacity() > CAP_CEILING
+            && read.capacity() > size.saturating_mul(4)
+        {
+            crate::ram_trim::maybe_shrink_scratch_vec(&mut read, size, CAP_CEILING);
+        }
+        result
     })
 }
 
@@ -530,35 +538,48 @@ pub(crate) fn let_go() -> [u64; 2] {
 /// them, 2.1 GB, at the end of run 24). The next list that samples such a
 /// texture makes a staging buffer anew, detiles and uploads once more.
 /// Called before a submission starts, by the thread that submits.
-pub(crate) fn let_go_idle() {
+pub(crate) fn let_go_idle_with(policy: &crate::ram_trim::TrimPolicy) {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(map) = map.as_mut() else {
-        return;
-    };
-    if map.is_empty() {
-        return;
-    }
-    let idle_ms = crate::host::ram_idle_ms(crate::residency::headroom());
-    // A list that recorded an upload or a check holds the staging until it
-    // is reset: one only the table holds is named by no list, recorded or
-    // running.
-    let (mut went, mut bytes) = (0u64, 0u64);
-    map.retain(|_, s| {
-        let keep = Arc::strong_count(s) > 1
-            || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
-        if !keep {
-            LET_GO[0].fetch_add(1, Relaxed);
-            LET_GO[1].fetch_add(s.bytes, Relaxed);
-            went += 1;
-            bytes += s.bytes;
+    let mut dropped_staging: Vec<Arc<Staging>> = Vec::new();
+    {
+        let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(map) = map.as_mut() else {
+            return;
+        };
+        if map.is_empty() {
+            return;
         }
-        keep
-    });
-    if went > 0 {
-        crate::host::trail(|| format!("sweep: {went} staging buffers of textures let go ({} KiB), held by no list", bytes >> 10));
+        let mut idle_ms = crate::host::ram_idle_ms(crate::residency::headroom());
+        if policy.trim_staging && (policy.aggressive || policy.low_memory || policy.panic_memory) {
+            idle_ms = idle_ms.min(policy.pool_idle_ms);
+        }
+        // A list that recorded an upload or a check holds the staging until it
+        // is reset: one only the table holds is named by no list, recorded or
+        // running.
+        let (mut went, mut bytes) = (0u64, 0u64);
+        let mut idle_keys = Vec::new();
+        for (&key, s) in map.iter() {
+            if Arc::strong_count(s) == 1
+                && crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES)
+            {
+                idle_keys.push(key);
+            }
+        }
+        for key in idle_keys {
+            if let Some(s) = map.remove(&key) {
+                LET_GO[0].fetch_add(1, Relaxed);
+                LET_GO[1].fetch_add(s.bytes, Relaxed);
+                went += 1;
+                bytes += s.bytes;
+                dropped_staging.push(s);
+            }
+        }
+        if went > 0 {
+            crate::host::trail(|| format!("sweep: {went} staging buffers of textures let go ({} KiB), held by no list", bytes >> 10));
+        }
     }
+    drop(dropped_staging);
 }
 
 /// Textures the host GPU wrote by a copy or resolve: their contents are on

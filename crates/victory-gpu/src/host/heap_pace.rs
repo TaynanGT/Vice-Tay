@@ -1,4 +1,4 @@
-//! Heap pacing (on by default, `VICTORY_HEAP_SYNC_PACE=0` turns it off): a submission
+//! Heap pacing (`VICTORY_HEAP_SYNC_PACE=1`, off by default for now): a submission
 //! of ours is prepared (the title's descriptor records brought into the host
 //! heaps, card steps' slots pointed, ...) only when the card has run the
 //! last frame our side has sent, and the heaps' rounds of their own between
@@ -25,14 +25,14 @@ use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 /// The most a submission is held, in ms.
 const MOST_MS: u32 = 250;
 
-/// Whether heap pacing is on (the default; `VICTORY_HEAP_SYNC_PACE=0` turns it off).
+/// Whether heap pacing is on (`VICTORY_HEAP_SYNC_PACE=1`).
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_HEAP_SYNC_PACE").is_none_or(|v| v != "0");
+        let on = crate::switch::on("VICTORY_HEAP_SYNC_PACE");
         if on {
             tracing::info!(
-                "heap pacing (VICTORY_HEAP_SYNC_PACE, on by default): a submission is prepared when the card has run the frame our side sent before it"
+                "VICTORY_HEAP_SYNC_PACE=1: a submission is prepared when the card has run the frame our side sent before it"
             );
         }
         on

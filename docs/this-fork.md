@@ -92,13 +92,12 @@ How each of these was found, with the numbers:
   frame line counts the slots tables take, the refusals whose free slots were
   in pieces, and the tables that waited for flights to land for slots or were
   refused again and dropped (diagnostics builds).
-- **Stretched-triangle spikes ("wedges")**: heap pacing, on by default
-  (`VICTORY_HEAP_SYNC_PACE=0` turns it off).
+- **Stretched-triangle spikes ("wedges")**: set `VICTORY_HEAP_SYNC_PACE=1`.
   Our side then prepares a submission only when the card has run the last
   frame we sent, so the title's descriptors for the next frame no longer reach
   the host heaps while the card still draws the frame before. The title is not
-  held. It costs frame rate (17-19 fps down to 12-14 on an RTX 2080 Ti), but
-  the wedges show on both Series S and Series X, so it is on by default. The frame line counts held submissions and ms held.
+  held. It costs frame rate (17-19 fps down to 12-14 on an RTX 2080 Ti), so it
+  is off by default for now. The wedges show on both Series S and Series X. The frame line counts held submissions and ms held.
 - **Rectangle lists** expanded on the CPU find their right angles from the element
   the input layout names `POSITION`, not from the first two-component element,
   which may be a texture coordinate.

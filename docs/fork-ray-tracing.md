@@ -185,6 +185,65 @@ The counters also report direct dispatches with zero groups, counted indirect
 dispatches and indirect dispatches with multiple records.
 [Original reflection hold](https://github.com/avatarmanz/VIctory-7900XTX/pull/314)
 
+## Optional diffuse minimum without resolve depth
+
+`VICTORY_AMBIENT_FLAT=0.3` supplies a uniform minimum diffuse illumination
+when the ambient resolve's expected depth SRV cannot be found. It requires
+the ambient stand-in to be enabled, for example with `VICTORY_AMBIENT=1`,
+and follows the same builder gate. With valid depth the existing estimate is
+unchanged; a depth view with mismatched dimensions is still rejected.
+
+The setting is off by default. It accepts a positive finite number capped
+at 2; zero, negative and invalid values disable it. Restart after changing
+it. The pass uses the existing diffuse-light UAV and a root signature with
+no depth SRV, without creating dummy depth or reconstructing normals. It
+raises each channel to at least the slightly warm neutral floor, before
+the title applies materials. Existing light is neither rejected by color
+nor capped in brightness; RGB9E5 packing still quantizes the result.
+
+This is a visibility approximation, not restored ray tracing, occlusion or
+light direction. It can flatten shadowed materials and brighten regions
+that should remain dark. It does not replace colored probe irradiance or
+modify the final display image. Matched scene and performance verification
+is required before selecting a level for a particular setup.
+
+Synthetic D3D12 readback tests cover the absent depth descriptor, the floor
+on black pixels, preserved bright and saturated light, and dispatch bounds.
+Settings and routing tests cover disabled or invalid levels, the maximum
+clamp, valid depth, and incompatible dimensions, samples or texture type.
+
+The flat pipeline is created only when the option is requested. If its
+creation fails, the existing ambient passes remain available; the missing-depth
+resolve is left unchanged instead. A synthetic setup test rejects the optional
+shader to verify this failure path and verifies it is never attempted when off.
+
+## Optional neutral probe replacement
+
+With the depth-free minimum enabled, `VICTORY_AMBIENT_FLAT_REPLACE=1`
+replaces that resolve's entire diffuse probe output with the configured
+warm-neutral level. For example, enable the ambient stand-in and set
+`VICTORY_AMBIENT_FLAT=0.3` and `VICTORY_AMBIENT_FLAT_REPLACE=1`.
+The option defaults off; only the exact value `1` enables it. Restart after
+changing it. The ordinary valid-depth estimate and existing builder gate
+are unchanged. A diagnostic message identifies actual replacement use.
+
+This isolates the diffuse probe contribution when surfaces show spurious
+coloured illumination. It is a workaround, not a repair of the producer:
+it also discards legitimate indirect colour, intensity and variation.
+Other lighting passes, including direct lights and reflections, are not
+disabled, but their final composite appearance can change with diffuse
+illumination. Unlike the ordinary floor, replacement does not preserve
+existing probe light, even when brighter than the configured level.
+
+Compare with replacement off while keeping the ambient level and all other
+settings identical. Existing user observations compare a combined local
+configuration; an isolation-only recorded comparison is still required.
+
+Synthetic GPU readback covers replacement of black, gray, bright and
+saturated red, green, blue and magenta inputs with the same neutral value.
+It also checks that the ordinary floor still preserves existing light
+when replacement is disabled, and leaves out-of-bounds pixels untouched.
+
 ## Where to look
 
 - `crates/victory-shader/src/bvh.rs`: the reference for the node test.

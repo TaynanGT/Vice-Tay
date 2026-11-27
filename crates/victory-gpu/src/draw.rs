@@ -3464,18 +3464,27 @@ impl State {
             return false;
         };
         let depth = if role == Role::Resolve {
-            let Some((seen, depth)) = entry(ResourceType::Srv, DEPTH) else {
-                once!(?role, "no stand-in for the indirect light: missing depth SRV");
-                return false;
-            };
-            if seen.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
-                || seen.SampleDesc.Count != 1
-                || (seen.Width, seen.Height) != (of.Width, of.Height)
-            {
-                once!(?role, "no stand-in for the indirect light: depth dimensions differ");
-                return false;
+            let depth = entry(ResourceType::Srv, DEPTH);
+            use crate::ambient::DepthPath;
+            match crate::ambient::depth_path(
+                &of,
+                depth.as_ref().map(|(seen, _)| seen),
+                crate::ambient::flat_level().is_some(),
+            ) {
+                DepthPath::Estimate => depth.map(|(_, handle)| handle),
+                DepthPath::Flat => {
+                    once!(?role, "missing depth SRV: using the depth-free ambient floor");
+                    None
+                }
+                DepthPath::Missing => {
+                    once!(?role, "no stand-in for the indirect light: missing depth SRV");
+                    return false;
+                }
+                DepthPath::Mismatch => {
+                    once!(?role, "no stand-in for the indirect light: depth dimensions differ");
+                    return false;
+                }
             }
-            Some(depth)
         } else {
             None
         };

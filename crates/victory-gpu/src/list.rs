@@ -209,6 +209,13 @@ impl Detached {
     pub(crate) fn release_tables(&mut self) {
         self.state.tables_done();
     }
+
+    /// Number of dynamic descriptor slots still held by this detached list
+    /// waiting for retirement.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn pending_dynamic_slots(&self) -> u64 {
+        self.state.pending_dynamic_slots()
+    }
 }
 
 /// The card has run `lists`: the dynamic descriptor slots their tables

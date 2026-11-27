@@ -3898,14 +3898,25 @@ pub(crate) fn settle_for_fence() {
     settle_now(WHY_FENCE);
 }
 
+/// Diagnostics for landed-list recycling and dynamic descriptor slots waiting
+/// for retirement: `[0]` µs spent in `land()` on the submitting thread, `[1]`
+/// µs spent in `land()` on `victory-late-wait`, `[2]` peak `line.landed.len()`
+/// observed, `[3]` peak unretired dynamic descriptor slots observed in
+/// `line.landed` before `past_lag`, `[4]` peak dynamic descriptor slots held
+/// by a batch of settled flights right before `Detached::release_tables`.
+#[cfg(feature = "diagnostics")]
+static LAND_RETIRE_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
 /// Resets the host lists of settled flights and keeps them for reuse, as
 /// a queue does for the lists it ran (`crate::list::recycle`), [`bury_lag`]
-/// flights after they landed. The dynamic descriptor slots of their tables
-/// go back as soon as they land ([`past_lag`]).
+/// flights after they landed. `settle` already releases each flight's dynamic
+/// descriptor slots (`Detached::release_tables`) before pushing it to
+/// `line.landed`; [`past_lag`] still calls `crate::list::ran` as an idempotent
+/// backstop.
 fn land() {
     // One at a time, so that the flights kept go back in front of the ones
     // that landed meanwhile. A thread that finds another landing leaves it
-    // to that one (the submitting thread lands after every flight it sends).
+    // to that one.
     static LANDING: Mutex<()> = Mutex::new(());
     let old = {
         let _landing = match LANDING.try_lock() {
@@ -3916,6 +3927,16 @@ fn land() {
         // Taken out of the line: giving slots back takes the heap's lock,
         // which recording threads hold while they search.
         let mut landed = std::mem::take(&mut line().landed);
+        #[cfg(feature = "diagnostics")]
+        {
+            LAND_RETIRE_STATS[2].fetch_max(landed.len() as u64, Ordering::Relaxed);
+            let pending: u64 = landed
+                .iter()
+                .flat_map(|(lists, _)| lists.iter())
+                .map(crate::list::Detached::pending_dynamic_slots)
+                .sum();
+            LAND_RETIRE_STATS[3].fetch_max(pending, Ordering::Relaxed);
+        }
         let old = past_lag(&mut landed, bury_lag() as usize, |(lists, _)| crate::list::ran(lists));
         let mut line = line();
         landed.append(&mut line.landed);
@@ -3999,6 +4020,10 @@ mod landed_tests {
     }
 }
 
+/// Whether `victory-late-wait` is alive and serving `line.poke` requests so
+/// `send_late` can offload `land()` off the submitting thread.
+static LATE_HELPER_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The thread that settles the flights once the card has run them all
 /// ([`late`]): without it a bottom-of-pipe write would reach the title only
 /// at the next call that settles, and a title thread that polls such a
@@ -4014,6 +4039,7 @@ fn late_helper() {
         tracing::warn!("no event for the thread that settles submissions sent ahead");
         return;
     };
+    LATE_HELPER_LIVE.store(true, Ordering::Release);
     loop {
         let target = {
             let mut line = line();
@@ -4031,7 +4057,11 @@ fn late_helper() {
         };
         let Some(target) = target else {
             let mut helping = crate::timeline::span("helper: landed lists reset and given back");
+            #[cfg(feature = "diagnostics")]
+            let started = std::time::Instant::now();
             land();
+            #[cfg(feature = "diagnostics")]
+            LAND_RETIRE_STATS[1].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             helping.next("helper: looking at what queues hold");
             crate::queue::release_held(false);
             continue;
@@ -4055,7 +4085,11 @@ fn late_helper() {
             }
             host.settle(&mut submitted, WHY_CARD_DONE);
         }
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
         land();
+        #[cfg(feature = "diagnostics")]
+        LAND_RETIRE_STATS[1].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         crate::queue::release_held(false);
     }
 }
@@ -4401,6 +4435,46 @@ fn late_line(frames: f64) {
                 t[2],
             );
         }
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        let submit_us = LAND_RETIRE_STATS[0].swap(0, Ordering::Relaxed) as f64;
+        let helper_us = LAND_RETIRE_STATS[1].swap(0, Ordering::Relaxed) as f64;
+        let peak_landed_flights = LAND_RETIRE_STATS[2].swap(0, Ordering::Relaxed);
+        let peak_landed_slots = LAND_RETIRE_STATS[3].swap(0, Ordering::Relaxed);
+        let peak_settled_slots = LAND_RETIRE_STATS[4].swap(0, Ordering::Relaxed);
+        let (in_flight_slots, landed_slots, landed_flights) = {
+            let line = line();
+            let in_flight: u64 = line
+                .line
+                .iter()
+                .filter_map(|item| match item {
+                    Late::Run(flight) => Some(&flight.lists),
+                    _ => None,
+                })
+                .flat_map(|lists| lists.iter())
+                .map(crate::list::Detached::pending_dynamic_slots)
+                .sum();
+            let landed: u64 = line
+                .landed
+                .iter()
+                .flat_map(|(lists, _)| lists.iter())
+                .map(crate::list::Detached::pending_dynamic_slots)
+                .sum();
+            (in_flight, landed, line.landed.len())
+        };
+        tracing::info!(
+            "landed list recycling per frame: {:.2} ms on submitting thread, {:.2} ms on helper thread; \
+             dynamic slots waiting for retirement: {} in flight (peak {} retired at settle), {} in landed (peak {} in landed; {} landed flights queued, peak {})",
+            submit_us / 1000.0 / frames,
+            helper_us / 1000.0 / frames,
+            in_flight_slots,
+            peak_settled_slots,
+            landed_slots,
+            peak_landed_slots.max(landed_slots),
+            landed_flights,
+            peak_landed_flights.max(landed_flights as u64),
+        );
     }
     crate::land::log(frames);
     if place::on() {
@@ -5772,6 +5846,8 @@ impl Host {
         stage.next("landing: read-backs, telling the title");
         let mut last = 0;
         let mut landed = Vec::new();
+        #[cfg(feature = "diagnostics")]
+        let mut retiring_slots = 0u64;
         let mut telling = std::time::Instant::now();
         for item in items {
             telling = match item {
@@ -5787,6 +5863,10 @@ impl Host {
                         own.landed();
                     }
                     for detached in &mut flight.lists {
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            retiring_slots += detached.pending_dynamic_slots();
+                        }
                         detached.release_tables();
                     }
                     landed.push((flight.lists, flight.order));
@@ -5802,6 +5882,8 @@ impl Host {
                 }
             };
         }
+        #[cfg(feature = "diagnostics")]
+        LAND_RETIRE_STATS[4].fetch_max(retiring_slots, Ordering::Relaxed);
         if last > 0 {
             FINISHED.store(last, Ordering::Release);
             bury(last);
@@ -6088,8 +6170,18 @@ impl Host {
             LINE_MOVED.notify_one();
         }
         drop(submitted);
-        let _landing = crate::timeline::span("landed lists reset and given back");
-        land();
+        // Every push to `line.landed` (`relay_land` and `settle`) already sets
+        // `line.poke` or runs `land()` directly on `victory-late-wait`, so
+        // `send_late` only falls back to inline `land()` if the helper thread
+        // failed to start.
+        if !LATE_HELPER_LIVE.load(Ordering::Acquire) {
+            let _landing = crate::timeline::span("landed lists reset and given back");
+            #[cfg(feature = "diagnostics")]
+            let started = std::time::Instant::now();
+            land();
+            #[cfg(feature = "diagnostics")]
+            LAND_RETIRE_STATS[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
     }
 
     /// Sends `list`, a closed list of ours (the present's copy), as a
@@ -6260,6 +6352,8 @@ impl Host {
             // In the order given: what tells the title the card is done.
             let mut last = 0;
             let mut landed = Vec::new();
+            #[cfg(feature = "diagnostics")]
+            let mut retiring_slots = 0u64;
             for item in items {
                 match item {
                     Late::Run(mut flight) => {
@@ -6271,6 +6365,10 @@ impl Host {
                             self.card_done(card);
                         }
                         for detached in &mut flight.lists {
+                            #[cfg(feature = "diagnostics")]
+                            {
+                                retiring_slots += detached.pending_dynamic_slots();
+                            }
                             detached.release_tables();
                         }
                         landed.push((flight.lists, flight.order));
@@ -6279,6 +6377,8 @@ impl Host {
                     Late::Signal(fence, value) => crate::fence::set(fence.as_this(), value),
                 }
             }
+            #[cfg(feature = "diagnostics")]
+            LAND_RETIRE_STATS[4].fetch_max(retiring_slots, Ordering::Relaxed);
             if last > 0 {
                 FINISHED.store(last, Ordering::Release);
                 bury(last);

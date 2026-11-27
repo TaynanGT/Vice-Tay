@@ -4701,8 +4701,16 @@ impl<'a> Lower<'a> {
         let az = self.s.m.cmp(c, pred::OEQ, a, zero);
         let bz = self.s.m.cmp(c, pred::OEQ, b, zero);
         let z = self.s.m.bin(c, Bin::Or, az, bz);
-        // +0 + acc: the sign of a zero addend comes out of the addition.
+        // DXIL fadd can give -0 for +0 + -0. Select the +0 bits explicitly
+        // for the legacy rule, while keeping the add's NaN behavior.
+        let acc_bits = self.as_int(acc);
+        let neg_zero = self.s.m.i32(0x8000_0000);
+        let acc_neg_zero = self.s.m.cmp(c, pred::EQ, acc_bits, neg_zero);
         let sum = self.s.m.bin(c, Bin::Add, zero, acc);
+        let sum_bits = self.as_int(sum);
+        let zero_bits = self.s.m.i32(0);
+        let sum_bits = self.s.m.select(c, acc_neg_zero, zero_bits, sum_bits);
+        let sum = self.as_float(sum_bits);
         self.s.m.select(c, z, sum, fused)
     }
 

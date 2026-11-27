@@ -5308,6 +5308,8 @@ mod late_tests {
             eprintln!("no D3D12 device; texture readback dependency not tested");
             return;
         };
+        // Submitting a list clears the shared write-watch query.
+        let _one = crate::watch::one_asking_test();
         let mut title = [0u8; 64];
         let producer = host.new_list().unwrap();
         let (upload, upload_bytes) = host.upload_buffer(512).unwrap();

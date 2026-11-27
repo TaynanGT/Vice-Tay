@@ -395,10 +395,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
                     None => one(Sym::Unknown),
                 },
                 Operand::Const(c @ 240..=248) if f16_inline => {
-                    let h = [
-                        0x3800, 0xB800, 0x3C00, 0xBC00, 0x4000, 0xC000, 0x4400, 0xC400, 0x3118,
-                    ][usize::from(c - 240)];
-                    one(Sym::K(h))
+                    one(Sym::K(super::lower::inline_f16(c)))
                 }
                 Operand::Const(c) => one(crate::resource::inline(c).map_or(Sym::Unknown, Sym::K)),
                 Operand::Literal(x) => one(Sym::K(x)),

@@ -204,12 +204,30 @@ pub(crate) struct Scratch {
     tiling: victory_formats::texture::TilingCache,
 }
 
+/// Whether flight texture readbacks use parallel landing (`VICTORY_TEXBACK_PARALLEL=1`,
+/// opt-in, off by default; `VICTORY_AB` can flip it live in `diagnostics` builds).
+fn parallel_enabled() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_TEXBACK_PARALLEL") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| parse_parallel_switch(std::env::var("VICTORY_TEXBACK_PARALLEL").ok().as_deref()))
+}
+
+fn parse_parallel_switch(raw: Option<&str>) -> bool {
+    raw.is_some_and(|v| v.trim() == "1")
+}
+
 /// Once the list has run, tile its texels back into the same title allocation.
+///
+/// The `TICKETS` lock is narrowed to the final validity check and copy into
+/// title memory (after XaviFortes/VIctory-RDNA `e4250eb`), preserving the
+/// `MAPPING -> TICKETS` lock order so parallel workers can read, map, and tile
+/// disjoint textures concurrently without serializing on `TICKETS`.
 pub(crate) fn land(back: &Back, scratch: &mut Scratch) {
     static COPIED: AtomicU64 = AtomicU64::new(0);
     static STALE: AtomicU64 = AtomicU64::new(0);
-    let _mapping = crate::watch::title_memory_reading();
-    let _ticket_guard = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
     if !back.ticket.valid.load(Ordering::Acquire) {
         let skipped = STALE.fetch_add(1, Ordering::Relaxed) + 1;
         if skipped.is_power_of_two() {
@@ -217,6 +235,7 @@ pub(crate) fn land(back: &Back, scratch: &mut Scratch) {
         }
         return;
     }
+    let _mapping = crate::watch::title_memory_reading();
     let (at, end) = back.range();
     let size = end - at;
     if scratch.pixels.len() < size {
@@ -257,7 +276,17 @@ pub(crate) fn land(back: &Back, scratch: &mut Scratch) {
     }
     // SAFETY: mapped above.
     unsafe { buffer.Unmap(0, None) };
+    let ticket_guard = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
+    if !back.ticket.valid.load(Ordering::Acquire) {
+        drop(ticket_guard);
+        let skipped = STALE.fetch_add(1, Ordering::Relaxed) + 1;
+        if skipped.is_power_of_two() {
+            tracing::info!(skipped, "skipping texture readbacks whose title allocation changed");
+        }
+        return;
+    }
     crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
+    drop(ticket_guard);
     let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
     if copied == 1 || copied.is_multiple_of(128) {
         let stats = back.buffer.stats();
@@ -277,6 +306,82 @@ pub(crate) fn land(back: &Back, scratch: &mut Scratch) {
             "texture readback landed"
         );
     }
+}
+
+/// Lands one texture readback using a thread-local [`Scratch`] buffer and
+/// tiling cache, for worker threads in [`land_many`].
+fn land_local(back: &Back) {
+    thread_local! {
+        static LOCAL: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
+    }
+    LOCAL.with(|scratch| land(back, &mut scratch.borrow_mut()));
+}
+
+/// Decides which readback indices to execute and whether they are pairwise
+/// disjoint (safe to tile and land in parallel).
+///
+/// Each entry is `(owner, at, end, valid)`. An earlier readback is skipped only
+/// when a later still-valid readback shares the exact same `(owner, at, end)`,
+/// so both tickets have identical invalidation predicates (`released`,
+/// `replaced`, `remapped`) and cover the same texture subresources. Any
+/// overlapping remaining entries fall back to strict sequential submission
+/// order (`parallel == false`).
+fn plan_land_many(entries: &[(usize, usize, usize, bool)]) -> (Vec<usize>, bool) {
+    let mut active = Vec::with_capacity(entries.len());
+    for (i, &(owner, at, end, _)) in entries.iter().enumerate() {
+        let superseded = entries[i + 1..]
+            .iter()
+            .any(|&(lowner, lat, lend, lvalid)| lowner == owner && lat == at && lend == end && lvalid);
+        if !superseded {
+            active.push(i);
+        }
+    }
+    if active.len() <= 1 {
+        return (active, false);
+    }
+    let mut sorted: Vec<(usize, usize)> = active.iter().map(|&i| (entries[i].1, entries[i].2)).collect();
+    sorted.sort_unstable();
+    let overlaps = sorted.windows(2).any(|w| w[0].1 > w[1].0);
+    (active, !overlaps)
+}
+
+/// Lands a flight's texture readbacks. When `VICTORY_TEXBACK_PARALLEL=1` is
+/// enabled, skips superseded duplicates for the same `(owner, at, end)` and
+/// tiles pairwise-disjoint readbacks in parallel across `crate::land::each_view`
+/// (after XaviFortes/VIctory-RDNA `e4250eb` and `af65a79`). When off (the
+/// default), lands sequentially in exact submission order.
+pub(crate) fn land_many(backs: &[&Back], scratch: &mut Scratch) {
+    land_many_with(backs, scratch, parallel_enabled());
+}
+
+fn land_many_with(backs: &[&Back], scratch: &mut Scratch, parallel_on: bool) {
+    if backs.is_empty() {
+        return;
+    }
+    if !parallel_on || backs.len() == 1 {
+        for &back in backs {
+            land(back, scratch);
+        }
+        return;
+    }
+    let entries: Vec<(usize, usize, usize, bool)> = backs
+        .iter()
+        .map(|b| {
+            let (at, end) = b.range();
+            (b.ticket.owner, at, end, b.ticket.valid.load(Ordering::Acquire))
+        })
+        .collect();
+    let (active, parallel) = plan_land_many(&entries);
+    if active.is_empty() {
+        return;
+    }
+    if !parallel {
+        for i in active {
+            land(backs[i], scratch);
+        }
+        return;
+    }
+    crate::land::each_view(false, active.len(), &|slot| land_local(backs[active[slot]]));
 }
 
 /// Register the initialized upload row copied by the host's test list as a
@@ -336,5 +441,256 @@ mod tests {
         released(93);
         assert!(!far.valid.load(Ordering::Acquire));
         assert!(track(94, 0x2000, 0x3000).valid.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn parallel_switch_defaults_off_and_accepts_only_one() {
+        assert!(!parse_parallel_switch(None));
+        assert!(!parse_parallel_switch(Some("0")));
+        assert!(!parse_parallel_switch(Some("")));
+        assert!(!parse_parallel_switch(Some("false")));
+        assert!(!parse_parallel_switch(Some("2")));
+        assert!(parse_parallel_switch(Some("1")));
+        assert!(parse_parallel_switch(Some(" 1 ")));
+    }
+
+    #[test]
+    fn plan_land_many_handles_disjoint_dedup_overlap_and_stale_tickets() {
+        // Pairwise disjoint ranges run in parallel.
+        assert_eq!(
+            plan_land_many(&[
+                (1, 0x1000, 0x1100, true),
+                (2, 0x2000, 0x2100, true),
+                (3, 0x1100, 0x1200, true),
+            ]),
+            (vec![0, 1, 2], true)
+        );
+        // Same-owner exact duplicate keeps only the last valid entry; remaining disjoint entries stay parallel.
+        assert_eq!(
+            plan_land_many(&[
+                (1, 0x1000, 0x1100, true),
+                (2, 0x2000, 0x2100, true),
+                (1, 0x1000, 0x1100, true),
+            ]),
+            (vec![1, 2], true)
+        );
+        // Different-owner aliases covering the exact same range never suppress each other and run sequentially.
+        assert_eq!(
+            plan_land_many(&[
+                (1, 0x1000, 0x1100, true),
+                (9, 0x1000, 0x1100, true),
+            ]),
+            (vec![0, 1], false)
+        );
+        // An invalidated later duplicate never suppresses an earlier still-valid entry.
+        assert_eq!(
+            plan_land_many(&[
+                (1, 0x1000, 0x1100, true),
+                (1, 0x1000, 0x1100, false),
+            ]),
+            (vec![0, 1], false)
+        );
+        // Partially overlapping ranges fall back to sequential submission order.
+        assert_eq!(
+            plan_land_many(&[
+                (1, 0x1000, 0x1200, true),
+                (2, 0x1100, 0x1300, true),
+            ]),
+            (vec![0, 1], false)
+        );
+        // Contained sub-range overlap falls back to sequential submission order.
+        assert_eq!(
+            plan_land_many(&[
+                (1, 0x1000, 0x1400, true),
+                (2, 0x1100, 0x1200, true),
+            ]),
+            (vec![0, 1], false)
+        );
+    }
+
+    /// Full 256-byte linear 64x1 R32_UINT readback targeting `[dst_ptr, dst_ptr + 256)`
+    /// with an explicit `owner` identity, so every byte of the 256-byte range is
+    /// written on landing for overlap-order and stale-ticket verification.
+    fn full_row_back_for_test(buffer: crate::host::TextureReadback, dst_ptr: *mut u8, owner: usize) -> Back {
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        let layout = Layout::new(&Desc {
+            dimension: Dimension::Tex2d,
+            width: 64,
+            height: 1,
+            depth: 1,
+            mips: 1,
+            element_bytes: 4,
+            block: 1,
+            samples: 1,
+            swizzle: Swizzle::LINEAR,
+        })
+        .unwrap();
+        assert_eq!(layout.size, 256);
+        let at = dst_ptr as usize;
+        Back {
+            buffer,
+            footprints: vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                Offset: 0,
+                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                    Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT,
+                    Width: 64,
+                    Height: 1,
+                    Depth: 1,
+                    RowPitch: 256,
+                },
+            }],
+            rows: vec![1],
+            mips: 1,
+            layout,
+            ticket: track(owner, at, at + 256),
+        }
+    }
+
+    fn record_row_back(
+        host: &'static crate::host::Host,
+        fill: u8,
+        dst_ptr: *mut u8,
+        owner: usize,
+    ) -> (Back, ID3D12Resource, crate::host::HostList) {
+        const ROW: u64 = 256;
+        let (src, ptr) = host.upload_buffer(ROW).expect("upload buffer");
+        // SAFETY: freshly allocated 256-byte upload mapping.
+        unsafe { ptr.write_bytes(fill, ROW as usize) };
+        let lease = host.texture_readback_buffer(ROW).expect("readback lease");
+        let list = host.new_list().expect("host list");
+        // SAFETY: open list, live upload and readback buffers of ROW bytes.
+        unsafe { list.list.CopyBufferRegion(lease.resource(), 0, &src, 0, ROW) };
+        list.close();
+        host.execute(&[&list]);
+        (full_row_back_for_test(lease, dst_ptr, owner), src, list)
+    }
+
+    /// Real D3D12 (HW and WARP) test verifying both baseline sequential and
+    /// opt-in parallel `land_many_with`: disjoint textures land concurrently,
+    /// same-owner duplicates keep the latest write, and partially overlapping
+    /// destination ranges strictly preserve submission/ticket order in both
+    /// forward and reverse directions.
+    #[test]
+    fn land_many_preserves_overlap_order_and_disjoint_parallel_on_gpu() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        const ROW: usize = 256;
+        const COUNT: usize = 8;
+
+        for parallel_on in [false, true] {
+            // 1. Disjoint targets + same-owner duplicate latest-wins.
+            let mut dsts = [[0u8; ROW]; COUNT];
+            let mut uploads = Vec::new();
+            let mut lists = Vec::new();
+            let mut backs = Vec::new();
+            for (i, dst) in dsts.iter_mut().enumerate() {
+                let owner = 0x1000 + i;
+                let (back, src, list) = record_row_back(host, 0x20 + i as u8, dst.as_mut_ptr(), owner);
+                backs.push(back);
+                uploads.push(src);
+                lists.push(list);
+            }
+            let (ovr, src_ovr, list_ovr) = record_row_back(host, 0xEE, dsts[0].as_mut_ptr(), 0x1000);
+            backs.push(ovr);
+            uploads.push(src_ovr);
+            lists.push(list_ovr);
+
+            let refs: Vec<&Back> = backs.iter().collect();
+            let mut scratch = Scratch::default();
+            land_many_with(&refs, &mut scratch, parallel_on);
+            assert_eq!(dsts[0], [0xEE; ROW], "latest valid write wins (parallel_on={parallel_on})");
+            for (i, dst) in dsts.iter().enumerate().skip(1) {
+                assert_eq!(*dst, [0x20 + i as u8; ROW], "disjoint slot {i} (parallel_on={parallel_on})");
+            }
+            drop((backs, uploads, lists));
+
+            // 2. Partial forward overlap: [0..256) = 0xAA then [128..384) = 0xBB.
+            let mut shared = [0x55u8; 512];
+            let base = shared.as_mut_ptr();
+            // SAFETY: base+0..256 and base+128..384 both lie inside `shared[..512]`.
+            let (b1, u1, l1) = record_row_back(host, 0xAA, base, 0x2001);
+            let (b2, u2, l2) = record_row_back(host, 0xBB, unsafe { base.add(128) }, 0x2002);
+            land_many_with(&[&b1, &b2], &mut scratch, parallel_on);
+            assert_eq!(&shared[0..128], &[0xAA; 128], "forward overlap head");
+            assert_eq!(&shared[128..256], &[0xBB; 128], "forward overlap shared middle");
+            assert_eq!(&shared[256..384], &[0xBB; 128], "forward overlap tail");
+            assert_eq!(&shared[384..512], &[0x55; 128], "untouched suffix");
+            drop((b1, b2, u1, u2, l1, l2));
+
+            // 3. Reverse overlap: [128..384) = 0xCC then [0..256) = 0xDD.
+            shared.fill(0x55);
+            let base = shared.as_mut_ptr();
+            // SAFETY: base+128..384 and base+0..256 both lie inside `shared[..512]`.
+            let (b3, u3, l3) = record_row_back(host, 0xCC, unsafe { base.add(128) }, 0x2003);
+            let (b4, u4, l4) = record_row_back(host, 0xDD, base, 0x2004);
+            land_many_with(&[&b3, &b4], &mut scratch, parallel_on);
+            assert_eq!(&shared[0..256], &[0xDD; 256], "reverse overlap later write wins");
+            assert_eq!(&shared[256..384], &[0xCC; 128], "reverse overlap earlier tail preserved");
+            assert_eq!(&shared[384..512], &[0x55; 128], "untouched suffix");
+            drop((b3, b4, u3, u4, l3, l4));
+        }
+        assert_eq!(host.log_messages(), None);
+    }
+
+    /// Real D3D12 (HW and WARP) stale-ticket isolation test: cancelled
+    /// (`released`), superseded (`replaced`), and partially remapped
+    /// (`remapped`) tickets never overwrite destination memory, out-of-range
+    /// invalidations leave valid tickets intact, and invalidated later
+    /// duplicates never suppress an earlier valid ticket.
+    #[test]
+    fn land_many_blocks_stale_cancelled_superseded_and_remapped_tickets_on_gpu() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        const ROW: usize = 256;
+
+        for parallel_on in [false, true] {
+            let mut dst_released = [0x11u8; ROW];
+            let mut dst_replaced = [0x22u8; ROW];
+            let mut dst_remapped = [0x33u8; ROW];
+            // Reserve a trailing guard region so `remapped(at + ROW, 64)` cannot alias
+            // another local buffer on the stack.
+            let mut dst_valid = [0x44u8; ROW * 2];
+            let mut dst_stale_dup = [0x55u8; ROW];
+
+            let (b_rel, u_rel, l_rel) = record_row_back(host, 0xF1, dst_released.as_mut_ptr(), 0x3001);
+            let (b_rep_old, u_rep_old, l_rep_old) = record_row_back(host, 0xF2, dst_replaced.as_mut_ptr(), 0x3002);
+            let (b_remap, u_remap, l_remap) = record_row_back(host, 0xF3, dst_remapped.as_mut_ptr(), 0x3003);
+            let (b_val, u_val, l_val) = record_row_back(host, 0x99, dst_valid.as_mut_ptr(), 0x3004);
+            let (b_dup_good, u_dg, l_dg) = record_row_back(host, 0x7A, dst_stale_dup.as_mut_ptr(), 0x3005);
+            let (b_dup_stale, u_ds, l_ds) = record_row_back(host, 0xFA, dst_stale_dup.as_mut_ptr(), 0x3006);
+
+            // Cancel by owner, supersede by base address, invalidate by partial remap,
+            // and cancel only the later alias on `dst_stale_dup`.
+            released(0x3001);
+            replaced(dst_replaced.as_ptr() as usize);
+            let (b_rep_new, u_rep_new, l_rep_new) = record_row_back(host, 0x88, dst_replaced.as_mut_ptr(), 0x3007);
+            remapped(dst_remapped.as_ptr() as usize + 128, 4);
+            released(0x3006);
+            // Out-of-range invalidation right after `dst_valid[..ROW]` must not cancel `b_val`.
+            remapped(dst_valid.as_ptr() as usize + ROW, 64);
+
+            let mut scratch = Scratch::default();
+            land_many_with(
+                &[&b_rel, &b_rep_old, &b_rep_new, &b_remap, &b_val, &b_dup_good, &b_dup_stale],
+                &mut scratch,
+                parallel_on,
+            );
+
+            assert_eq!(dst_released, [0x11; ROW], "released ticket must not write");
+            assert_eq!(dst_replaced, [0x88; ROW], "superseded old ticket skipped, newer replacement lands");
+            assert_eq!(dst_remapped, [0x33; ROW], "partially remapped ticket must not write");
+            assert_eq!(&dst_valid[..ROW], &[0x99; ROW], "out-of-range remap must not cancel valid ticket");
+            assert_eq!(&dst_valid[ROW..], &[0x44; ROW], "guard region untouched");
+            assert_eq!(dst_stale_dup, [0x7A; ROW], "cancelled later ticket must not suppress earlier valid write");
+
+            drop((
+                b_rel, b_rep_old, b_rep_new, b_remap, b_val, b_dup_good, b_dup_stale,
+                u_rel, u_rep_old, u_rep_new, u_remap, u_val, u_dg, u_ds,
+                l_rel, l_rep_old, l_rep_new, l_remap, l_val, l_dg, l_ds,
+            ));
+        }
+        assert_eq!(host.log_messages(), None);
     }
 }

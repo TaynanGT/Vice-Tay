@@ -181,8 +181,16 @@ pub struct Layout {
     pub(crate) pattern: &'static SwizzlePattern,
 }
 
-pub(crate) type SwizzlePattern = [Vec<u32>; 3];
-static EMPTY_PATTERN: SwizzlePattern = [const { Vec::new() }; 3];
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SwizzlePattern {
+    axes: [Vec<u32>; 3],
+    pub(crate) thin_offsets: Option<crate::detile::ThinOffsets>,
+}
+
+static EMPTY_PATTERN: SwizzlePattern = SwizzlePattern {
+    axes: [const { Vec::new() }; 3],
+    thin_offsets: None,
+};
 
 type CopyRun = (usize, usize, usize);
 
@@ -372,8 +380,15 @@ fn shared_pattern(kind: usize, element_log2: u32, block_log2: u32) -> &'static S
     static PATTERNS: [[[OnceLock<SwizzlePattern>; 5]; 3]; 3] =
         [const { [const { [const { OnceLock::new() }; 5] }; 3] }; 3];
     let block_index = ((block_log2 - 8) / 4) as usize;
-    PATTERNS[kind][block_index][element_log2 as usize]
-        .get_or_init(|| pattern(kind, element_log2, block_log2).map(|bits| spread(&bits)))
+    PATTERNS[kind][block_index][element_log2 as usize].get_or_init(|| {
+        let axes = pattern(kind, element_log2, block_log2).map(|bits| spread(&bits));
+        let thin_offsets = if kind == 2 {
+            None
+        } else {
+            crate::detile::ThinOffsets::new(&axes, element_log2, 1 << block_log2)
+        };
+        SwizzlePattern { axes, thin_offsets }
+    })
 }
 
 const MAX_MIPS: u32 = 16;
@@ -646,7 +661,7 @@ impl Layout {
     /// differ). Titles use them for render targets and depth, which the
     /// host renders; add them when a title copies into or out of one.
     pub fn addressable(&self) -> bool {
-        self.desc.swizzle == Swizzle::LINEAR || !self.pattern[0].is_empty()
+        self.desc.swizzle == Swizzle::LINEAR || !self.pattern.axes[0].is_empty()
     }
 
     /// The slice and the depth inside it for `z` (an array slice or a 3D
@@ -695,7 +710,7 @@ impl Layout {
         // offset inside the tail block.
         let y = y + m.tail.map_or(0, |t| t.y);
         let blocks = u64::from(y / bh) * u64::from(m.pitch / bw);
-        (blocks << log2) + u64::from(self.pattern[1][(y % bh) as usize] | self.pattern[2][z as usize])
+        (blocks << log2) + u64::from(self.pattern.axes[1][(y % bh) as usize] | self.pattern.axes[2][z as usize])
     }
 
     /// The part of an address that depends on the column.
@@ -704,7 +719,7 @@ impl Layout {
         let bw = self.block[0];
         let x = x + m.tail.map_or(0, |t| t.x);
         (u64::from(x / bw) << self.alignment.trailing_zeros())
-            + u64::from(self.pattern[0][(x % bw) as usize])
+            + u64::from(self.pattern.axes[0][(x % bw) as usize])
     }
 
     /// Depth slices a subresource of mip `mip` covers: the mip's depth for
@@ -1115,8 +1130,8 @@ mod tests {
                 let [w, h, d] = l.block;
                 assert_eq!(u64::from(w * h * d) << e, 1 << log2, "{log2} {e}");
                 // The pattern covers exactly the block's coordinates.
-                assert_eq!(l.pattern[0].len() as u32, w);
-                assert_eq!(l.pattern[1].len() as u32, h);
+                assert_eq!(l.pattern.axes[0].len() as u32, w);
+                assert_eq!(l.pattern.axes[1].len() as u32, h);
             }
         }
         // 64 KiB, 16-byte elements: 64x64 (a 256x256 BC7 texture).
@@ -1298,7 +1313,8 @@ mod tests {
                 })
                 .unwrap();
                 let expected = pattern(kind, element_log2, block_log2).map(|bits| spread(&bits));
-                assert_eq!(first.pattern, &expected);
+                assert_eq!(first.pattern.axes, expected);
+                assert_eq!(first.pattern.thin_offsets.is_some(), kind != 2);
                 assert!(std::ptr::eq(first.pattern, second.pattern));
                 assert!(std::ptr::eq(first.pattern, first.clone().pattern));
             }

@@ -4476,14 +4476,43 @@ fn buffer_uav(
     Some(Some(shadow.buffer.clone()))
 }
 
+/// Whether the host lets views of a typed resource name another format of
+/// its family (`CastingFullyTypedFormatSupported`; never SNORM for UNORM,
+/// nor FLOAT for another type), which [`fits`] uses for sRGB and linear
+/// twins only.
+fn casts_typed() -> bool {
+    static CASTS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CASTS.get_or_init(|| {
+        let Some(host) = host() else { return false };
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+        // SAFETY: the query writes its own structure of the given size.
+        let asked = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS3,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        };
+        let casts = asked.is_ok() && options.CastingFullyTypedFormatSupported.as_bool();
+        if !casts {
+            tracing::warn!(
+                "the host does not cast typed formats: sRGB views of linear textures (and the reverse) read in the texture's own format"
+            );
+        }
+        casts
+    })
+}
+
 /// Whether the host can make a shader (or unordered access) view of
 /// `texture` in `format` (none: the texture's own). The console allows any
 /// view; the host refuses (and removes the device for) views without the
 /// resource's permission, of typed depth, and in another format than a
-/// typed resource's. A view of a typed texture in another format of its
-/// family takes the texture's format.
-/// shortcut: such a view (sRGB of UNORM, say) reads without its
-/// conversion; cast with castable formats if colors come out wrong.
+/// typed resource's, but for casts it allows (see [`casts_typed`]). A view
+/// of a typed texture in another format of its family takes the texture's
+/// format, unless it is the texture's sRGB or linear twin and the host
+/// casts: then the hardware converts (or not) as the console does.
+/// shortcut: other casts within a family (UINT of UNORM, say) read as the
+/// texture's own format.
 fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
     use crate::resource::{DEPTH_FORMATS, family};
     // SAFETY: a live resource.
@@ -4520,9 +4549,12 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     if view == 0 {
         return !typeless;
     }
+    if view == own {
+        return true;
+    }
     // A view of a target whose format the host refuses, in the title's
     // format: in the stand-in the host copy has.
-    if view != own && crate::resource::target_format(view) == own {
+    if crate::resource::target_format(view) == own {
         if let Some(format) = format {
             *format = d.Format;
         }
@@ -4534,6 +4566,7 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     }
     if let Some(format) = format
         && !typeless
+        && (unordered || !crate::resource::srgb_twins(view, own) || !casts_typed())
     {
         *format = d.Format;
     }

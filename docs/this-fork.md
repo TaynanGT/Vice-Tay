@@ -43,6 +43,13 @@ where there is one; the default is the behaviour described.
 
 ## Memory and frame rate
 
+- Texture uploads reuse the tile offsets for each swizzle pattern across mip
+  levels and array slices. Each upload still checks its bounds and row pitch.
+  This extends [Vladimir-Human's texture converter](https://github.com/TaynanGT/Vice-Tay/pull/191).
+- Binding the view and sampler heaps uses two stack slots. The command list
+  keeps both heaps alive until the GPU finishes. This follows
+  [Xavi Fortes's change in VIctory-RDNA](https://github.com/XaviFortes/VIctory-RDNA/commit/c43982ea2cca87a68426d776b745d745d641a3a3).
+
 How each of these was found, with the numbers:
 [findings-rtx4090.md](findings-rtx4090.md).
 
@@ -83,6 +90,13 @@ How each of these was found, with the numbers:
   [RTX 5090 D v2 report](https://github.com/TaynanGT/Vice-Tay/pull/211#issuecomment-7218626007)
 
 ## Picture
+
+- On devices that support casting fully typed formats, shaders can read
+  the same texture through either its linear or its sRGB view. A mid-grey
+  colour stored as 128/255 should reach the lighting shader
+  as about 0.216 through the sRGB view and 0.502 through the linear one.
+  The GPU test checks both directions for seven format pairs. Adapted from
+  [AnoHunted's fix in VIctory](https://github.com/Marvisak/VIctory/pull/331).
 
 - **Dynamic descriptor slots are given back when the card has run a flight**, not
   when the host list is reset some 64 flights later. On a card whose

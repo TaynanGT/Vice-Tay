@@ -542,6 +542,90 @@ unsafe impl Send for SendPtr {}
 // SAFETY: as above.
 unsafe impl Sync for SendPtr {}
 
+/// Macro-block offsets shared by all thin textures with this swizzle pattern.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ThinOffsets {
+    block: [u32; 2],
+    element_log2: u32,
+    block_bytes: usize,
+    x: [usize; 16],
+    y: [usize; 16],
+}
+
+impl ThinOffsets {
+    pub(crate) fn new(axes: &[Vec<u32>; 3], element_log2: u32, block_bytes: usize) -> Option<Self> {
+        let bw = u32::try_from(axes[0].len()).ok()?;
+        let bh = u32::try_from(axes[1].len()).ok()?;
+        let [micro_w, micro_h] = BLOCK_256_2D[element_log2 as usize];
+        if !bw.is_power_of_two() || !bh.is_power_of_two() || bw < micro_w || bh < micro_h {
+            return None;
+        }
+        let mx_per_block = (bw / micro_w) as usize;
+        let my_per_block = (bh / micro_h) as usize;
+        if !(1..=16).contains(&mx_per_block)
+            || !(1..=16).contains(&my_per_block)
+            || !my_per_block.is_power_of_two()
+        {
+            return None;
+        }
+        if mx_per_block
+            .checked_mul(my_per_block)?
+            .checked_mul(256)?
+            != block_bytes
+        {
+            return None;
+        }
+
+        let mut x_in_block = [0usize; 16];
+        for (i, slot) in x_in_block.iter_mut().take(mx_per_block).enumerate() {
+            let idx = i.checked_mul(micro_w as usize)?;
+            let off = *axes[0].get(idx)? as usize;
+            if (off & 0xff) != 0 || off >= block_bytes {
+                return None;
+            }
+            *slot = off;
+        }
+        let mut y_in_block = [0usize; 16];
+        for (i, slot) in y_in_block.iter_mut().take(my_per_block).enumerate() {
+            let idx = i.checked_mul(micro_h as usize)?;
+            let off = *axes[1].get(idx)? as usize;
+            if (off & 0xff) != 0 || off >= block_bytes {
+                return None;
+            }
+            *slot = off;
+        }
+
+        // Prove every `(ix, iy)` inside a macro-block maps to a strictly distinct
+        // 256-byte micro-tile completely inside `0..block_bytes` so parallel
+        // macro-row / strip workers never race or step out of `block_base..block_base+block_bytes`.
+        // Because `mx_per_block <= 16` and `my_per_block <= 16`, `block_bytes <= 65536`
+        // and every 256-byte tile index `sum >> 8` fits in a 256-bit mask.
+        let mut seen_tiles = [0u64; 4];
+        for &yo in &y_in_block[..my_per_block] {
+            for &xo in &x_in_block[..mx_per_block] {
+                let sum = yo.checked_add(xo)?;
+                if (sum & 0xff) != 0 || sum.checked_add(256)? > block_bytes {
+                    return None;
+                }
+                let slot = sum >> 8;
+                let word = &mut seen_tiles[slot >> 6];
+                let bit = 1u64 << (slot & 63);
+                if (*word & bit) != 0 {
+                    return None;
+                }
+                *word |= bit;
+            }
+        }
+        Some(Self {
+            block: [bw, bh],
+            element_log2,
+            block_bytes,
+            x: x_in_block,
+            y: y_in_block,
+        })
+    }
+}
+
 /// Precomputed per-strip parameters for thin tiled micro-tile processing.
 struct ThinStripParams {
     kind: MicroKind,
@@ -556,8 +640,8 @@ struct ThinStripParams {
     start_my: usize,
     full_blocks_x: usize,
     rem_full_mx: usize,
-    x_in_block: [usize; 16],
-    y_in_block: [usize; 16],
+    x_in_block: &'static [usize; 16],
+    y_in_block: &'static [usize; 16],
     row_pitch: usize,
     #[cfg(target_arch = "x86_64")]
     avx2: bool,
@@ -808,65 +892,18 @@ fn prepare_thin_geometry(
     let block_bytes = usize::try_from(layout.alignment).ok()?;
     let bw = layout.block[0];
     let bh = layout.block[1];
-    if !bw.is_power_of_two() || !bh.is_power_of_two() || bw < micro_w || bh < micro_h {
+    let offsets = layout.pattern.thin_offsets.as_ref()?;
+    // Layout metadata is public. Only use the saved proof for the geometry
+    // it was made for. Extents, mip tails, pitches and buffers are still
+    // checked below for this particular copy.
+    if offsets.block != [bw, bh]
+        || offsets.element_log2 != element_log2
+        || offsets.block_bytes != block_bytes
+    {
         return None;
     }
     let mx_per_block = (bw / micro_w) as usize;
     let my_per_block = (bh / micro_h) as usize;
-    if !(1..=16).contains(&mx_per_block)
-        || !(1..=16).contains(&my_per_block)
-        || !my_per_block.is_power_of_two()
-    {
-        return None;
-    }
-    if mx_per_block
-        .checked_mul(my_per_block)?
-        .checked_mul(256)?
-        != block_bytes
-    {
-        return None;
-    }
-
-    let mut x_in_block = [0usize; 16];
-    for (i, slot) in x_in_block.iter_mut().take(mx_per_block).enumerate() {
-        let idx = i.checked_mul(micro_w as usize)?;
-        let off = *layout.pattern[0].get(idx)? as usize;
-        if (off & 0xff) != 0 || off >= block_bytes {
-            return None;
-        }
-        *slot = off;
-    }
-    let mut y_in_block = [0usize; 16];
-    for (i, slot) in y_in_block.iter_mut().take(my_per_block).enumerate() {
-        let idx = i.checked_mul(micro_h as usize)?;
-        let off = *layout.pattern[1].get(idx)? as usize;
-        if (off & 0xff) != 0 || off >= block_bytes {
-            return None;
-        }
-        *slot = off;
-    }
-
-    // Prove every `(ix, iy)` inside a macro-block maps to a strictly distinct
-    // 256-byte micro-tile completely inside `0..block_bytes` so parallel
-    // macro-row / strip workers never race or step out of `block_base..block_base+block_bytes`.
-    // Because `mx_per_block <= 16` and `my_per_block <= 16`, `block_bytes <= 65536`
-    // and every 256-byte tile index `sum >> 8` fits in a 256-bit mask.
-    let mut seen_tiles = [0u64; 4];
-    for &yo in &y_in_block[..my_per_block] {
-        for &xo in &x_in_block[..mx_per_block] {
-            let sum = yo.checked_add(xo)?;
-            if (sum & 0xff) != 0 || sum.checked_add(256)? > block_bytes {
-                return None;
-            }
-            let slot = sum >> 8;
-            let word = &mut seen_tiles[slot >> 6];
-            let bit = 1u64 << (slot & 63);
-            if (*word & bit) != 0 {
-                return None;
-            }
-            *word |= bit;
-        }
-    }
 
     let full_mx = (m.width / micro_w) as usize;
     let full_my = (m.height / micro_h) as usize;
@@ -910,8 +947,8 @@ fn prepare_thin_geometry(
         start_my,
         full_blocks_x,
         rem_full_mx,
-        x_in_block,
-        y_in_block,
+        x_in_block: &offsets.x,
+        y_in_block: &offsets.y,
         row_pitch: plan.row_pitch,
         #[cfg(target_arch = "x86_64")]
         avx2,

@@ -301,6 +301,17 @@ fn rest() -> u32 {
     u32::from(std::env::var("VICTORY_INDIRECT_REST").is_ok_and(|v| v == "1"))
 }
 
+/// Serializes WARP adapter tests across modules (see `tests::warp_turn`).
+#[cfg(test)]
+pub(crate) fn warp_turn_for_tests() -> std::sync::MutexGuard<'static, ()> {
+    tests::warp_turn()
+}
+
+/// Whether a record that does not fit consumes the remaining list budget.
+pub(crate) fn rest_on() -> bool {
+    rest() != 0
+}
+
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
 /// replaced).
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {

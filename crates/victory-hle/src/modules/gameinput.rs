@@ -101,6 +101,86 @@ struct PadState {
     right_y: f32,
 }
 
+/// Exponentially smoothed mouse-delta to right-stick velocity converter.
+///
+/// The poll loop runs at 125 Hz (8 ms) while the title may render at low
+/// framerates. A 45 ms half-life keeps flicks alive long enough for the next
+/// rendered frame to sample them while settling cleanly to zero.
+#[cfg(any(windows, test))]
+#[derive(Default)]
+pub struct MouseLook {
+    vx: f32,
+    vy: f32,
+}
+
+#[cfg(any(windows, test))]
+impl MouseLook {
+    const BASE_SENS: f32 = 0.022;
+    const HALF_LIFE_SECS: f32 = 0.045;
+    const DEADZONE: f32 = 0.015;
+
+    pub fn reset(&mut self) {
+        self.vx = 0.0;
+        self.vy = 0.0;
+    }
+
+    pub fn step(&mut self, dx: i32, dy: i32, dt: Duration, sens: f32, invert_y: bool) -> (f32, f32) {
+        let dt_secs = dt.as_secs_f32().clamp(0.001, 0.25);
+        let decay = 0.5_f32.powf(dt_secs / Self::HALF_LIFE_SECS);
+        let scale = Self::BASE_SENS * sens;
+        let y_sign = if invert_y { 1.0 } else { -1.0 };
+        self.vx = (self.vx * decay + dx as f32 * scale).clamp(-1.0, 1.0);
+        self.vy = (self.vy * decay + dy as f32 * scale * y_sign).clamp(-1.0, 1.0);
+        // Only snap tiny residual decay to zero at rest so low-sensitivity
+        // 1-pixel movements are never dropped.
+        if dx == 0 && self.vx.abs() < Self::DEADZONE {
+            self.vx = 0.0;
+        }
+        if dy == 0 && self.vy.abs() < Self::DEADZONE {
+            self.vy = 0.0;
+        }
+        (self.vx, self.vy)
+    }
+}
+
+/// Edge-captured state for `[LMB, RMB, MMB]` so holding a button on window
+/// chrome or in another app and dragging into the client area never fires
+/// triggers or buttons.
+#[cfg(any(windows, test))]
+#[derive(Default)]
+pub struct MouseButtons {
+    seeded: bool,
+    prev: [bool; 3],
+    captured: [bool; 3],
+}
+
+#[cfg(any(windows, test))]
+impl MouseButtons {
+    pub fn reset(&mut self) {
+        self.seeded = false;
+        self.prev = [false; 3];
+        self.captured = [false; 3];
+    }
+
+    pub fn update(&mut self, down: [bool; 3], eligible: bool) -> [bool; 3] {
+        if !self.seeded {
+            self.seeded = true;
+            self.prev = down;
+            self.captured = [false; 3];
+            return self.captured;
+        }
+        for ((&is_down, prev), captured) in down.iter().zip(&mut self.prev).zip(&mut self.captured) {
+            if !is_down {
+                *captured = false;
+            } else if !*prev && eligible {
+                *captured = true;
+            }
+            *prev = is_down;
+        }
+        self.captured
+    }
+}
+
 /// One key held down: scan code (0xE0xx when extended), character, key.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -139,6 +219,12 @@ trait Source: Send {
     }
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
+    /// Extra stand-in pad input from the mouse while the stand-in is active.
+    /// When `active` is false (a physical pad owns input), any active mouse
+    /// look is released without warping the cursor.
+    fn mouse_pad(&mut self, _active: bool) -> PadState {
+        PadState::default()
+    }
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
@@ -187,6 +273,58 @@ fn merged(a: PadState, b: PadState) -> PadState {
 /// own slot and a remapper's) from being two players.
 fn one_pad() -> bool {
     std::env::var_os("VICTORY_ONE_PAD").is_none_or(|v| v != "0")
+}
+
+/// Parses an opt-in boolean environment variable (`1`, `true`, `yes`, `on`,
+/// ignoring surrounding whitespace and ASCII case).
+pub fn parse_env_flag(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// Mouse camera control for the keyboard's stand-in pad, on by default
+/// (`VICTORY_MOUSE_LOOK=0` turns it off).
+fn mouse_look() -> bool {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var("VICTORY_MOUSE_LOOK")
+            .map_or(true, |v| parse_env_flag(&v))
+    });
+    *ENABLED
+}
+
+/// Mouse-look sensitivity multiplier (`VICTORY_MOUSE_SENS`, default `1.0`).
+#[cfg(windows)]
+fn mouse_sens() -> f32 {
+    static SENS: LazyLock<f32> = LazyLock::new(|| {
+        std::env::var("VICTORY_MOUSE_SENS")
+            .ok()
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(1.0)
+    });
+    *SENS
+}
+
+/// Invert the mouse Y axis (`VICTORY_MOUSE_INVERT_Y=1`).
+#[cfg(windows)]
+fn mouse_invert_y() -> bool {
+    static INVERT: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var("VICTORY_MOUSE_INVERT_Y")
+            .is_ok_and(|v| parse_env_flag(&v))
+    });
+    *INVERT
+}
+
+/// Whether the cursor should be hidden inside the game window's client area.
+#[cfg(windows)]
+static CURSOR_LOCKED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(windows)]
+pub(crate) fn cursor_locked() -> bool {
+    CURSOR_LOCKED.load(Ordering::Relaxed)
 }
 
 #[repr(C)]
@@ -458,14 +596,16 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys, mouse) = {
+        let (pads, keys, mouse_state, mouse_pad) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys(), source.mouse())
+            let keys = source.keys();
+            let stand_in_active = self.one_pad || pads.iter().all(Option::is_none);
+            let mouse_state = source.mouse();
+            let mouse_pad = source.mouse_pad(stand_in_active);
+            (pads, keys, mouse_state, mouse_pad)
         };
-        let events = self
-            .state()
-            .poll(&self.devices, self.one_pad, pads, keys, mouse);
+        let events = self.state().poll(&self.devices, self.one_pad, pads, keys, mouse_state, mouse_pad);
         self.deliver(events);
     }
 
@@ -511,13 +651,15 @@ impl State {
         one_pad: bool,
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
-        mouse: Option<MouseState>,
+mouse: Option<MouseState>,
+        mouse_pad: PadState,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
         self.update(devices, MOUSE, mouse.map(Value::Mouse), now, &mut events);
+        let stand_in = merged(fallback(&keys), mouse_pad);
         if one_pad {
-            let pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
+            let pad = pads.into_iter().flatten().fold(stand_in, merged);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
             self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
             return events;
@@ -526,7 +668,7 @@ impl State {
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then_some(Value::Pad(stand_in));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1175,6 +1317,7 @@ pub(crate) fn module() -> HleModule {
 mod host {
     use std::time::{Duration, Instant};
 
+    use windows_sys::Win32::Foundation::{HWND, POINT};
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW,
@@ -1188,7 +1331,8 @@ mod host {
         XInputSetState,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId,
+        GetCursorPos, GetForegroundWindow, GetWindowInfo, GetWindowThreadProcessId, HTCLIENT,
+        PostMessageW, SetCursorPos, WINDOWINFO, WM_MOUSEMOVE, WM_SETCURSOR,
     };
 
     use super::*;
@@ -1236,9 +1380,46 @@ mod host {
         /// The input snapshot for this poll and the HID connection owning each slot.
         pads: [Option<PadState>; PADS],
         hid_slots: [Option<u64>; PADS],
+        mouse_locked: bool,
+        just_locked: bool,
+        toggle_was_down: bool,
+        user_unlocked: bool,
+        anchor: (i32, i32),
+        mouse_last_poll: Option<Instant>,
+        mouse_look: MouseLook,
+        mouse_buttons: MouseButtons,
     }
 
     impl Host {
+        fn set_mouse_locked(&mut self, locked: bool, hwnd: Option<HWND>) {
+            if self.mouse_locked == locked {
+                return;
+            }
+            self.mouse_locked = locked;
+            CURSOR_LOCKED.store(locked, Ordering::Release);
+            if let Some(hwnd) = hwnd {
+                // Prompt the window's UI thread to run WM_SETCURSOR right away
+                // so the cursor hides/reappears the instant F2/Esc/P unlocks it.
+                let lparam = (HTCLIENT as isize) | ((WM_MOUSEMOVE as isize) << 16);
+                // SAFETY: asynchronous post to our own process's foreground window.
+                unsafe {
+                    let _ = PostMessageW(hwnd, WM_SETCURSOR, hwnd as usize, lparam);
+                }
+            }
+        }
+
+        fn disarm_mouse(&mut self, hwnd: Option<HWND>, reason: &'static str) {
+            if self.mouse_locked {
+                self.set_mouse_locked(false, hwnd);
+                tracing::info!(reason, "mouse look unlocked");
+            }
+            self.just_locked = false;
+            self.mouse_look.reset();
+            self.mouse_last_poll = None;
+            self.toggle_was_down = false;
+            self.mouse_buttons.reset();
+        }
+
         fn xinput(&mut self, slot: usize) -> Option<PadState> {
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
                 return None;
@@ -1327,6 +1508,131 @@ mod host {
             };
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };
+        }
+
+        fn mouse_pad(&mut self, active: bool) -> PadState {
+            if !mouse_look() || !active {
+                self.disarm_mouse(foreground_window(), "stand-in inactive");
+                return PadState::default();
+            }
+            let Some(hwnd) = foreground_window() else {
+                self.disarm_mouse(None, "focus lost");
+                return PadState::default();
+            };
+
+            let key_down = |vk: i32| {
+                // SAFETY: plain async key state query.
+                unsafe { GetAsyncKeyState(vk) < 0 }
+            };
+
+            // F2 (0x71, layout-independent) toggles mouse-look; Esc or P opens
+            // the pause menu and frees the mouse so the user is never trapped.
+            let toggle_down = key_down(0x71) || key_down(0xC0);
+            if toggle_down && !self.toggle_was_down {
+                let next = !self.mouse_locked;
+                self.set_mouse_locked(next, Some(hwnd));
+                self.just_locked = next;
+                self.user_unlocked = !next;
+                self.mouse_look.reset();
+                tracing::info!(locked = next, "mouse look toggled");
+            }
+            self.toggle_was_down = toggle_down;
+
+            if self.mouse_locked && (key_down(0x1B) || key_down(i32::from(b'P'))) {
+                self.set_mouse_locked(false, Some(hwnd));
+                self.just_locked = false;
+                self.user_unlocked = true;
+                self.mouse_look.reset();
+                tracing::info!("mouse look unlocked (menu key)");
+            }
+
+            // Keep mouse look on whenever the window has focus, unless the
+            // user explicitly unlocked it for a menu.
+            if !self.mouse_locked && !self.user_unlocked {
+                self.set_mouse_locked(true, Some(hwnd));
+                self.just_locked = true;
+                self.mouse_look.reset();
+            }
+
+            let Some((c_left, c_top, c_right, c_bottom)) = client_rect_screen(hwnd) else {
+                self.disarm_mouse(Some(hwnd), "client unavailable");
+                return PadState::default();
+            };
+            let mut pos = POINT::default();
+            // SAFETY: valid pointer to our initialized POINT.
+            if unsafe { GetCursorPos(&mut pos) } == 0 {
+                self.disarm_mouse(Some(hwnd), "cursor query failed");
+                return PadState::default();
+            }
+
+            let now = Instant::now();
+            let dt = self
+                .mouse_last_poll
+                .replace(now)
+                .map_or(POLL, |prev| now.saturating_duration_since(prev));
+
+            let (right_x, right_y) = if self.mouse_locked {
+                let cx = c_left + (c_right - c_left) / 2;
+                let cy = c_top + (c_bottom - c_top) / 2;
+                let (dx, dy) = if self.just_locked {
+                    self.just_locked = false;
+                    if let Some(anchor) = recenter_cursor(cx, cy) {
+                        self.anchor = anchor;
+                    } else {
+                        self.set_mouse_locked(false, Some(hwnd));
+                        self.mouse_look.reset();
+                        tracing::warn!("mouse look unlocked (cursor warp failed)");
+                    }
+                    (0, 0)
+                } else {
+                    let dx = pos.x - self.anchor.0;
+                    let dy = pos.y - self.anchor.1;
+                    if dx != 0 || dy != 0 {
+                        if let Some(anchor) = recenter_cursor(cx, cy) {
+                            self.anchor = anchor;
+                            (dx, dy)
+                        } else {
+                            self.set_mouse_locked(false, Some(hwnd));
+                            self.mouse_look.reset();
+                            tracing::warn!("mouse look unlocked (cursor warp failed)");
+                            (0, 0)
+                        }
+                    } else {
+                        (0, 0)
+                    }
+                };
+                if self.mouse_locked {
+                    self.mouse_look
+                        .step(dx, dy, dt, mouse_sens(), mouse_invert_y())
+                } else {
+                    (0.0, 0.0)
+                }
+            } else {
+                self.mouse_look.reset();
+                (0.0, 0.0)
+            };
+
+            let in_client =
+                (c_left..c_right).contains(&pos.x) && (c_top..c_bottom).contains(&pos.y);
+            let [lmb, rmb, mmb] = self.mouse_buttons.update(
+                [key_down(0x01), key_down(0x02), key_down(0x04)],
+                self.mouse_locked || in_client,
+            );
+            let mut pad = PadState {
+                right_x,
+                right_y,
+                ..Default::default()
+            };
+            if lmb {
+                pad.right_trigger = 1.0; // LMB: fire / attack
+            }
+            if rmb {
+                pad.left_trigger = 1.0; // RMB: aim
+            }
+            if mmb {
+                pad.buttons |= RIGHT_STICK; // MMB: look behind / special
+            }
+            pad
         }
     }
 
@@ -1439,14 +1745,56 @@ mod host {
             .collect()
     }
 
-    /// The foreground window is one of ours (the title's or our fallback).
-    fn focused() -> bool {
+    /// The foreground window if it belongs to our process.
+    fn foreground_window() -> Option<HWND> {
         let mut process = 0;
         // SAFETY: plain queries; a null window gives process 0.
         unsafe {
-            GetWindowThreadProcessId(GetForegroundWindow(), &mut process);
-            process == GetCurrentProcessId()
+            let hwnd = GetForegroundWindow();
+            if hwnd.is_null() {
+                return None;
+            }
+            GetWindowThreadProcessId(hwnd, &mut process);
+            (process == GetCurrentProcessId()).then_some(hwnd)
         }
+    }
+
+    /// The foreground window is one of ours (the title's or our fallback).
+    fn focused() -> bool {
+        foreground_window().is_some()
+    }
+
+    /// Recenters the cursor at `(cx, cy)` and reads back its actual screen
+    /// position so fractional DPI scaling never introduces phantom drift.
+    /// Returns `None` if either Win32 call fails.
+    fn recenter_cursor(cx: i32, cy: i32) -> Option<(i32, i32)> {
+        // SAFETY: recenters the cursor inside our own foreground window.
+        if unsafe { SetCursorPos(cx, cy) } == 0 {
+            return None;
+        }
+        let mut settled = POINT::default();
+        // SAFETY: valid pointer to our initialized POINT.
+        if unsafe { GetCursorPos(&mut settled) } == 0 {
+            return None;
+        }
+        Some((settled.x, settled.y))
+    }
+
+    /// Client area in screen coordinates directly from Win32 `GetWindowInfo`.
+    fn client_rect_screen(hwnd: HWND) -> Option<(i32, i32, i32, i32)> {
+        let mut info = WINDOWINFO {
+            cbSize: size_of::<WINDOWINFO>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: valid initialized WINDOWINFO with cbSize set.
+        if unsafe { GetWindowInfo(hwnd, &mut info) } == 0 {
+            return None;
+        }
+        let rc = info.rcClient;
+        if rc.right - rc.left < 64 || rc.bottom - rc.top < 64 {
+            return None;
+        }
+        Some((rc.left, rc.top, rc.right, rc.bottom))
     }
 
     #[test]
@@ -1557,7 +1905,9 @@ mod tests {
     struct FakeHost {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
-        mouse: Option<MouseState>,
+mouse: Option<MouseState>,
+        mouse_pad: PadState,
+        mouse_active_log: Vec<bool>,
         rumble: Vec<(usize, u16, u16)>,
     }
 
@@ -1575,6 +1925,16 @@ mod tests {
         }
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
             self.0.lock().unwrap().rumble.push((slot, low, high));
+        }
+
+        fn mouse_pad(&mut self, active: bool) -> PadState {
+            let mut host = self.0.lock().unwrap();
+            host.mouse_active_log.push(active);
+            if active {
+                host.mouse_pad
+            } else {
+                PadState::default()
+            }
         }
     }
 
@@ -1996,5 +2356,46 @@ mod tests {
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
         assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+    }
+
+    #[test]
+    fn mouse_pad_merges_into_the_stand_in_pad_and_is_disarmed_with_a_pad() {
+        let (hub, host) = fake_with(true);
+        {
+            let mut h = host.lock().unwrap();
+            h.keys = vec![key(b'W')];
+            h.mouse_pad = PadState {
+                buttons: RIGHT_STICK,
+                left_trigger: 1.0,
+                right_trigger: 1.0,
+                right_x: 0.75,
+                right_y: -0.25,
+                ..Default::default()
+            };
+        }
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        let got = pad(r);
+        assert_eq!(got.buttons, RIGHT_STICK);
+        assert_eq!(
+            (
+                got.left_y,
+                got.left_trigger,
+                got.right_trigger,
+                got.right_x,
+                got.right_y,
+            ),
+            (1.0, 1.0, 1.0, 0.75, -0.25)
+        );
+        release(r);
+
+        let (hub, host) = fake_with(false);
+        host.lock().unwrap().pads[0] = Some(PadState { buttons: A, ..Default::default() });
+        hub.poll();
+        assert_eq!(host.lock().unwrap().mouse_active_log.last(), Some(&false));
+
+        host.lock().unwrap().pads[0] = None;
+        hub.poll();
+        assert_eq!(host.lock().unwrap().mouse_active_log.last(), Some(&true));
     }
 }

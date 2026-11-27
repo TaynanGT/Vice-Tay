@@ -580,8 +580,28 @@ pub(crate) fn retire<T: 'static>(object: T) {
     retired().push_back((started, Retired::Any(Box::new(object))));
 }
 
+/// Whether list-translation worker threads accumulate retired `ID3D12Resource`s
+/// in a thread-local batch (`VICTORY_BATCH_RETIRE=1`, opt-in, off by default;
+/// `VICTORY_AB` can flip it live in `diagnostics` builds).
+fn batch_retire_enabled() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_BATCH_RETIRE") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| parse_batch_retire_switch(std::env::var("VICTORY_BATCH_RETIRE").ok().as_deref()))
+}
+
+fn parse_batch_retire_switch(raw: Option<&str>) -> bool {
+    raw.is_some_and(|v| v.trim() == "1")
+}
+
 /// [`retire`] for a resource.
 pub(crate) fn retire_resource(object: ID3D12Resource) {
+    retire_resource_with(object, batch_retire_enabled());
+}
+
+fn retire_resource_with(object: ID3D12Resource, batch_on: bool) {
     let queued = crate::queue::queued();
     let started = STARTED.load(Ordering::Acquire) + queued;
     if bury_lag() == 0 && started <= FINISHED.load(Ordering::Acquire) {
@@ -590,7 +610,269 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    retired().push_back((started, Retired::Resource(object)));
+    let mut entry = Some((started, Retired::Resource(object)));
+    if !batch_on {
+        // Flush any buffered entries left over if toggled off mid-run.
+        flush_retired();
+        if let Some(back) = entry {
+            retired().push_back(back);
+        }
+        return;
+    }
+    let flush = BATCH.try_with(|b| {
+        let taken = entry.take().expect("entry present");
+        let mut guard = b.borrow_mut();
+        let target = guard.eligible.then_some(&mut guard.entries);
+        into_batch(target, taken, BATCH_MOST)
+    });
+    match flush {
+        Ok(Err(back)) => retired().push_back(back),
+        Ok(Ok(true)) => flush_retired(),
+        Ok(Ok(false)) => {}
+        Err(_) => {
+            if let Some(back) = entry {
+                retired().push_back(back);
+            }
+        }
+    }
+}
+
+/// Pushes `entry` into the thread's batch if enabled; returns `Ok(true)` once
+/// the batch reaches `most` and should be handed over, or `Err(entry)` if the
+/// thread is not batching.
+fn into_batch<T>(batch: Option<&mut Vec<T>>, entry: T, most: usize) -> Result<bool, T> {
+    match batch {
+        Some(batch) => {
+            batch.push(entry);
+            Ok(batch.len() >= most)
+        }
+        None => Err(entry),
+    }
+}
+
+/// Number of retired resources a worker thread accumulates before handing them
+/// over to [`RETIRED`] in one lock acquisition (after voidopcode/vilocity
+/// `4315c77`).
+const BATCH_MOST: usize = 256;
+
+/// Thread-local retired resource batch that flushes any remaining entries on
+/// thread exit so retired D3D12 objects are never dropped prematurely.
+struct RetiredBatch {
+    eligible: bool,
+    entries: Vec<(u64, Retired)>,
+}
+
+impl Drop for RetiredBatch {
+    fn drop(&mut self) {
+        if !self.entries.is_empty() {
+            retired().extend(self.entries.drain(..));
+        }
+    }
+}
+
+thread_local! {
+    /// Resources retired on this thread and not yet handed to [`RETIRED`]
+    /// ([`retire_in_batches`]).
+    static BATCH: std::cell::RefCell<RetiredBatch> = const {
+        std::cell::RefCell::new(RetiredBatch { eligible: false, entries: Vec::new() })
+    };
+}
+
+/// Marks the calling thread as eligible for opt-in thread-local batching in
+/// [`retire_resource`] (`VICTORY_BATCH_RETIRE=1`). Idempotent: calling it
+/// repeatedly never discards already-buffered entries.
+///
+/// Worker threads translating command lists retire thousands of replaced view
+/// resources per frame; accumulating up to [`BATCH_MOST`] items and flushing
+/// at recording boundaries amortizes lock acquisitions on [`RETIRED`] while
+/// preserving retirement ordering (an entry handed over later can only be
+/// dropped later, never sooner).
+pub(crate) fn retire_in_batches() {
+    let _ = BATCH.try_with(|b| {
+        let mut guard = b.borrow_mut();
+        if !guard.eligible {
+            guard.eligible = true;
+            if guard.entries.capacity() < BATCH_MOST {
+                let need = BATCH_MOST.saturating_sub(guard.entries.len());
+                guard.entries.reserve(need);
+            }
+        }
+    });
+}
+
+/// Hands over every resource retired on this thread since the last flush
+/// ([`retire_in_batches`]).
+pub(crate) fn flush_retired() {
+    let _ = BATCH.try_with(|b| {
+        let mut guard = b.borrow_mut();
+        if !guard.entries.is_empty() {
+            retired().extend(guard.entries.drain(..));
+        }
+    });
+}
+
+#[cfg(test)]
+mod retire_batch_tests {
+    use super::*;
+
+    #[test]
+    fn batch_retire_switch_defaults_off_and_accepts_only_one() {
+        assert!(!parse_batch_retire_switch(None));
+        assert!(!parse_batch_retire_switch(Some("0")));
+        assert!(!parse_batch_retire_switch(Some("")));
+        assert!(!parse_batch_retire_switch(Some("false")));
+        assert!(!parse_batch_retire_switch(Some("2")));
+        assert!(parse_batch_retire_switch(Some("1")));
+        assert!(parse_batch_retire_switch(Some(" 1 ")));
+    }
+
+    #[test]
+    fn a_thread_without_a_batch_keeps_nothing_and_a_full_batch_signals_flush() {
+        assert_eq!(into_batch(None, 7, 2), Err(7));
+        let mut batch = Vec::new();
+        assert_eq!(into_batch(Some(&mut batch), 7, 2), Ok(false));
+        assert_eq!(into_batch(Some(&mut batch), 8, 2), Ok(true));
+        assert_eq!(batch, [7, 8]);
+    }
+
+    #[test]
+    fn batched_retirement_off_hands_over_immediately_and_flushes_leftovers() {
+        let Some(host) = host() else {
+            return;
+        };
+        let prev_started = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                retire_in_batches();
+                let (b1, _) = host.upload_buffer(256).expect("upload buffer");
+                retire_resource_with(b1, false);
+                assert_eq!(BATCH.with(|b| b.borrow().entries.len()), 0, "off mode never buffers");
+
+                // Buffer 3 entries while on, then toggle off: leftovers must flush immediately.
+                for _ in 0..3 {
+                    let (b, _) = host.upload_buffer(256).expect("upload buffer");
+                    retire_resource_with(b, true);
+                }
+                assert_eq!(BATCH.with(|b| b.borrow().entries.len()), 3);
+                let (b4, _) = host.upload_buffer(256).expect("upload buffer");
+                retire_resource_with(b4, false);
+                assert_eq!(BATCH.with(|b| b.borrow().entries.len()), 0, "toggling off flushes buffered entries");
+            });
+        });
+        bury(prev_started.saturating_add(bury_lag()));
+        assert_eq!(host.log_messages(), None);
+    }
+
+    #[test]
+    fn retire_in_batches_is_idempotent_with_buffered_entries() {
+        let Some(host) = host() else {
+            return;
+        };
+        let prev_started = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                retire_in_batches();
+                for _ in 0..5 {
+                    let (buf, _) = host.upload_buffer(256).expect("upload buffer");
+                    retire_resource_with(buf, true);
+                }
+                assert_eq!(BATCH.with(|b| b.borrow().entries.len()), 5);
+                // Calling retire_in_batches again must keep buffered entries intact.
+                retire_in_batches();
+                assert_eq!(BATCH.with(|b| b.borrow().entries.len()), 5);
+                flush_retired();
+                assert_eq!(BATCH.with(|b| b.borrow().entries.len()), 0);
+            });
+        });
+        bury(prev_started.saturating_add(bury_lag()));
+        assert_eq!(host.log_messages(), None);
+    }
+
+    #[test]
+    fn batched_resource_retirement_flushes_concurrently_without_losing_entries() {
+        let Some(host) = host() else {
+            return;
+        };
+        const THREADS: usize = 4;
+        const PER_THREAD: usize = 300; // exceeds BATCH_MOST (256) to exercise auto-flush + tail flush
+        let before = RETIREMENTS[1].load(Ordering::Relaxed);
+        let prev_started = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
+        std::thread::scope(|s| {
+            for t in 0..THREADS {
+                s.spawn(move || {
+                    retire_in_batches();
+                    for _ in 0..PER_THREAD {
+                        let (buf, _) = host.upload_buffer(256).expect("upload buffer");
+                        retire_resource_with(buf, true);
+                    }
+                    // Explicitly flush half the threads; let the others exercise RetiredBatch::drop.
+                    if t % 2 == 0 {
+                        flush_retired();
+                    }
+                });
+            }
+        });
+        let queued_now = RETIREMENTS[1].load(Ordering::Relaxed) - before;
+        assert!(
+            queued_now >= (THREADS * PER_THREAD) as u64,
+            "expected at least {} queued retirements, got {queued_now}",
+            THREADS * PER_THREAD
+        );
+        bury(prev_started.saturating_add(bury_lag()));
+        assert_eq!(host.log_messages(), None);
+    }
+
+    #[test]
+    fn batched_retirement_preserves_resource_lifetime_until_bury_on_gpu() {
+        struct SendResource(ID3D12Resource);
+        // SAFETY: D3D12 resources are free-threaded (same invariant as `Retired`).
+        unsafe impl Send for SendResource {}
+
+        let Some(host) = host() else {
+            return;
+        };
+        let stamp = STARTED.fetch_add(1, Ordering::AcqRel) + 1 + crate::queue::queued();
+        let (buf_explicit, _) = host.upload_buffer(256).expect("upload buffer");
+        let probe_explicit = buf_explicit.clone();
+        let (buf_drop, _) = host.upload_buffer(256).expect("upload buffer");
+        let probe_drop = buf_drop.clone();
+        assert_eq!(references(&probe_explicit), 2);
+        assert_eq!(references(&probe_drop), 2);
+        let send_explicit = SendResource(buf_explicit);
+        let send_drop = SendResource(buf_drop);
+
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                let SendResource(buf) = send_explicit;
+                let probe = buf.clone();
+                retire_in_batches();
+                retire_resource_with(buf, true);
+                assert_eq!(BATCH.with(|b| b.borrow().entries.len()), 1);
+                assert!(references(&probe) >= 3, "buffered entry dropped early");
+                drop(probe);
+                flush_retired();
+                assert_eq!(BATCH.with(|b| b.borrow().entries.len()), 0);
+            });
+            s.spawn(move || {
+                let SendResource(buf) = send_drop;
+                retire_in_batches();
+                retire_resource_with(buf, true);
+                assert_eq!(BATCH.with(|b| b.borrow().entries.len()), 1);
+                // Intentionally exit without flush_retired() to exercise RetiredBatch::drop.
+            });
+        });
+
+        // Both resources must remain alive in RETIRED before their stamped submission finishes.
+        bury(stamp.saturating_sub(1).saturating_add(bury_lag()));
+        assert!(references(&probe_explicit) >= 2, "explicitly flushed resource dropped before bury");
+        assert!(references(&probe_drop) >= 2, "drop-flushed resource dropped before bury");
+
+        // Once the stamped submission plus bury_lag finishes, both must be released.
+        bury(stamp.saturating_add(bury_lag()));
+        assert_eq!(references(&probe_explicit), 1, "explicitly flushed resource leaked after bury");
+        assert_eq!(references(&probe_drop), 1, "drop-flushed resource leaked after bury");
+        assert_eq!(host.log_messages(), None);
+    }
 }
 
 /// How many submissions later than it could (the last one that may use it

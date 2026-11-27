@@ -30,7 +30,7 @@ use windows::core::{GUID, HRESULT, IUnknown, Interface};
 const BLOCK: u64 = 64 << 20;
 /// Blocks with nothing in them that are kept.
 const SPARE: usize = 2;
-/// The same while the card has room ([`room`]): 4 GiB of them.
+/// The same while the card has room ([`room_with`]): 4 GiB of them.
 const SPARE_KEPT: usize = 64;
 /// The same of blocks of staging buffers, which are the PC's memory: run
 /// crash-1 held 5.2 GB of them.
@@ -40,27 +40,54 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 
 /// Sets how many empty blocks stay, by the card's memory (budget and use):
 /// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
-/// Asked once a second.
-pub(crate) fn room(memory: Option<[u64; 4]>) {
+/// Also trims aged empty 64 MiB staging blocks (system RAM) above
+/// `policy.staging_pool_warm_blocks`. Asked once a second.
+pub(crate) fn room_with(
+    memory: Option<[u64; 4]>,
+    policy: &crate::ram_trim::TrimPolicy,
+    tick: u64,
+) {
     let pressure = crate::residency::pressured();
     let limit = spares(memory, crate::host::keep_freed() && !pressure);
     SPARES.store(limit, Ordering::Relaxed);
-    let tick = now();
     // A full pool can become idle while another subsystem needs the VRAM.
     // A busy allocator observes the new limit on its next allocation or tick.
-    if let Ok(mut pool) = TEXTURES.try_lock() {
-        pool.reclaim(tick, limit, true);
-    }
-    if let Ok(mut pool) = STAGING.try_lock() {
-        let staging_limit = if crate::residency::critical_commit() {
-            0
-        } else if pressure {
-            1
+    let dropped_textures = if let Ok(mut pool) = TEXTURES.try_lock() {
+        pool.reclaim(tick, limit, true)
+    } else {
+        Vec::new()
+    };
+    drop(dropped_textures);
+
+    let dropped_staging = if let Ok(mut pool) = STAGING.try_lock() {
+        if policy.trim_staging {
+            let hard_limit = if crate::residency::critical_commit() || policy.panic_memory {
+                0
+            } else if pressure {
+                1
+            } else {
+                limit
+            };
+            let mut gone = pool.reclaim(tick, hard_limit, true);
+            let warm_limit = policy.staging_pool_warm_blocks.min(hard_limit);
+            gone.extend(pool.reclaim_aged(tick, warm_limit, policy.pool_idle_ms, policy.panic_memory));
+            gone
         } else {
-            limit
-        };
-        pool.reclaim(tick, staging_limit, true);
-    }
+            let staging_limit = if crate::residency::critical_commit() {
+                0
+            } else if pressure {
+                1
+            } else {
+                limit
+            };
+            pool.reclaim(tick, staging_limit, true)
+        }
+    } else {
+        Vec::new()
+    };
+    let freed_blocks = dropped_staging.len() as u64;
+    drop(dropped_staging);
+    crate::ram_trim::note_pool_trimmed(freed_blocks * BLOCK);
 }
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
@@ -119,7 +146,7 @@ impl Ripe {
 
     fn now() -> Ripe {
         let (started, finished) = crate::host::submissions();
-        // Not more than are kept ([`room`]): they would go and be made again.
+        // Not more than are kept ([`room_with`]): they would go and be made again.
         Ripe { started, finished, ahead: ahead().min(SPARES.load(Ordering::Relaxed)) }
     }
 
@@ -192,6 +219,8 @@ struct Block<B> {
     /// When that was (ms).
     #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     since: u64,
+    /// When this block became completely empty (`0` while any piece is taken).
+    emptied_ms: u64,
 }
 
 struct Pool<B> {
@@ -274,6 +303,7 @@ impl<B: Clone> Pool<B> {
             }
         }
         let block = self.blocks[i].as_mut()?;
+        block.emptied_ms = 0;
         let again = start < block.used_to;
         block.used_to = block.used_to.max(start + len);
         Some((Piece { block: i, start, len }, block.memory.clone(), again))
@@ -298,7 +328,15 @@ impl<B: Clone> Pool<B> {
                 self.blocks.len() - 1
             }
         };
-        self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made, since: crate::host::now_ms() });
+        let now = crate::host::now_ms();
+        self.blocks[i] = Some(Block {
+            memory,
+            free: Ranges::new(BLOCK),
+            used_to: 0,
+            made,
+            since: now,
+            emptied_ms: now,
+        });
         i
     }
 
@@ -309,10 +347,10 @@ impl<B: Clone> Pool<B> {
     /// Makes the pieces that rested long enough free, and lets go of empty
     /// blocks past [`SPARE`].
     fn rested(&mut self, now: u64) {
-        self.reclaim(now, SPARES.load(Ordering::Relaxed), false);
+        let _ = self.reclaim(now, SPARES.load(Ordering::Relaxed), false);
     }
 
-    fn reclaim(&mut self, now: u64, limit: usize, sweep: bool) {
+    fn drain_rested(&mut self, now: u64) -> bool {
         let mut any = false;
         while let Some(&(ready, piece)) = self.resting.front()
             && ready <= now
@@ -320,23 +358,69 @@ impl<B: Clone> Pool<B> {
             self.resting.pop_front();
             if let Some(block) = self.blocks[piece.block].as_mut() {
                 block.free.give(piece.start, piece.len);
-                any |= block.free.whole(BLOCK);
+                if block.free.whole(BLOCK) {
+                    if block.emptied_ms == 0 {
+                        block.emptied_ms = now;
+                    }
+                    any = true;
+                }
             }
         }
+        any
+    }
+
+    fn reclaim(&mut self, now: u64, limit: usize, sweep: bool) -> Vec<Block<B>> {
+        let any = self.drain_rested(now);
         // (Without a piece given back too, once there is less room.)
         let most = limit.min(self.most);
         let previous = std::mem::replace(&mut self.spare, most);
+        let mut gone = Vec::new();
         if sweep || any || most < previous {
             let mut spare = 0;
             for block in &mut self.blocks {
                 if block.as_ref().is_some_and(|b| b.free.whole(BLOCK)) {
                     spare += 1;
-                    if spare > most {
-                        *block = None;
+                    if spare > most
+                        && let Some(evicted) = block.take()
+                    {
+                        gone.push(evicted);
                     }
                 }
             }
         }
+        gone
+    }
+
+    /// Reclaims empty blocks that have sat unused for at least `idle_ms` above
+    /// `warm_limit` (or all empty blocks above `warm_limit` when `force`),
+    /// returning them so callers can release OS/D3D12 allocations outside locks.
+    fn reclaim_aged(&mut self, now: u64, warm_limit: usize, idle_ms: u64, force: bool) -> Vec<Block<B>> {
+        let _ = self.drain_rested(now);
+        let keep = warm_limit.min(self.most);
+        // Sort empty blocks newest-first by `emptied_ms` so hot recently emptied
+        // blocks stay warm while oldest idle blocks are reclaimed first.
+        let mut empty: Vec<(u64, usize)> = self
+            .blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| {
+                let b = slot.as_ref()?;
+                b.free.whole(BLOCK).then_some((b.emptied_ms, i))
+            })
+            .collect();
+        if empty.len() <= keep {
+            return Vec::new();
+        }
+        empty.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let mut gone = Vec::new();
+        for (emptied_ms, i) in empty.into_iter().skip(keep) {
+            if (force || now.saturating_sub(emptied_ms) >= idle_ms)
+                && let Some(evicted) = self.blocks[i].take()
+            {
+                gone.push(evicted);
+            }
+        }
+        gone
     }
 
     fn blocks(&self) -> usize {
@@ -951,5 +1035,35 @@ mod tests {
         assert_eq!(spares_for(Some([100 * gib, 74 * gib, 0, 0]), true, 75), SPARE_KEPT);
         assert_eq!(spares_for(Some([100 * gib, 75 * gib, 0, 0]), true, 75), SPARE);
         assert_eq!(spares_for(Some([100 * gib, 10 * gib, 0, 0]), false, 85), SPARE);
+    }
+
+    #[test]
+    fn aged_empty_staging_blocks_reclaim_past_warm_limit() {
+        let mut pool: Pool<u32> = Pool::new(STAGING_KEPT);
+        // One busy block (must never be evicted).
+        let (held, _, _) = pool.take(BLOCK / 2, 1, 100, || Some(1)).unwrap();
+        // Three empty blocks: two old (`emptied_ms = 1_000`, `2_000`), one fresh (`20_000`).
+        for (id, ts) in [(2u32, 1_000u64), (3, 2_000), (4, 20_000)] {
+            let idx = pool.add(id, 0);
+            pool.blocks[idx].as_mut().unwrap().emptied_ms = ts;
+        }
+        assert_eq!(pool.blocks(), 4);
+
+        // At `now = 21_000`, `warm_limit = 1`, `idle_ms = 10_000`:
+        // newest empty block (id 4, ts 20_000) stays warm; ids 2 and 3 (aged 20s/19s) drop;
+        // busy block (id 1) stays intact.
+        let gone = pool.reclaim_aged(21_000, 1, 10_000, false);
+        assert_eq!(gone.len(), 2);
+        assert_eq!(pool.blocks(), 2);
+        let live_ids: Vec<u32> = pool.blocks.iter().flatten().map(|b| b.memory).collect();
+        assert!(live_ids.contains(&1));
+        assert!(live_ids.contains(&4));
+
+        // Force mode drops the remaining empty block too, still leaving busy block 1 intact.
+        let forced = pool.reclaim_aged(21_000, 0, 10_000, true);
+        assert_eq!(forced.len(), 1);
+        assert_eq!(forced[0].memory, 4);
+        assert_eq!(pool.blocks(), 1);
+        let _ = held;
     }
 }

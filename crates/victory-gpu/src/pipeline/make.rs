@@ -57,7 +57,7 @@ pub(crate) struct Pending {
 fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
     shaders
         .iter()
-        .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
+        .any(|s| s.stage == "compute" && s.with_container(|bytes| bytes.windows(name.len()).any(|w| w == name)))
 }
 
 fn left_out(shaders: &[Arc<Shader>], skip_hashes: &[String]) -> Option<&'static str> {
@@ -914,14 +914,7 @@ mod tests {
     }
 
     fn compute_shader(hash: &str) -> Arc<Shader> {
-        Arc::new(Shader {
-            stage: "compute",
-            hash: hash.to_owned(),
-            container: Vec::new(),
-            ambient: None,
-            probe: None,
-            translated: OnceLock::from(None),
-        })
+        Shader::test_stub("compute", hash)
     }
 
     fn head_map_pipeline(wait: bool) -> Pending {

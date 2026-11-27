@@ -144,6 +144,8 @@ When comparing warm-up times, `warm --used --batch-size 80` tests longer batches
 `warm --used --normal-priority` tests normal worker priority. Change one option
 at a time. The defaults are 40 pipelines per worker process and idle priority.
 
+The opening's head blend-shape map starts compiling when its pipeline is created. Its first dispatch waits for the compiler's result so the character's skin setup can run. Set `VICTORY_HEAD_MAP_WAIT=0` for the ordinary pipeline schedule and wait budget.
+
 </details>
 
 <details>

@@ -47,6 +47,8 @@ pub(crate) struct Pending {
     screen: bool,
     /// Confirmed first-scene / bake producer prepared early even on a cold cache.
     scene_input: bool,
+    /// The title dispatches this head blend-shape map only once.
+    head_map: bool,
     /// Why this pipeline is intentionally skipped (e.g. RT resolve without BVH).
     left_out: Option<&'static str>,
 }
@@ -104,6 +106,14 @@ fn scene_input(shaders: &[Arc<Shader>]) -> bool {
     })
 }
 
+/// Losing this producer leaves eyes and teeth without the surrounding skin.
+/// See avatarmanz/VIctory-7900XTX #166.
+fn head_map(shaders: &[Arc<Shader>]) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAD_MAP_WAIT").is_none_or(|value| value != "0"))
+        && matches!(shaders, [shader] if shader.stage == "compute" && shader.hash == "61e54e90adccaf6a")
+}
+
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
 // elements point into its own names) is only read after creation.
 unsafe impl Send for Pending {}
@@ -126,7 +136,8 @@ impl Pending {
             key.update(s.hash.as_bytes());
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
-        let scene_input = scene_input(&shaders);
+        let head_map = graphics.is_none() && head_map(&shaders);
+        let scene_input = head_map || scene_input(&shaders);
         let screen = (graphics.as_ref().is_some_and(|g| g.screen_pass())
             && shaders.iter().all(|s| s.stage != "mesh"))
             || scene_input;
@@ -134,6 +145,7 @@ impl Pending {
         Pending {
             screen,
             scene_input,
+            head_map,
             left_out,
             shaders,
             graphics,
@@ -241,9 +253,13 @@ pub(crate) fn waiting() -> u64 {
     WAITING.load(Ordering::Relaxed)
 }
 
-/// The host pipeline if it is made (or is made within the frame's budget);
-/// queues it on first use.
-pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+/// Queue the host pipeline on first use and wait within the frame budget.
+/// The head-map dispatch waits for completion because its work runs once.
+pub(crate) fn ready(p: &Arc<Pending>, dispatch: bool) -> Option<&HostPipeline> {
+    ready_with(p, dispatch, |p| wait(p, crate::frame::current()))
+}
+
+fn ready_with(p: &Arc<Pending>, dispatch: bool, wait_for_frame: impl FnOnce(&Pending)) -> Option<&HostPipeline> {
     if p.left_out.is_some() {
         return None;
     }
@@ -252,9 +268,28 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
     }
-    if p.made.get().is_none() {
+    let already_ready = p.made.get().is_some();
+    if dispatch && p.head_map {
+        let began = Instant::now();
+        if !already_ready {
+            start(p, REQUESTED);
+        }
+        // start has released the queue lock. The worker publishes both failure
+        // and success through made, which wakes every caller waiting here.
+        let made = p.made.wait();
+        tracing::info!(
+            frame = crate::frame::current(),
+            key = p.key,
+            already_ready,
+            host_pipeline = made.is_some(),
+            wait_ms = began.elapsed().as_secs_f64() * 1e3,
+            "head blend-shape map pipeline at dispatch"
+        );
+        return made.as_ref();
+    }
+    if !already_ready {
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        wait_for_frame(p);
     }
     p.made.get()?.as_ref()
 }
@@ -411,7 +446,7 @@ impl Queue {
     /// Queues an unrequested pipeline or promotes one queued at creation.
     /// Returns whether it is new to the queue, or `None` if nothing changed.
     fn push(&mut self, p: &Arc<Pending>, priority: u8) -> Option<bool> {
-        self.push_as(p, priority, slow_limit() != usize::MAX && super::library::slow(&p.key))
+        self.push_as(p, priority, priority == EARLY && slow_limit() != usize::MAX && super::library::slow(&p.key))
     }
 
     fn push_as(&mut self, p: &Arc<Pending>, priority: u8, slow: bool) -> Option<bool> {
@@ -420,7 +455,9 @@ impl Queue {
             return None;
         }
         p.queue_state.store(priority, Ordering::Relaxed);
-        if priority == REQUESTED && p.screen && screens_first() {
+        if priority == REQUESTED && p.head_map {
+            self.screen.push_front(p.clone());
+        } else if priority == REQUESTED && p.screen && screens_first() {
             self.screen.push_back(p.clone());
         } else if priority == REQUESTED {
             self.requested.push_back(p.clone());
@@ -638,7 +675,7 @@ mod tests {
     #[test]
     fn first_use_is_made_by_a_worker() {
         let p = Arc::new(Pending::new(Vec::new(), None));
-        assert!(ready(&p).is_none());
+        assert!(ready(&p, false).is_none());
         assert_ne!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
         let started = Instant::now();
         while p.made.get().is_none() && started.elapsed() < Duration::from_secs(10) {
@@ -656,7 +693,7 @@ mod tests {
         let p = Arc::new(p);
 
         assert!(!super::super::library::wanted_early(&p.key));
-        assert!(ready(&p).is_none());
+        assert!(ready(&p, false).is_none());
         assert!(p.made.get().is_none());
         assert!(super::super::library::wanted_early(&p.key));
     }
@@ -723,6 +760,46 @@ mod tests {
     }
 
     #[test]
+    fn a_head_map_is_next_for_a_screen_worker() {
+        let mut screen = Pending::new(Vec::new(), None);
+        screen.screen = true;
+        let screen = Arc::new(screen);
+        let mut head = Pending::new(Vec::new(), None);
+        head.head_map = true;
+        let head = Arc::new(head);
+        let mut queue = Queue::new();
+        assert_eq!(queue.push(&screen, REQUESTED), Some(true));
+        assert_eq!(queue.push(&head, REQUESTED), Some(true));
+        assert_eq!(queue.push(&head, REQUESTED), None);
+        assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &head));
+    }
+
+    #[test]
+    fn head_map_dispatch_bypasses_the_frame_budget_and_wakes_on_driver_failure() {
+        let mut head = Pending::new(Vec::new(), None);
+        head.head_map = true;
+        head.queue_state.store(MAKING, Ordering::Relaxed);
+        head.used.store(true, Ordering::Relaxed);
+        let head = Arc::new(head);
+
+        std::thread::scope(|scope| {
+            let (entered, began) = std::sync::mpsc::channel();
+            let (finished, result) = std::sync::mpsc::channel();
+            let pending = &head;
+            scope.spawn(move || {
+                entered.send(()).unwrap();
+                let ready = ready_with(pending, true, |_| panic!("ordinary frame budget used"));
+                finished.send(ready.is_none() && pending.made.get().is_some()).unwrap();
+            });
+            began.recv().unwrap();
+            let first = result.recv_timeout(Duration::from_millis(25));
+            head.make_with(|| None);
+            assert_eq!(first, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+            assert_eq!(result.recv_timeout(Duration::from_secs(1)), Ok(true));
+        });
+    }
+
+    #[test]
     fn skipped_hash_leaves_pipeline_unqueued_and_unmatched_queues_normally() {
         let shader = |hash: &str| {
             Arc::new(Shader {
@@ -743,7 +820,7 @@ mod tests {
         ));
         assert_eq!(skipped.left_out, Some("skipped by VICTORY_SKIP_PIPELINES"));
         early(&skipped);
-        assert!(ready(&skipped).is_none());
+        assert!(ready(&skipped, false).is_none());
         assert_eq!(skipped.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
         assert!(skipped.made.get().is_none());
         #[cfg(feature = "diagnostics")]
@@ -758,7 +835,7 @@ mod tests {
             &skips,
         ));
         assert_eq!(normal.left_out, None);
-        assert!(ready(&normal).is_none());
+        assert!(ready(&normal, false).is_none());
         assert_ne!(normal.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
         let started = Instant::now();
         while normal.made.get().is_none() && started.elapsed() < Duration::from_secs(10) {

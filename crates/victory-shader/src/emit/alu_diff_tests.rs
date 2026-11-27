@@ -20,6 +20,7 @@ use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
 use crate::{io, ir, resource, structure};
+use windows::Win32::Graphics::Direct3D12::{ID3D12PipelineState, ID3D12RootSignature};
 
 // ---------------------------------------------------------------------------
 // Encodings (RDNA2 ISA, chapter 13: microcode formats).
@@ -89,14 +90,14 @@ const fn buffer_store_dword(vdata: u32, srsrc: u32, byte_off: u32) -> [u32; 2] {
 const OUTS: [u32; 3] = [0, 5, 6];
 
 /// A one-thread compute shader: 4 root constants in `s0..s3` (copied to
-/// `v1..v4`), `body`, then [`OUTS`] stored. `None` with the stage that
-/// refused it.
-fn build(body: &[u32]) -> Result<HostShader, String> {
+/// `v1..v4`), `body`, then [`OUTS`] stored; with the wave size it declares
+/// (`WaveSize`), if any. `Err` names the stage that refused it.
+fn build(body: &[u32]) -> Result<(HostShader, Option<u32>), String> {
     build_for(body, 1)
 }
 
 /// [`build`] for groups of `threads` threads.
-fn build_for(body: &[u32], threads: u32) -> Result<HostShader, String> {
+fn build_for(body: &[u32], threads: u32) -> Result<(HostShader, Option<u32>), String> {
     let mut words = vec![sop1(0x03, 5, ZERO)]; // s_mov_b32 s5, 0: the table at s[4:5]
     words.extend(s_load_dwordx4(8, 4));
     for i in 0..4u16 {
@@ -167,6 +168,7 @@ fn build_for(body: &[u32], threads: u32) -> Result<HostShader, String> {
         mesh_stride: 0,
     })
     .map_err(|e| format!("lower: {e:?}"))?;
+    let wave_size = lowered.wave_size;
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
@@ -183,7 +185,7 @@ fn build_for(body: &[u32], threads: u32) -> Result<HostShader, String> {
         v.validate(&mut copy)
             .map_err(|e| format!("DXIL validation: {e}"))?;
     }
-    Ok(shader)
+    Ok((shader, wave_size))
 }
 
 // ---------------------------------------------------------------------------
@@ -270,22 +272,27 @@ fn scc_to_v5() -> [u32; 2] {
     [sop2(0x0A, 17, ONE, ZERO), vop1(0x01, 5, s(17))]
 }
 
-fn sop2_case(
-    name: &str,
-    op: u32,
-    f: fn(u32, u32, bool) -> (u32, Option<bool>),
-    inputs: Inputs,
-) -> Case {
-    // SCC in from d (s3 == 1), for the ops that read it.
+/// `op s16, s0, s1` with SCC set beforehand from `s3 == 1` (the carry in
+/// of the ops that read it); the result into `v0`, SCC into `v5`.
+fn sop2_body(op: u32) -> Vec<u32> {
     let mut body = vec![
         sopc(0x06, s(3), ONE),
         sop2(op, 16, s(0), s(1)),
         vop1(0x01, 0, s(16)),
     ];
     body.extend(scc_to_v5());
+    body
+}
+
+fn sop2_case(
+    name: &str,
+    op: u32,
+    f: fn(u32, u32, bool) -> (u32, Option<bool>),
+    inputs: Inputs,
+) -> Case {
     Case {
         name: name.into(),
-        body,
+        body: sop2_body(op),
         model: Box::new(move |i| {
             let (r, scc) = f(i[0], i[1], i[3] == 1);
             // An op that writes no SCC leaves the one set beforehand.
@@ -414,7 +421,9 @@ fn sopc_case(name: &str, op: u32, wide: bool, f: fn(u64, u64) -> bool) -> Case {
     }
 }
 
-fn sopk_case(name: &str, op: u32, imm: u16, f: fn(u32, u16) -> (u32, Option<bool>)) -> Case {
+/// `s16 = s0; op s16, imm` with SCC set beforehand from `s3 == 1`; the
+/// result into `v0`, SCC into `v5`.
+fn sopk_body(op: u32, imm: u16) -> Vec<u32> {
     let mut body = vec![
         sop1(0x03, 16, s(0)),
         sopc(0x06, s(3), ONE),
@@ -422,9 +431,13 @@ fn sopk_case(name: &str, op: u32, imm: u16, f: fn(u32, u16) -> (u32, Option<bool
         vop1(0x01, 0, s(16)),
     ];
     body.extend(scc_to_v5());
+    body
+}
+
+fn sopk_case(name: &str, op: u32, imm: u16, f: fn(u32, u16) -> (u32, Option<bool>)) -> Case {
     Case {
         name: format!("{name} {imm:#06x}"),
-        body,
+        body: sopk_body(op, imm),
         model: Box::new(move |i| {
             let (r, scc) = f(i[0], imm);
             w2(r, scc.unwrap_or(i[3] == 1))
@@ -1704,7 +1717,77 @@ const DOUBLES: [f64; 16] = [
     4294967295.5, 4294967296.0, 1.0e300, f64::INFINITY, f64::NAN,
 ];
 
+/// Runs `case` (translated to `shader`) on `host` for each of `inputs`,
+/// adding what differs from the model to `wrong`; the number of runs.
+fn check(
+    label: &str,
+    host: &Host,
+    pipeline: &(ID3D12RootSignature, ID3D12PipelineState),
+    shader: &HostShader,
+    case: &Case,
+    inputs: &[[u32; 4]],
+    wrong: &mut Vec<String>,
+) -> usize {
+    let (root, pso) = pipeline;
+    let mut shown = 0;
+    for set in inputs {
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match (u.root, u.slot) {
+                (RootType::Constants, 0) => set[u.dword as usize],
+                (RootType::Table, 1) => 0,
+                other => panic!("unexpected user data {other:?}"),
+            };
+        }
+        let out = host
+            .dispatch(
+                root,
+                pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(4)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label} {}: dispatch failed: {e}", case.name));
+        let want = (case.model)(*set);
+        for (k, w) in want.iter().enumerate() {
+            let Some(w) = *w else { continue };
+            let got = out[0][k];
+            if !meets(got, w) {
+                if shown < 3 {
+                    let what = match w {
+                        NAN32 => "a NaN".to_string(),
+                        NAN16 => "a half NaN".to_string(),
+                        (mask, value) => format!("{:#010x} (mask {mask:#010x})", value & mask),
+                    };
+                    wrong.push(format!(
+                        "{label} {}: inputs {:08x?}: output {k} is {got:#010x}, the ISA gives {what}",
+                        case.name, set
+                    ));
+                }
+                shown += 1;
+            }
+        }
+    }
+    if shown > 3 {
+        wrong.push(format!(
+            "{label} {}: {} more wrong input sets",
+            case.name,
+            shown - 3
+        ));
+    }
+    inputs.len()
+}
+
 /// Runs `cases` on the hardware adapter and WARP; the wrong results, said.
+///
+/// A case whose program declares a wave size (code that reads a lane mask
+/// as a number declares the console's 32 lanes) runs on the hardware only:
+/// WARP refuses a fixed `WaveSize` at pipeline creation. Where WARP is the
+/// only device (CI runners), such a case is listed as run nowhere, not as
+/// wrong. Any other pipeline failure is wrong.
 fn run(title: &str, cases: &[Case]) -> Vec<String> {
     let rounds = std::env::var("VICTORY_ALU_DIFF_ROUNDS")
         .ok()
@@ -1727,10 +1810,11 @@ fn run(title: &str, cases: &[Case]) -> Vec<String> {
     assert!(!hosts.is_empty(), "no SM 6.6 device");
     let mut refused = Vec::new();
     let mut skipped = Vec::new();
+    let mut nowhere = Vec::new();
     let mut wrong: Vec<String> = Vec::new();
     let mut ran = 0usize;
     for case in cases {
-        let shader = match build(&case.body) {
+        let (shader, wave_size) = match build(&case.body) {
             Ok(s) => s,
             Err(e) => {
                 refused.push(format!("{}: {e}", case.name));
@@ -1738,12 +1822,11 @@ fn run(title: &str, cases: &[Case]) -> Vec<String> {
             }
         };
         let inputs = input_sets(case.inputs, rounds);
+        let mut made = false;
         for (label, host) in &hosts {
-            let (root, pso) = match host.compute_pipeline(&shader) {
+            let pipeline = match host.compute_pipeline(&shader) {
                 Ok(p) => p,
-                // WARP refuses some programs the hardware takes (those that
-                // need a wave of 32 lanes); the hardware's run is the check.
-                Err(e) if *label == "warp" && hosts.len() > 1 => {
+                Err(e) if *label == "warp" && wave_size.is_some() => {
                     skipped.push(format!("{}: {}", case.name, e.trim()));
                     continue;
                 }
@@ -1752,63 +1835,20 @@ fn run(title: &str, cases: &[Case]) -> Vec<String> {
                     continue;
                 }
             };
-            let mut shown = 0;
-            for set in &inputs {
-                let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
-                for u in &shader.user_data {
-                    ud[u.index as usize] = match (u.root, u.slot) {
-                        (RootType::Constants, 0) => set[u.dword as usize],
-                        (RootType::Table, 1) => 0,
-                        other => panic!("unexpected user data {other:?}"),
-                    };
-                }
-                let out = host
-                    .dispatch(
-                        &root,
-                        &pso,
-                        &Dispatch {
-                            roots: vec![(0, Root::Constants(ud))],
-                            views: &[View::RawUav(4)],
-                            samplers: &[],
-                            groups: [1, 1, 1],
-                        },
-                    )
-                    .unwrap_or_else(|e| panic!("{label} {}: dispatch failed: {e}", case.name));
-                ran += 1;
-                let want = (case.model)(*set);
-                for (k, w) in want.iter().enumerate() {
-                    let Some(w) = *w else { continue };
-                    let got = out[0][k];
-                    if !meets(got, w) {
-                        if shown < 3 {
-                            let what = match w {
-                                NAN32 => "a NaN".to_string(),
-                                NAN16 => "a half NaN".to_string(),
-                                (mask, value) => format!("{:#010x} (mask {mask:#010x})", value & mask),
-                            };
-                            wrong.push(format!(
-                                "{label} {}: inputs {:08x?}: output {k} is {got:#010x}, the ISA gives {what}",
-                                case.name, set
-                            ));
-                        }
-                        shown += 1;
-                    }
-                }
-            }
-            if shown > 3 {
-                wrong.push(format!(
-                    "{label} {}: {} more wrong input sets",
-                    case.name,
-                    shown - 3
-                ));
-            }
+            made = true;
+            ran += check(label, host, &pipeline, &shader, case, &inputs, &mut wrong);
+        }
+        if !made && wave_size.is_some() {
+            nowhere.push(case.name.clone());
         }
     }
     eprintln!(
-        "{title}: {} cases, {ran} runs, {} refused by the translator, {} not made on WARP, {} wrong",
+        "{title}: {} cases, {ran} runs, {} refused by the translator, {} not made on WARP \
+         (fixed wave size), {} run on no device, {} wrong",
         cases.len(),
         refused.len(),
         skipped.len(),
+        nowhere.len(),
         wrong.len()
     );
     for r in &refused {
@@ -1816,6 +1856,9 @@ fn run(title: &str, cases: &[Case]) -> Vec<String> {
     }
     for r in &skipped {
         eprintln!("not on WARP: {r}");
+    }
+    if !nowhere.is_empty() {
+        eprintln!("run on no device (no hardware adapter): {}", nowhere.join(", "));
     }
     for w in &wrong {
         eprintln!("wrong: {w}");
@@ -1827,6 +1870,104 @@ fn run(title: &str, cases: &[Case]) -> Vec<String> {
 fn integer_alu_matches_the_isa_on_the_host_gpu_and_warp() {
     let wrong = run("integer ALU", &cases());
     assert!(wrong.is_empty(), "{} wrong results (see above)", wrong.len());
+}
+
+/// One scalar op checked against a table of `(s0, s1, result, scc)` rows,
+/// each run twice, SCC set beforehand to 0 and to 1: SCC must be written,
+/// not left as it was. Only on WARP, which every Windows machine (and CI
+/// runner) has: these programs declare no wave size, so it must make them.
+fn on_warp(name: &str, body: Vec<u32>, rows: &[(u32, u32, u32, bool)]) {
+    let rows = rows.to_vec();
+    let inputs: Vec<[u32; 4]> = rows
+        .iter()
+        .flat_map(|&(a, b, ..)| [[a, b, 0, 0], [a, b, 0, 1]])
+        .collect();
+    let case = Case {
+        name: name.into(),
+        body,
+        model: Box::new(move |i| {
+            let &(.., r, scc) = rows
+                .iter()
+                .find(|row| (row.0, row.1) == (i[0], i[1]))
+                .expect("a row for the inputs");
+            w2(r, scc)
+        }),
+        inputs: Inputs::Any,
+    };
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let host = Host::new(true).expect("an SM 6.6 WARP device");
+    let (shader, wave_size) = build(&case.body).unwrap_or_else(|e| panic!("{name}: {e}"));
+    assert_eq!(wave_size, None, "{name}: the program declares a wave size");
+    let pipeline = host
+        .compute_pipeline(&shader)
+        .unwrap_or_else(|e| panic!("warp {name}: no pipeline ({e})"));
+    let mut wrong = Vec::new();
+    let ran = check("warp", &host, &pipeline, &shader, &case, &inputs, &mut wrong);
+    assert_eq!(ran, inputs.len());
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// `s_lshl{1..4}_add_u32`: SCC is the carry out of `(S0 << n) + S1` taken
+/// in 64 bits, so bits shifted out of the top count as well as the add's own
+/// carry. Each table has rows where that differs from "the result is not
+/// zero", which the lowering gave before.
+#[test]
+fn scalar_shift_add_scc_is_the_64_bit_carry_on_warp() {
+    #[rustfmt::skip]
+    let tables: [(u32, &[(u32, u32, u32, bool)]); 4] = [
+        (0x2E, &[
+            (0, 1, 1, false),                     // no carry, non-zero result
+            (0x8000_0000, 0, 0, true),            // a bit shifted out, zero result
+            (0x4000_0000, 0x8000_0000, 0, true),  // the add's carry, zero result
+            (1, 0xFFFF_FFFF, 1, true),            // the add's carry, non-zero result
+            (0, 0, 0, false),
+        ]),
+        (0x2F, &[
+            (0x2000_0000, 7, 0x8000_0007, false),
+            (0x4000_0000, 3, 3, true),            // a bit shifted out
+            (0x3FFF_FFFF, 4, 0, true),            // the add's carry
+        ]),
+        (0x30, &[
+            (0x1000_0000, 0, 0x8000_0000, false),
+            (0x1FFF_FFFF, 8, 0, true),            // the add's carry
+            (0x2000_0000, 1, 1, true),            // a bit shifted out
+        ]),
+        (0x31, &[
+            (0x0800_0000, 5, 0x8000_0005, false),
+            (0x1000_0000, 0, 0, true),            // a bit shifted out
+            (0x0FFF_FFFF, 0x10, 0, true),         // the add's carry
+        ]),
+    ];
+    for (n, (op, rows)) in (1..).zip(tables) {
+        on_warp(&format!("s_lshl{n}_add_u32"), sop2_body(op), rows);
+    }
+}
+
+/// `s_add_i32`, `s_sub_i32` and `s_addk_i32`: SCC is the signed overflow
+/// (the ISA's pseudocode), which is neither the unsigned carry nor "the
+/// result is not zero"; reading it was refused before.
+#[test]
+fn signed_scalar_add_scc_is_the_overflow_on_warp() {
+    on_warp("s_add_i32", sop2_body(0x02), &[
+        (0x7FFF_FFFF, 1, 0x8000_0000, true),
+        (0x8000_0000, 0xFFFF_FFFF, 0x7FFF_FFFF, true),
+        (0x8000_0000, 0x8000_0000, 0, true),
+        (0xFFFF_FFFF, 1, 0, false),               // an unsigned carry only
+        (1, 1, 2, false),
+    ]);
+    on_warp("s_sub_i32", sop2_body(0x03), &[
+        (0x8000_0000, 1, 0x7FFF_FFFF, true),
+        (0x7FFF_FFFF, 0xFFFF_FFFF, 0x8000_0000, true),
+        (0, 1, 0xFFFF_FFFF, false),               // an unsigned borrow only
+        (5, 5, 0, false),
+    ]);
+    on_warp("s_addk_i32 0x8000", sopk_body(0x0F, 0x8000), &[
+        (0x8000_0000, 0, 0x7FFF_8000, true),      // + -32768
+        (0x0000_8000, 0, 0, false),
+        (0x7FFF_FFFF, 0, 0x7FFF_7FFF, false),     // an unsigned carry only
+    ]);
 }
 
 // ---------------------------------------------------------------------------
@@ -2096,7 +2237,7 @@ fn bench_f16_rounding_cost() {
     let inputs = [0x3E00_3C00u32, 0x3A00_3400, 0x3C00_3E00, 0x1400_1C00];
     for nearest in [false, true] {
         super::lower::TEST_F16_NEAREST.set(Some(nearest));
-        let shader = build_for(&body, THREADS).expect("the loop translates");
+        let (shader, _) = build_for(&body, THREADS).expect("the loop translates");
         super::lower::TEST_F16_NEAREST.set(None);
         let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
         let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];

@@ -13,13 +13,14 @@ where there is one; the default is the behaviour described.
   screen while the title runs; the picture is stretched to either. DXGI's own
   Alt+Enter, which would make the swap chain exclusive full screen, is turned off.
 - **Settings for an RTX 4090 / Ryzen 9 9950X3D / 48 GB** (`scripts\play.ps1
-  -Machine 4090`; `-Machine auto` uses the same NVIDIA memory and rendering
-  settings with worker counts sized to the CPU; `-Machine laptop` for 16 GB of RAM,
+  -Machine 4090`; `-Machine auto` uses the same NVIDIA rendering settings with
+  worker counts sized to the CPU and, for a card of 10 to 19 GB, the memory
+  settings of `-Machine 4070` or `4070tisuper`; `-Machine laptop` for 16 GB of RAM,
   [laptop-16gb.md](laptop-16gb.md); `-Machine 3060` for a six-core desktop with
   16 GB, [rtx3060-16gb.md](rtx3060-16gb.md); `-Machine 4070tisuper` for a 16 GB
   card and eight cores, measured on an RTX 5080 in
-  [rtx5080-16gb.md](rtx5080-16gb.md), and named by the launcher when `auto` meets
-  an NVIDIA card under 20 GB): the thread counts and switches
+  [rtx5080-16gb.md](rtx5080-16gb.md), which also lists what `auto` adds by the
+  card and the CPU): the thread counts and switches
   `scripts\play.ps1` sets. `-Safe` keeps the wave-wide list there: without it four
   wave64 programs do not translate on a 32-lane card and their draws are dropped.
 - **A performance panel** in the top-left corner (diagnostics builds; on by

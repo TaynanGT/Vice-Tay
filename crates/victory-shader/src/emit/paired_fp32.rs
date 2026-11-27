@@ -250,9 +250,14 @@ impl Lower<'_> {
             return Ok(false);
         }
         let refused = |why| unsupported(code[start].machine.offset, why);
-        if !std::env::var_os("VICTORY_WAVE_PAIRS_FP32")
-            .is_some_and(|mode| mode == "non-ieee-rne-ftz")
-        {
+        // The mode is confirmed by `VICTORY_WAVE_PAIRS_FP32=non-ieee-rne-ftz`, or, unset, for the
+        // programs paired by default (their MODE writes were checked: see `mode_change_touches_fp32`).
+        let mode = std::env::var_os("VICTORY_WAVE_PAIRS_FP32");
+        let confirmed = match &mode {
+            Some(mode) => mode == "non-ieee-rne-ftz",
+            None => super::super::paired_by_default_here(),
+        };
+        if !confirmed {
             return Err(refused(
                 "paired FP32 reduction requires a confirmed non-IEEE RNE/FTZ guest mode",
             ));

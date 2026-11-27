@@ -560,8 +560,56 @@ fn wave_wide_routes(
 /// separated; unset or empty: none) names this container: it is tried in the paired wave64
 /// form first (fxceless/victory-fork #1397; for 5dc3b25986622949 and 6f225b641c5b0708).
 fn wave_pairs_listed(input: &[u8]) -> bool {
-    let list = std::env::var_os("VICTORY_WAVE_PAIRS_ONLY");
-    list.as_deref().is_some_and(|l| !l.is_empty()) && container_listed(list.as_deref(), input)
+    match std::env::var_os("VICTORY_WAVE_PAIRS_ONLY") {
+        Some(list) if list == "none" || list == "0" => false,
+        Some(list) if !list.is_empty() => container_listed(Some(&list), input),
+        _ => paired_by_default(input),
+    }
+}
+
+/// The compute programs that take the paired wave64 form unless `VICTORY_WAVE_PAIRS_ONLY`
+/// names others (`none`: no program). On hosts of 32-lane waves these programs' wave-wide
+/// sums, first-lane reads and LDS shared within a console wave are exact only in the paired
+/// form; the other forms left the picture visibly wrong, each checked in game:
+/// - the shadow mask, `CS_ShadowRenderTiled*` (18 programs): whole 16x16 tiles black or lit
+///   (stair-stepped shadows on the ground and squares on characters);
+/// - the water's transmission volumetrics, `CS_TransmissionVolumetrics_Tiled`,
+///   `_Tiled_LocalLights` and `_Submerged`: dark blocks on open water and a broken view under
+///   water;
+/// - the atmospheric diffusion and its depth scan, `CS_GatherDiffusion`, `CS_ScanMip0..3`, with
+///   `CS_DeferredFallbacksAlpha_SkyProbe` and `CS_TemporalResolve2_Opaque_FrameStatistics`: a
+///   halo around dark silhouettes against the sky.
+/// Together they cost about 0.1 ms of card time a frame (a timing run on an RTX 4090).
+const DEFAULT_WAVE_PAIRS_HASHES: [&str; 28] = [
+    // shadow mask
+    "191ecaed66eea3b1", "1d44a723bdebbf27", "20b78ee12ecdb57d", "240cb516c1af0bc3",
+    "31d703207b51549a", "466ec41d3f9d24c0", "56f3bf2d9388e5a7", "65de113e23fa4fdd",
+    "804b342cb4b9d1e9", "922e1d0ee1e19a85", "ab5455fc6abb804f", "abd7a22106898c66",
+    "b4b0427232707598", "be6ce5d849d51127", "ce79e9eba7ae0348", "d7db57731ada919b",
+    "f133e35efed2a48a", "fa0bd10a35bfef3c",
+    // water
+    "5dc3b25986622949", "6f225b641c5b0708", "926c46bab3b86bd6",
+    // diffusion / sky
+    "ce2378e5e8711aad", "b7953a05b189dfc1", "71883e40620a567a",
+    "3c196d81eca7ff15", "acf14a70f37fb012", "f79824724d8e2daf", "f0aa2b1e79275592",
+];
+
+/// Whether `input` is one of [`DEFAULT_WAVE_PAIRS_HASHES`].
+fn paired_by_default(input: &[u8]) -> bool {
+    let digest = blake3::hash(input).to_hex();
+    DEFAULT_WAVE_PAIRS_HASHES.contains(&&digest[..16])
+}
+
+thread_local! {
+    /// The program being translated is paired by default ([`paired_by_default`]): its FP32
+    /// reductions replay with the confirmed guest mode unless `VICTORY_WAVE_PAIRS_FP32` says
+    /// otherwise (`lower::paired_fp32`).
+    static PAIRED_BY_DEFAULT_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// See [`PAIRED_BY_DEFAULT_HERE`].
+pub(crate) fn paired_by_default_here() -> bool {
+    PAIRED_BY_DEFAULT_HERE.get()
 }
 
 /// Translations inside `f` on this thread try the paired wave64 form first when `on`.
@@ -603,7 +651,11 @@ pub fn emit(
         native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32;
     let listed = WAVE_PAIRS_HERE.get() || wave_pairs_listed(c.input);
     if listed && wave32_compute {
-        match paired(c, native, p) {
+        let by_default = std::env::var_os("VICTORY_WAVE_PAIRS_ONLY").is_none() && paired_by_default(c.input);
+        let was = PAIRED_BY_DEFAULT_HERE.replace(by_default);
+        let tried = paired(c, native, p);
+        PAIRED_BY_DEFAULT_HERE.set(was);
+        match tried {
             Ok((shader, Some(32))) => {
                 eprintln!("WAVE64-PAIRS-ONLY translated with paired Wave64");
                 return Ok(shader);

@@ -151,6 +151,12 @@ if ($Machine -eq '7900xtx') {
         # flights: in play on an RTX 5080, 0.7 submissions a frame refused and waited
         # against 0.13, and frames 1.7 ms shorter (docs/rtx5080-16gb.md).
         $settings.VICTORY_PLACED_FILL_REDIRECT = '1'
+        # Large XMemAllocDefault allocations write-watched (#321): the title's 21 MB buffer the
+        # GPU writes every frame was copied and sent up whole each refresh, 21 MB a frame over
+        # the bus. Watched, what its landings put back is told apart (VICTORY_LAND_ECHO) and
+        # nothing of it goes up: on an RTX 4070 Ti with a Ryzen 9 7900X, in the prison cell,
+        # 24.0 -> 24.75 fps and 60 -> 40 MB a frame sent up (docs/rtx4070-performance.md).
+        $settings.VICTORY_WATCH_XMEM_ALLOC = '1'
     }
     if ($autoNvidia -or $Machine -eq 'laptop') {
         $autoAdds = Get-AutoNvidiaSettings $cardGb $coreCount ([bool]$Safe)

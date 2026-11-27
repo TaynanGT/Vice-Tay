@@ -146,3 +146,31 @@ output, about 4 min standing and walking):
 - Peak VRAM 6.8 GB of 10. No device lost.
 - The texture queue held 4,000 to 29,000 slots. Most of them waited for their
   memory (21,264 of 27,116 at the peak), with no pass short of room.
+
+## Large private allocations write-watched (2026-11-27)
+
+An RTX 4070 Ti 12 GB, Ryzen 9 7900X (12 cores), 63 GB, Windows 11 26200; build `aa917f3`, diagnostics, `-Machine 4070`,
+windowed 1920×1080, Series S, with renderer ports 6 and 7 on (#375). The intro is skipped
+(A held), so these runs reach the prison cell sooner and lighter than unskipped runs;
+compare them only with each other. Measured from 100 to 160 s after the loader started.
+
+`VICTORY_WATCH_XMEM_ALLOC=1` (#321) backs large `XMemAllocDefault` allocations with
+write-watched memory. Without it, the title's 21 MB buffer at `+0x1412200`, which the
+GPU writes every frame, was copied whole 1-2 times a frame and sent up whole: 21.05 MB
+up and 21.04 MB fetched a frame, all 321 pieces both ways. With it, nothing of that
+buffer goes up (what its landings put back is recognised, `VICTORY_LAND_ECHO`), and
+the bytes sent up over the bus fell from 60 to 40 MB a frame.
+
+Separate runs, order alternated (on, off, off, on):
+
+| `VICTORY_WATCH_XMEM_ALLOC` | FPS median | slowest quarter | CPU preparation |
+|---|---:|---:|---:|
+| 1 | 25.0 | 24.2 | 29.1 ms |
+| 0 | 23.9 | 23.4 | 32.0 ms |
+| 0 | 24.1 | 23.8 | 30.9 ms |
+| 1 | 24.5 | 24.0 | 30.1 ms |
+
+A further run with the switch on, recorded every 4 s, showed the same picture
+as without it (24.4 fps). #321 measured `preparing` slower with it on Windows
+(RTX 3080, boat scene) before `VICTORY_LAND_ECHO`; here it is 1.4 ms faster.
+The launcher sets it for the NVIDIA presets outside `-Safe`.

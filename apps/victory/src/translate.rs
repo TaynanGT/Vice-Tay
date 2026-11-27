@@ -18,6 +18,7 @@ use victory_shader::{
 use victory_shader::{io, resource};
 
 use crate::shader::{MAX_FILE, Source, scan::FileScan, sources};
+use victory_hle::modules::d3d12x::{self, Precompiled};
 
 #[derive(Default)]
 struct Tally {
@@ -184,6 +185,7 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>, wave: Option<
     let began = std::time::Instant::now();
     let done = Mutex::new(HashSet::new());
     let counts = [const { AtomicUsize::new(0) }; 5];
+    let not_cached = NotCached::default();
     for root in &paths {
         for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
             if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
@@ -213,9 +215,13 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>, wave: Option<
                             if n.is_multiple_of(1000) {
                                 println!("warm-up      {n} shaders so far, {:.0} s", began.elapsed().as_secs_f64());
                             }
-                            let which = match victory_hle::modules::d3d12x::warm_shader(&bytes) {
-                                Ok(true) => 0,
-                                Ok(false) => 1,
+                            let which = match d3d12x::precompile(&bytes) {
+                                Ok(Precompiled::Translated) => 0,
+                                Ok(Precompiled::Cached) => 1,
+                                Ok(Precompiled::NotCached(why)) => {
+                                    not_cached.add(why);
+                                    continue;
+                                }
                                 Err(_) => 2,
                             };
                             counts[which].fetch_add(1, Ordering::Relaxed);
@@ -229,11 +235,34 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>, wave: Option<
     let asked = if all { "all".to_owned() } else { wanted.len().to_string() };
     let stopped = if counts[3].load(Ordering::Relaxed) > 0 { " (stopped at the time limit)" } else { "" };
     println!(
-        "warm-up      {asked} hashes asked, {} found: {translated} translated now, {there} in the cache already, {failed} do not translate; {:.1} s on {threads} threads{stopped}",
-        translated + there + failed,
+        "warm-up      {asked} hashes asked, {} found: {translated} translated now, {there} in the cache already, {failed} do not translate, {} could not be cached; {:.1} s on {threads} threads{stopped}",
+        translated + there + failed + not_cached.count(),
+        not_cached.count(),
         began.elapsed().as_secs_f64()
     );
-    Ok(())
+    not_cached.result()
+}
+
+/// Shaders an offline command translated but could not write to the cache:
+/// a run would translate them again, so the command does not succeed.
+#[derive(Default)]
+struct NotCached(Mutex<(usize, Option<String>)>);
+
+impl NotCached {
+    fn add(&self, why: String) {
+        let mut seen = lock(&self.0);
+        seen.0 += 1;
+        seen.1.get_or_insert(why);
+    }
+    fn count(&self) -> usize {
+        lock(&self.0).0
+    }
+    fn result(self) -> Result<()> {
+        match self.0.into_inner().unwrap_or_else(|e| e.into_inner()) {
+            (n, Some(why)) => anyhow::bail!("could not cache {n} shaders (the first: {why})"),
+            _ => Ok(()),
+        }
+    }
 }
 
 pub fn run(
@@ -466,6 +495,7 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>, list: Option<PathBuf
     let started = std::time::Instant::now();
     let seen = Mutex::new(HashSet::new());
     let done = AtomicUsize::new(0);
+    let not_cached = NotCached::default();
     let failed = Mutex::new(BTreeMap::<String, (usize, String)>::new());
     let lines = Mutex::new(Vec::<String>::new());
     let mut scan = FileScan::new(MAX_FILE, false);
@@ -482,7 +512,14 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>, list: Option<PathBuf
                             if !lock(&seen).insert(hash) {
                                 continue;
                             }
-                            match victory_hle::modules::d3d12x::precompile(&bytes) {
+                            match d3d12x::precompile(&bytes) {
+                                Ok(Precompiled::NotCached(why)) => {
+                                    if list.is_some() {
+                                        let hex = &hash.to_hex()[..16];
+                                        lock(&lines).push(format!("{hex}\t{}{}\tnot cached: {why}", path.display(), job.label()));
+                                    }
+                                    not_cached.add(why);
+                                }
                                 Ok(_) => {
                                     let n = done.fetch_add(1, Ordering::Relaxed) + 1;
                                     if n.is_multiple_of(1000) {
@@ -514,9 +551,10 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>, list: Option<PathBuf
 ")?;
     }
     println!(
-        "{} shaders in the cache, {} do not translate, {:.0} s",
+        "{} shaders in the cache, {} do not translate, {} could not be cached, {:.0} s",
         done.load(Ordering::Relaxed),
         failed.values().map(|f| f.0).sum::<usize>(),
+        not_cached.count(),
         started.elapsed().as_secs_f64()
     );
     let (stale, refreshed, changed) = victory_hle::modules::d3d12x::stale_shaders();
@@ -543,7 +581,7 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>, list: Option<PathBuf
     {
         tracing::warn!(%error, "could not record shader pretranslation");
     }
-    Ok(())
+    not_cached.result()
 }
 
 fn translate(

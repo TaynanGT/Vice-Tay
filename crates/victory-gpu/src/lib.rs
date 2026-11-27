@@ -96,6 +96,18 @@ mod safecopy;
 mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
+
+/// What `victory shaders` made of one shader that translates.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Precompiled {
+    /// Its entry was in the cache already.
+    Cached,
+    /// Translated now and written to the cache.
+    Translated,
+    /// Translated, but not on disk: why (a run would translate it again).
+    NotCached(String),
+}
+
 #[cfg(windows)]
 mod memory;
 #[cfg(windows)]

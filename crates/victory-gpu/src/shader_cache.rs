@@ -19,6 +19,7 @@
 //! The entry is our own encoding of [`HostShader`]: a field added to it
 //! must be added to `encode` and `decode` too, and [`FORMAT`] bumped.
 
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -41,6 +42,12 @@ static STALE: AtomicU64 = AtomicU64::new(0);
 static REFRESHED: AtomicU64 = AtomicU64::new(0);
 static CHANGED: AtomicU64 = AtomicU64::new(0);
 static WRITE_FAILED: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    /// Why this thread's last [`cached_by`] left its translation off disk
+    /// ([`precompile`] reports it; a run uses the translation in memory).
+    static NOT_STORED: RefCell<Option<String>> = const { RefCell::new(None) };
+}
 
 /// The build of the translator (the BLAKE3 of its sources, `build.rs`).
 const SOURCE: &str = env!("VICTORY_TRANSLATOR");
@@ -182,19 +189,25 @@ pub fn precompile_cache_key() -> Option<[u8; 32]> {
 }
 
 /// Puts the translation of `container` into the cache before any title asks
-/// for it (`victory shaders`): whether it was there already, or why it does
-/// not translate. The host is opened first, as a run does: what the card
-/// can do decides the form of some programs.
-pub fn precompile(container: &[u8]) -> Result<bool, String> {
+/// for it (`victory shaders`): whether it was there already or could not be
+/// kept, or why it does not translate. The host is opened first, as a run
+/// does: what the card can do decides the form of some programs.
+pub fn precompile(container: &[u8]) -> Result<crate::Precompiled, String> {
+    use crate::Precompiled;
     let _ = crate::host::host();
     let misses = MISSES.load(Ordering::Relaxed);
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
-    match CACHE.get() {
-        Some(cache) => cached(cache, &build(), container, translate, true)?,
-        None => translate(container)?,
+    let Some(cache) = CACHE.get() else {
+        translate(container)?;
+        return Ok(Precompiled::NotCached("no shader cache".into()));
     };
+    NOT_STORED.take();
+    cached(cache, &build(), container, translate, true)?;
+    if let Some(why) = NOT_STORED.take() {
+        return Ok(Precompiled::NotCached(why));
+    }
     // (Counts other threads' misses too: the caller only adds them up.)
-    Ok(MISSES.load(Ordering::Relaxed) == misses)
+    Ok(if MISSES.load(Ordering::Relaxed) == misses { Precompiled::Cached } else { Precompiled::Translated })
 }
 
 /// The translation of a console shader container, from the cache when
@@ -278,6 +291,7 @@ fn cached_by(
             match entry {
                 Ok(path) => tracing::debug!(path = %path.display(), "shader translated and cached"),
                 Err(error) => {
+                    NOT_STORED.set(Some(format!("{error:#}")));
                     if !WRITE_FAILED.swap(true, Ordering::Relaxed) {
                         tracing::warn!(%error, "shader cache write failed; using the translation in memory");
                     }
@@ -316,6 +330,7 @@ fn cached_by(
         let _ = std::fs::remove_file(&path);
     }
     MISSES.fetch_add(1, Ordering::Relaxed);
+    NOT_STORED.set(Some("the cache entry did not read back".into()));
     (converter.translate)(container)
 }
 
@@ -583,7 +598,9 @@ mod tests {
         std::fs::remove_file(&entries[0]).unwrap();
         std::fs::create_dir(&entries[0]).unwrap();
 
+        NOT_STORED.take();
         assert_eq!(cached(&cache, &build, container, translate, false), Ok(shader()));
+        assert!(NOT_STORED.take().is_some(), "the offline commands are told");
         assert_eq!(runs.load(Ordering::Relaxed), 2);
         assert!(entries[0].is_dir());
         let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());

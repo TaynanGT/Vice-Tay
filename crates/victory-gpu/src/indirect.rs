@@ -977,6 +977,291 @@ void main() {
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
     }
 
+    /// Runs `MASKED_PATCH` + `CopyBufferRegion` (`card.dirty` ordering) +
+    /// `CARD_COMPARE` on either WARP (`software == true`) or the hardware GPU
+    /// (`software == false`), asserting bit-exact byte-mask parity across
+    /// overlapping patches, unaligned runs, sibling flight bytes, and rehash.
+    fn assert_masked_patch_gpu_parity(software: bool) {
+        let Some(mut gpu) = WarpHarness::on(software) else {
+            eprintln!("no D3D12 {} adapter; skipping masked-patch parity test", if software { "WARP" } else { "HW" });
+            return;
+        };
+        let patch = compile_cs(&gpu.device, crate::host::MASKED_PATCH).expect("MASKED_PATCH must compile");
+        let compare = compile_cs(&gpu.device, crate::host::CARD_COMPARE).expect("CARD_COMPARE must compile");
+        const PIECE: usize = 64 << 10;
+        const PIECES: u32 = 2;
+        let size = PIECE * PIECES as usize;
+
+        let (card_buf, card_ptr, card_gpu) = gpu.shared_buffer(size as u64);
+        let (staging_buf, staging_ptr, _) = gpu.shared_buffer(size as u64);
+        let (_hashes, _, hashes_gpu) = gpu.shared_buffer(16 * u64::from(PIECES));
+        let (_differs, differs_ptr, differs_gpu) = gpu.shared_buffer(64);
+
+        let initial: Vec<u8> = (0..size).map(|i| (i.wrapping_mul(19).wrapping_add(i >> 8)) as u8).collect();
+        let mut expected = initial.clone();
+        // Simulate GPU in-flight shader writes in untouched bytes (including
+        // sibling bytes sharing 32-bit dwords with patched title bytes).
+        let mut flight = vec![false; size];
+        for i in (1..size).step_by(5) {
+            expected[i] = 0xEE;
+            flight[i] = true;
+        }
+        // Explicitly mark byte 1 of the second piece's first dword as a flight byte
+        // so it shares a dword with dirty byte `PIECE + 3`.
+        expected[PIECE + 1] = 0xEE;
+        flight[PIECE + 1] = true;
+        // Reserve dwords at offsets 128..140 for explicit sub-dword overlap tests
+        // (newer `card.dirty` overwriting part of a dword already touched by an
+        // earlier masked patch), with byte 135 (byte 3 of dword 132) as a flight byte.
+        for i in 128..140 {
+            expected[i] = initial[i];
+            flight[i] = false;
+        }
+        expected[135] = 0xEE;
+        flight[135] = true;
+        // SAFETY: mappings hold `size` bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(expected.as_ptr(), card_ptr, size);
+            std::ptr::copy_nonoverlapping(initial.as_ptr(), staging_ptr, size);
+        }
+
+        // Pass 1: scattered byte changes across both pieces (including
+        // unaligned runs crossing dword boundaries) where `flight[i]` is false.
+        let mut pass1_title = initial.clone();
+        for i in (0..size).step_by(3) {
+            if !flight[i] && !(128..140).contains(&i) {
+                pass1_title[i] ^= 0x5A;
+            }
+        }
+        // Pass 2: overlapping patch on the SAME dwords (must win over pass 1!).
+        let mut pass2_title = pass1_title.clone();
+        for i in (0..4096).step_by(6) {
+            if !flight[i] && !(128..140).contains(&i) {
+                pass2_title[i] = pass1_title[i].wrapping_add(0x33);
+            }
+        }
+        // Extra byte in dword 0 (offset 2) overlapped by both pass 1 and pass 2,
+        // while byte 0 stays pass 1's 0x12 and byte 1 stays a flight byte (0xEE).
+        pass1_title[0] = 0x12;
+        pass2_title[0] = 0x12;
+        pass1_title[2] = 0x34;
+        pass2_title[2] = 0x78;
+        // Byte at offset 64 patched in pass 1/2 to 0x66, then overridden by a
+        // later `card.dirty` range `(64, 65)` holding 0x99!
+        pass1_title[64] = 0x55;
+        pass2_title[64] = 0x66;
+        // Sub-dword overlap cases within single 32-bit dwords (`128..140`):
+        // - Dword 128..132: earlier masked patch sets bytes 0..=1 ([0x31, 0x32]),
+        //   newer `card.dirty` overwrites bytes 1..=3 ([0xA1, 0xA2, 0xA3]) ->
+        //   byte 0 keeps 0x31, bytes 1..=3 get [0xA1, 0xA2, 0xA3].
+        pass1_title[128] = 0x31;
+        pass1_title[129] = 0x32;
+        pass2_title[128] = 0x31;
+        pass2_title[129] = 0x32;
+        // - Dword 132..136: earlier masked patch sets bytes 0..=1 ([0x41, 0x42]),
+        //   newer `card.dirty` overwrites bytes 1..=2 ([0xB1, 0xB2]), while
+        //   byte 3 (135) preserves untouched in-flight GPU byte 0xEE ->
+        //   [0x41, 0xB1, 0xB2, 0xEE].
+        pass1_title[132] = 0x41;
+        pass1_title[133] = 0x42;
+        pass2_title[132] = 0x41;
+        pass2_title[133] = 0x42;
+        // - Dword 136..140: earlier masked patch sets bytes 1..=3 ([0x51, 0x52, 0x53]),
+        //   newer `card.dirty` overwrites bytes 0..=1 ([0xC0, 0xC1]) ->
+        //   bytes 0..=1 get [0xC0, 0xC1], bytes 2..=3 keep [0x52, 0x53].
+        pass1_title[137] = 0x51;
+        pass1_title[138] = 0x52;
+        pass1_title[139] = 0x53;
+        pass2_title[137] = 0x51;
+        pass2_title[138] = 0x52;
+        pass2_title[139] = 0x53;
+
+        let mut words = Vec::new();
+        let runs1: Vec<(usize, usize)> = {
+            let mut r = Vec::new();
+            let mut i = 0;
+            while i < size {
+                if pass1_title[i] != initial[i] {
+                    let s = i;
+                    while i < size && pass1_title[i] != initial[i] {
+                        i += 1;
+                    }
+                    r.push((s, i - s));
+                } else {
+                    i += 1;
+                }
+            }
+            r
+        };
+        let runs2: Vec<(usize, usize)> = {
+            let mut r = Vec::new();
+            let mut i = 0;
+            while i < size {
+                if pass2_title[i] != pass1_title[i] {
+                    let s = i;
+                    while i < size && pass2_title[i] != pass1_title[i] {
+                        i += 1;
+                    }
+                    r.push((s, i - s));
+                } else {
+                    i += 1;
+                }
+            }
+            r
+        };
+        assert!(runs1.len() > 10_000);
+        assert!(!runs2.is_empty());
+        crate::shadow::patch_words(0, &pass1_title, &runs1, &mut words);
+        crate::shadow::patch_words(0, &pass2_title, &runs2, &mut words);
+        let folded = crate::shadow::folded(words);
+        assert!(!folded.is_empty());
+
+        // Compute CPU reference for masked patches first...
+        for &(r, m) in &runs1 {
+            expected[r..r + m].copy_from_slice(&pass1_title[r..r + m]);
+        }
+        for &(r, m) in &runs2 {
+            expected[r..r + m].copy_from_slice(&pass2_title[r..r + m]);
+        }
+        // ...then apply `card.dirty` overrides:
+        // - offset 64 -> 0x99 (exact single-byte override),
+        // - sub-dword overlaps on dwords 128..132 (`129..132`), 132..136 (`133..135`),
+        //   and 136..140 (`136..138`),
+        // - offset PIECE + 3 -> 0xAB sharing a dword with flight byte PIECE + 1 = 0xEE.
+        let dirty_ranges = [
+            (64usize, 65usize),
+            (129, 132),
+            (133, 135),
+            (136, 138),
+            (PIECE + 3, PIECE + 4),
+        ];
+        expected[64] = 0x99;
+        expected[129..132].copy_from_slice(&[0xA1, 0xA2, 0xA3]);
+        expected[133..135].copy_from_slice(&[0xB1, 0xB2]);
+        expected[136..138].copy_from_slice(&[0xC0, 0xC1]);
+        expected[PIECE + 3] = 0xAB;
+        // SAFETY: staging holds `size` bytes.
+        unsafe {
+            *staging_ptr.add(64) = 0x99;
+            std::ptr::copy_nonoverlapping([0xA1u8, 0xA2, 0xA3].as_ptr(), staging_ptr.add(129), 3);
+            std::ptr::copy_nonoverlapping([0xB1u8, 0xB2].as_ptr(), staging_ptr.add(133), 2);
+            std::ptr::copy_nonoverlapping([0xC0u8, 0xC1].as_ptr(), staging_ptr.add(136), 2);
+            *staging_ptr.add(PIECE + 3) = 0xAB;
+        }
+
+        let (_words_buf, words_ptr, words_gpu) = gpu.shared_buffer((folded.len() * 12).max(16) as u64);
+        // SAFETY: mapping holds `folded.len() * 12` bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(folded.as_ptr().cast::<u8>(), words_ptr, folded.len() * 12);
+        }
+
+        // Execute the exact `Host::card_before` sequence in one list:
+        // 1. `MASKED_PATCH` (COMMON -> UAV -> dispatch -> UAV -> COPY_DEST)
+        // 2. `card.dirty` (`CopyBufferRegion` -> COPY_DEST -> NON_PIXEL_SHADER_RESOURCE)
+        // 3. `CARD_COMPARE` (`mode = 0` store hashes, then `mode = 1` verify 0 diffs)
+        // SAFETY: open list and live buffers.
+        unsafe {
+            gpu.list.ResourceBarrier(&[transition(
+                &card_buf,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )]);
+            gpu.list.SetComputeRootSignature(&patch.root);
+            gpu.list.SetPipelineState(&patch.pso);
+            let constants = [folded.len() as u32, 0u32, 0, 0, 0, 0];
+            gpu.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+            gpu.list.SetComputeRootShaderResourceView(1, words_gpu);
+            gpu.list.SetComputeRootUnorderedAccessView(2, card_gpu);
+            gpu.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+            gpu.list.Dispatch((folded.len() as u32).div_ceil(64), 1, 1);
+            gpu.list.ResourceBarrier(&[transition(
+                &card_buf,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            )]);
+            for &(a, b) in &dirty_ranges {
+                gpu.list.CopyBufferRegion(&card_buf, a as u64, &staging_buf, a as u64, (b - a) as u64);
+            }
+            gpu.list.ResourceBarrier(&[transition(
+                &card_buf,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            )]);
+            // Hash both patched pieces (`mode = 0`).
+            gpu.list.SetComputeRootSignature(&compare.root);
+            gpu.list.SetPipelineState(&compare.pso);
+            let h_const = [0u32, 0, size as u32, PIECES, 0, 0];
+            gpu.list.SetComputeRoot32BitConstants(0, 6, h_const.as_ptr().cast(), 0);
+            gpu.list.SetComputeRootShaderResourceView(1, card_gpu);
+            gpu.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+            gpu.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+            gpu.list.Dispatch(PIECES, 1, 1);
+            gpu.list.ResourceBarrier(&[uav_barrier()]);
+            // Compare immediately (`mode = 1`): both pieces must report 0 diff!
+            let c_const = [0u32, 0, size as u32, PIECES, 0, 1];
+            gpu.list.SetComputeRoot32BitConstants(0, 6, c_const.as_ptr().cast(), 0);
+            gpu.list.Dispatch(PIECES, 1, 1);
+            gpu.list.ResourceBarrier(&[transition(
+                &card_buf,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_COMMON,
+            )]);
+        }
+        gpu.submit_and_wait();
+
+        // SAFETY: GPU finished; `size` bytes mapped.
+        let actual = unsafe { std::slice::from_raw_parts(card_ptr.cast_const(), size) };
+        assert_eq!(actual, &expected[..], "byte-mask + dirty ordering mismatch (software={software})");
+        assert_eq!(actual[0..4], [0x12, 0xEE, 0x78, expected[3]], "overlapping dword 0 parity");
+        assert_eq!(actual[64], 0x99, "card.dirty must override earlier masked patch");
+        assert_eq!(
+            actual[128..132],
+            [0x31, 0xA1, 0xA2, 0xA3],
+            "sub-dword overlap (software={software}): byte 0 keeps earlier patch, bytes 1..=3 take newer dirty"
+        );
+        assert_eq!(
+            actual[132..136],
+            [0x41, 0xB1, 0xB2, 0xEE],
+            "sub-dword overlap (software={software}): byte 0 keeps earlier patch, bytes 1..=2 take newer dirty, byte 3 keeps flight"
+        );
+        assert_eq!(
+            actual[136..140],
+            [0xC0, 0xC1, 0x52, 0x53],
+            "reverse sub-dword overlap (software={software}): bytes 0..=1 take newer dirty, bytes 2..=3 keep earlier patch"
+        );
+        assert_eq!(actual[PIECE + 3], 0xAB, "partial dirty byte must land without clobbering flight byte");
+        assert_eq!(actual[PIECE + 1], 0xEE, "sibling flight byte in dirty dword must stay intact");
+
+        let diffs = [0usize, 1].map(|p| unsafe { differs_ptr.cast::<u32>().add(p).read_volatile() & 1 });
+        assert_eq!(diffs, [0, 0], "rehashed patched pieces must compare clean");
+
+        // Now simulate a post-patch GPU shader write in piece 1 and confirm compare flags it!
+        unsafe { *card_ptr.add(PIECE + 100) ^= 0x80 };
+        unsafe {
+            gpu.list.SetComputeRootSignature(&compare.root);
+            gpu.list.SetPipelineState(&compare.pso);
+            let c_const = [0u32, 0, size as u32, PIECES, 0, 1];
+            gpu.list.SetComputeRoot32BitConstants(0, 6, c_const.as_ptr().cast(), 0);
+            gpu.list.SetComputeRootShaderResourceView(1, card_gpu);
+            gpu.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+            gpu.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+            gpu.list.Dispatch(PIECES, 1, 1);
+        }
+        gpu.submit_and_wait();
+        let diffs_after = [0usize, 1].map(|p| unsafe { differs_ptr.cast::<u32>().add(p).read_volatile() & 1 });
+        assert_eq!(diffs_after, [0, 1], "subsequent shader write after masked patch must be detected");
+    }
+
+    #[test]
+    fn warp_masked_patch_byte_mask_and_dirty_ordering() {
+        assert_masked_patch_gpu_parity(true);
+    }
+
+    #[test]
+    fn hw_masked_patch_byte_mask_and_dirty_ordering() {
+        assert_masked_patch_gpu_parity(false);
+    }
+
     /// What the passes over copies in the card's memory cost on the card
     /// (ignored: a measurement): rounds of a few passes of some pieces and a
     /// wait, as a frame has them. `VICTORY_BENCH_CS=<file>` times another

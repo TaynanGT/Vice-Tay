@@ -31,6 +31,20 @@ const ORIGIN: u32 = 0;
 const TOKEN_ON_TIMEOUT: u32 = 2;
 const SIXTIETH: Duration = Duration::from_micros(16_667);
 
+/// Default pacing interval when the title passes `length == 0`: uses the active
+/// host monitor refresh rate when `VICTORY_VRR=1`, else baseline 60 Hz.
+fn default_interval() -> Duration {
+    static DEFAULT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *DEFAULT.get_or_init(|| {
+        if !crate::display_output::vrr_enabled() {
+            return SIXTIETH;
+        }
+        let interval = crate::display_output::active_refresh_interval().unwrap_or(SIXTIETH);
+        tracing::info!(?interval, "default frame interval from host display (VICTORY_VRR=1)");
+        interval
+    })
+}
+
 /// `VICTORY_FRAME_INTERVAL_MS`: the interval asked for in place of the
 /// title's (zero: no wait). Read once.
 fn asked() -> Option<Duration> {
@@ -78,7 +92,7 @@ pub(crate) extern "system" fn set_interval(
     _flags: u32,
 ) -> HRESULT {
     let asked_by_title = match length {
-        0 => SIXTIETH,
+        0 => default_interval(),
         us => Duration::from_micros(u64::from(us)),
     };
     let interval = asked().unwrap_or(asked_by_title);
@@ -134,7 +148,7 @@ fn next_tick(kind: u32) -> (u64, Duration) {
     let mut clock = clock();
     let c = clock.get_or_insert_with(|| Clock {
         start: Instant::now(),
-        interval: asked().unwrap_or(SIXTIETH),
+        interval: asked().unwrap_or_else(default_interval),
         first: 0,
     });
     if c.interval.is_zero() {

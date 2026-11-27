@@ -216,6 +216,7 @@ static FACTORY_FUNCTIONS: Table<32> = {
 /// A display mode as the console lists it: size, refresh rate (numerator,
 /// denominator), format, scanline order, scaling, flags.
 #[repr(C)]
+#[derive(Clone, Copy, Debug)]
 struct Mode {
     width: u32,
     height: u32,
@@ -227,34 +228,61 @@ struct Mode {
 }
 const _: () = assert!(size_of::<Mode>() == 32);
 
-/// The size of the display the console reports: `VICTORY_DISPLAY_MODE=WxH`
-/// if set (as a console reports the television it is plugged into: a
-/// Series X on a 1080p set lists a 1080p mode), else 3840x2160.
-/// shortcut: not yet the host display's own size by default; make it so
-/// once a title is seen to render for the mode it is given.
-fn display_size() -> (u32, u32) {
-    static SIZE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
+/// Explicit display size override (`VICTORY_DISPLAY_MODE=WxH`), if set.
+fn display_size_override() -> Option<(u32, u32)> {
+    static SIZE: std::sync::OnceLock<Option<(u32, u32)>> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
         let asked = std::env::var("VICTORY_DISPLAY_MODE").ok().and_then(|v| {
             let (w, h) = v.trim().split_once(['x', 'X'])?;
             Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
         });
-        let size = match asked {
-            Some((w, h)) if (640..=7680).contains(&w) && (360..=4320).contains(&h) => (w, h),
-            _ => (3840, 2160),
-        };
-        tracing::info!(width = size.0, height = size.1, "display mode reported to the title");
-        size
+        let valid = asked.filter(|&(w, h)| (640..=7680).contains(&w) && (360..=4320).contains(&h));
+        if let Some((w, h)) = valid {
+            tracing::info!(width = w, height = h, "display mode override (VICTORY_DISPLAY_MODE)");
+        }
+        valid
     })
 }
 
-/// The console's mode list: one 4K mode at 60 Hz (the title looks
-/// for a 120 Hz one to allow 120 Hz frame intervals).
-/// shortcut: fixed mode, not the host display's; report the host's rates if
-/// a title paces by them.
+/// Real progressive display modes supported by the host output when
+/// `VICTORY_VRR=1` is opted in; under baseline default (`VICTORY_VRR=0`),
+/// preserves the single 60 Hz mode (respecting `VICTORY_DISPLAY_MODE`).
+fn host_modes() -> &'static [crate::display_output::RawDisplayMode] {
+    static MODES: std::sync::OnceLock<Vec<crate::display_output::RawDisplayMode>> =
+        std::sync::OnceLock::new();
+    MODES.get_or_init(|| {
+        let override_size = display_size_override();
+        if !crate::display_output::vrr_enabled() {
+            let (width, height) = override_size.unwrap_or((3840, 2160));
+            tracing::info!(width, height, "display mode reported to the title (baseline 60 Hz)");
+            return vec![crate::display_output::RawDisplayMode {
+                width,
+                height,
+                refresh_num: 60,
+                refresh_den: 1,
+            }];
+        }
+        let raw = crate::display_output::enumerate_host_display_modes();
+        let selected = crate::display_output::select_display_modes(&raw, override_size);
+        let max_hz = selected
+            .iter()
+            .map(crate::display_output::RawDisplayMode::rounded_hz)
+            .max()
+            .unwrap_or(60);
+        tracing::info!(
+            count = selected.len(),
+            max_hz,
+            "display modes reported to the title (VICTORY_VRR=1)"
+        );
+        selected
+    })
+}
+
+/// Lists progressive display modes from the host monitor (including high-refresh
+/// rates such as 120/144/180/240 Hz when supported).
 extern "system" fn modes(
     _: This,
-    _format: u32,
+    format: u32,
     _flags: u32,
     count: *mut u32,
     out: *mut Mode,
@@ -263,26 +291,30 @@ extern "system" fn modes(
     let Some(count) = (unsafe { count.as_mut() }) else {
         return E_INVALIDARG;
     };
+    let list = host_modes();
     if out.is_null() {
-        *count = 1;
+        *count = list.len() as u32;
         return S_OK;
     }
-    if *count < 1 {
+    let capacity = *count as usize;
+    let written = capacity.min(list.len());
+    for (i, m) in list.iter().take(written).enumerate() {
+        let mode = Mode {
+            width: m.width,
+            height: m.height,
+            refresh: [m.refresh_num, m.refresh_den],
+            format,
+            scanlines: 1, // progressive
+            scaling: 0,
+            flags: 0,
+        };
+        // SAFETY: `out` is non-null and holds at least `capacity >= written` entries.
+        unsafe { out.add(i).write(mode) };
+    }
+    *count = written as u32;
+    if capacity < list.len() {
         return MORE_DATA;
     }
-    *count = 1;
-    let (width, height) = display_size();
-    let mode = Mode {
-        width,
-        height,
-        refresh: [60, 1],
-        format: 0,
-        scanlines: 1, // progressive
-        scaling: 0,
-        flags: 0,
-    };
-    // SAFETY: checked non-null; room for `count` >= 1 modes.
-    unsafe { out.write(mode) };
     S_OK
 }
 
@@ -358,6 +390,65 @@ mod tests {
             let mut out = object as This;
             assert_eq!(enumerate(object, 1, &mut out), NOT_FOUND, "{method}");
             assert!(out.is_null(), "{method} left a stale output pointer");
+        }
+    }
+
+    #[test]
+    fn output_enumerates_progressive_modes_and_reports_more_data() {
+        type GetModes = extern "system" fn(This, u32, u32, *mut u32, *mut Mode) -> HRESULT;
+        let get_modes = slot::<GetModes>(&OUTPUT_OBJECT, 0xa8);
+
+        // Null count pointer returns E_INVALIDARG.
+        assert_eq!(
+            get_modes(&OUTPUT_OBJECT, 28, 0, std::ptr::null_mut(), std::ptr::null_mut()),
+            E_INVALIDARG
+        );
+
+        // First pass: query count.
+        let mut count = 0u32;
+        assert_eq!(
+            get_modes(&OUTPUT_OBJECT, 28, 0, &mut count, std::ptr::null_mut()),
+            S_OK
+        );
+        assert!(count >= 1, "at least one display mode must be enumerated");
+
+        // Zero-capacity output buffer returns MORE_DATA without writing.
+        let mut zero = 0u32;
+        let mut scratch = std::mem::MaybeUninit::<Mode>::uninit();
+        assert_eq!(
+            get_modes(&OUTPUT_OBJECT, 28, 0, &mut zero, scratch.as_mut_ptr()),
+            MORE_DATA
+        );
+        assert_eq!(zero, 0);
+
+        // Full query succeeds with valid progressive modes and non-zero refresh rates.
+        let mut modes_buf = vec![
+            Mode {
+                width: 0,
+                height: 0,
+                refresh: [0, 0],
+                format: 0,
+                scanlines: 0,
+                scaling: 0,
+                flags: 0,
+            };
+            count as usize
+        ];
+        let mut filled = count;
+        assert_eq!(
+            get_modes(&OUTPUT_OBJECT, 28, 0, &mut filled, modes_buf.as_mut_ptr()),
+            S_OK
+        );
+        assert_eq!(filled, count);
+        for m in &modes_buf {
+            assert!(m.width >= 640 && m.height >= 360, "invalid mode {m:?}");
+            assert!(m.refresh[0] > 0 && m.refresh[1] > 0, "invalid refresh {m:?}");
+            assert_eq!(m.scanlines, 1);
+            assert_eq!(m.format, 28);
+        }
+        if !crate::display_output::vrr_enabled() {
+            assert_eq!(count, 1, "baseline VICTORY_VRR=0 must report single 60 Hz mode");
+            assert_eq!(modes_buf[0].refresh, [60, 1]);
         }
     }
 }

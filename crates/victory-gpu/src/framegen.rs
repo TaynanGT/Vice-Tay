@@ -460,7 +460,7 @@ pub(crate) fn swap_chain(
     queue: &ID3D12CommandQueue,
     device: &ID3D12Device,
     frame: u64,
-) -> Option<IDXGISwapChain3> {
+) -> Option<IDXGISwapChain4> {
     let api = api()?;
     let format = surface_format(desc.Format.0)?;
     let _sdk = SDK.lock().unwrap_or_else(|e| e.into_inner());
@@ -501,12 +501,7 @@ pub(crate) fn swap_chain(
         return None;
     }
     // SAFETY: the SDK's replacement swap chain, which returned one COM reference.
-    let swap = unsafe { IDXGISwapChain4::from_raw(out) };
-    let Ok(swap_chain) = swap.cast::<IDXGISwapChain3>() else {
-        // SAFETY: the new swap chain has no submitted presents.
-        unsafe { (api.destroy)(&mut context, null()) };
-        return None;
-    };
+    let swap_chain = unsafe { IDXGISwapChain4::from_raw(out) };
     state.swap_context = context as usize;
     state.swap_chain = out as usize;
     state.display = [desc.Width, desc.Height];
@@ -931,6 +926,7 @@ pub(crate) fn present(
     frame: u64,
     token: Option<u64>,
     allow_generation: bool,
+    present_flags: DXGI_PRESENT,
 ) -> HRESULT {
     let _sdk = SDK.lock().unwrap_or_else(|e| e.into_inner());
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -967,7 +963,11 @@ pub(crate) fn present(
     // state lock does not have to be held while the proxy paces presentation.
     drop(state);
     // SAFETY: the caller holds the presenter and has submitted the back buffer.
-    let status = unsafe { swap_chain.Present(0, DXGI_PRESENT(0)) };
+    let mut status = unsafe { swap_chain.Present(0, present_flags) };
+    if status == windows::Win32::Graphics::Dxgi::DXGI_ERROR_INVALID_CALL && present_flags.0 != 0 {
+        // SAFETY: fallback without tearing flag if runtime transitioned to fullscreen.
+        status = unsafe { swap_chain.Present(0, DXGI_PRESENT(0)) };
+    }
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(context) = &state.context {
         context.can_generate.store(false, Ordering::Release);

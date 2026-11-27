@@ -42,6 +42,7 @@ mod faultbook;
 mod cores;
 pub mod descriptor;
 pub mod device;
+pub mod display_output;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;

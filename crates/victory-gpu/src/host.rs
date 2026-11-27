@@ -2777,6 +2777,9 @@ struct Deferred {
     back_wanted: Vec<crate::texback::Target>,
     /// Those copies, whose texels go to title memory once the list has run.
     texture_backs: Vec<crate::texback::Back>,
+    /// Title textures whose upload copies read GPU-detiled buffers filled in
+    /// this list's prelude (`crate::gpudetile`), in recorded order.
+    detiles: Vec<std::sync::Arc<crate::texture::Staging>>,
     /// Whether the indirect-work budget is zeroed for this recording (a
     /// step on the CPU, or in the list for the card's copy).
     budget_zeroed: bool,
@@ -6450,7 +6453,7 @@ impl Host {
         for (_run, list) in runs.iter().enumerate() {
             list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
+            if let Some(prelude) = list.prelude(this_submission) {
                 #[cfg(feature = "diagnostics")]
                 marks.push((lists.len(), crate::copystat::Timed::Prelude));
                 lists.push(Some(prelude));
@@ -7529,7 +7532,10 @@ impl HostList {
     /// states become those the list ends with. For depth textures with a
     /// colour twin it first copies the side the list uses as it finds it
     /// from the other, if a list submitted earlier left it behind.
-    fn prelude(&self) -> Option<ID3D12CommandList> {
+    fn prelude(&self, submission: u64) -> Option<ID3D12CommandList> {
+        // GPU-detiled textures for this list's copies (`crate::gpudetile`),
+        // snapshotted before locking `states`/`twins`; deduplicated per submission.
+        let detiles: Vec<_> = self.deferred().detiles.clone();
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
@@ -7590,7 +7596,8 @@ impl HostList {
             (real != *first)
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
-        if barriers.is_empty() && syncs.is_empty() {
+        let need_detile = detiles.iter().any(|s| s.needs_detile(submission));
+        if barriers.is_empty() && syncs.is_empty() && !need_detile {
             return None;
         }
         self.prelude
@@ -7607,6 +7614,10 @@ impl HostList {
                         }
                         if !barriers.is_empty() {
                             list.ResourceBarrier(&barriers);
+                        }
+                        // Buffer-only compute passes: texture states transitioned above stay intact.
+                        for staging in &detiles {
+                            staging.record_detile(list, submission);
                         }
                         list.Close()
                     })
@@ -7679,7 +7690,8 @@ impl HostList {
                 && deferred.textures.is_empty()
                 && deferred.writes.is_empty()
                 && deferred.backs.is_empty()
-                && deferred.texture_backs.is_empty())
+                && deferred.texture_backs.is_empty()
+                && deferred.detiles.is_empty())
             {
                 return false;
             }
@@ -8204,6 +8216,12 @@ impl HostList {
     /// submitted, keeping it alive until the list is reset.
     pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
         self.deferred().copies.push(Step::Texture(staging));
+    }
+
+    /// Marks a GPU-detiled texture staging so this list's prelude records its
+    /// compute detiling pass before the list's `CopyTextureRegion` commands.
+    pub(crate) fn detile_first(&self, staging: std::sync::Arc<crate::texture::Staging>) {
+        self.deferred().detiles.push(staging);
     }
 
     /// A copy source owned exclusively by this list until reset after its
@@ -10134,6 +10152,7 @@ impl Meter {
                          hold still (the runtime remapping it); the rest is reading, hashing and detiling"
                     );
                 }
+                crate::gpudetile::meter_line(frames);
                 let [through, left, filled, short] =
                     [0, 1, 2, 3].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
                 if through + left + filled > 0.0 {

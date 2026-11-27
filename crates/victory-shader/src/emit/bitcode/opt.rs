@@ -61,14 +61,17 @@ pub const FIRST: u32 = 32;
 /// the yard's frame replayed turn by turn, dispatches and draws 18.47 -> 18.45
 /// ms (12 loops) and 18.23 -> 18.16 (5 loops): the driver joins the loads.
 pub const WIDE: u32 = 64;
+/// Whole-function sparse conditional known-bits, `exec`-predicate correlation,
+/// bitfield collapse, and backward demanded-bits optimization (`dataflow.rs`).
+pub const DATAFLOW: u32 = 512;
 /// The passes over the module.
-pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
+pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS | DATAFLOW;
 /// Every pass.
 pub const ALL: u32 = MODULE | FIRST | WIDE;
-/// The passes that run when nothing says which: every one but [`WIDE`],
-/// which no card has shown a gain for yet (`VICTORY_SHADER_OPT=127` asks
-/// for it).
-pub const DEFAULT: u32 = ALL & !WIDE;
+/// The passes that run when nothing says which: every one except [`WIDE`] and
+/// opt-in [`DATAFLOW`] (`VICTORY_SHADER_OPT=575` enables `DATAFLOW` alongside
+/// the default passes; `VICTORY_SHADER_OPT=639` enables every pass with `WIDE`).
+pub const DEFAULT: u32 = ALL & !(WIDE | DATAFLOW);
 
 /// What the instructions a module writes use, of the features a shader
 /// declares by flag (the validator's "flags must match usage").
@@ -105,16 +108,18 @@ enum Key {
 
 /// The blocks reached from the entry, each after the blocks that dominate
 /// it, and each block's children in the dominator tree.
-struct Tree {
-    order: Vec<usize>,
-    children: Vec<Vec<usize>>,
+pub(super) struct Tree {
+    pub(super) order: Vec<usize>,
+    pub(super) children: Vec<Vec<usize>>,
     /// Per block: the reached blocks that branch to it, once per edge.
-    preds: Vec<Vec<usize>>,
+    pub(super) preds: Vec<Vec<usize>>,
+    /// Immediate dominator per block (`usize::MAX` if unreachable; `0` for entry).
+    pub(super) idom: Vec<usize>,
 }
 
 /// The comparison that holds exactly when `p` does not (floats 0-15,
 /// integers 32-41).
-fn opposite(p: u8) -> u8 {
+pub(super) fn opposite(p: u8) -> u8 {
     match p {
         0..=15 => 15 - p,
         pred::EQ => pred::NE,
@@ -145,12 +150,12 @@ struct Learned {
     compares: Vec<(u8, V, V)>,
 }
 
-fn mask(bits: u32) -> u64 {
+pub(super) fn mask(bits: u32) -> u64 {
     if bits >= 64 { !0 } else { (1 << bits) - 1 }
 }
 
 /// `x` of `bits` bits as a signed number.
-fn signed(bits: u32, x: u64) -> i64 {
+pub(super) fn signed(bits: u32, x: u64) -> i64 {
     if bits < 64 && x >> (bits - 1) & 1 != 0 {
         (x | !mask(bits)) as i64
     } else {
@@ -159,7 +164,7 @@ fn signed(bits: u32, x: u64) -> i64 {
 }
 
 /// What `v` stands for after the replacements so far.
-fn resolve(repl: &[Option<V>], mut v: V) -> V {
+pub(super) fn resolve(repl: &[Option<V>], mut v: V) -> V {
     while let V::Inst(i) = v {
         match repl[i as usize] {
             Some(r) => v = r,
@@ -170,7 +175,7 @@ fn resolve(repl: &[Option<V>], mut v: V) -> V {
 }
 
 /// Replaces every value `op` reads by `f` of it.
-fn map_operands(op: &mut Op, mut f: impl FnMut(V) -> V) {
+pub(super) fn map_operands(op: &mut Op, mut f: impl FnMut(V) -> V) {
     match op {
         Op::Bin(_, a, b) | Op::Cmp(_, a, b) | Op::Store(a, b) | Op::AtomicRmw(_, a, b) => {
             *a = f(*a);
@@ -230,13 +235,20 @@ pub(super) fn effect(f: &Func) -> Effect {
 impl Module {
     /// Runs the clean-up passes named in `passes` ([`ALL`]: every one).
     pub(crate) fn optimise(&mut self, passes: u32) {
-        if passes & (FOLD | REUSE | FACTS | LOADS) != 0 {
+        if passes & (FOLD | REUSE | FACTS | LOADS | DATAFLOW) != 0 {
             // Values merged in one round can make two joins the same in
-            // the next (a loop's registers that only go round), and a
-            // branch that goes one way leaves blocks with one way in.
+            // the next (a loop's registers that only go round), a branch
+            // that goes one way leaves blocks with one way in, and
+            // whole-function dataflow exposes new folds, CSEs, and dead edges.
             for _ in 0..4 {
-                let mut changed = self.merge(passes);
-                if passes & FOLD != 0 {
+                let mut changed = false;
+                if passes & (FOLD | REUSE | FACTS | LOADS) != 0 {
+                    changed |= self.merge(passes);
+                }
+                if passes & DATAFLOW != 0 {
+                    changed |= self.optimise_dataflow();
+                }
+                if passes & (FOLD | DATAFLOW) != 0 {
                     changed |= self.prune();
                 }
                 if !changed {
@@ -273,7 +285,7 @@ impl Module {
         seen
     }
 
-    fn dominator_tree(&self) -> Tree {
+    pub(super) fn dominator_tree(&self) -> Tree {
         let n = self.blocks.len();
         let succs = |b: usize| successors(self.blocks[b].term);
         // Reverse postorder, as `write` lays the blocks out.
@@ -349,6 +361,7 @@ impl Module {
             order,
             children,
             preds,
+            idom,
         }
     }
 

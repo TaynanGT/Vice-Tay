@@ -49,6 +49,8 @@ thread_local! {
     /// a hash of each one's bitcode, with its counts (a program may be
     /// emitted in several forms before one is kept).
     static WRITTEN: RefCell<Vec<(usize, u64, Census)>> = const { RefCell::new(Vec::new()) };
+    #[cfg(test)]
+    static FORCE_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn fnv(bytes: &[u8]) -> u64 {
@@ -59,8 +61,25 @@ fn fnv(bytes: &[u8]) -> u64 {
 
 /// Whether modules are counted (`VICTORY_SHADER_CENSUS` set).
 pub fn enabled() -> bool {
+    #[cfg(test)]
+    if FORCE_ON.get() {
+        return true;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_SHADER_CENSUS").is_some())
+}
+
+/// Runs `f` with census recording forced on for the current thread.
+#[cfg(test)]
+pub(crate) fn with_census<R>(f: impl FnOnce() -> R) -> R {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FORCE_ON.set(self.0);
+        }
+    }
+    let _reset = Reset(FORCE_ON.replace(true));
+    f()
 }
 
 /// The counts of the module whose bitcode the container `dxil` holds, if

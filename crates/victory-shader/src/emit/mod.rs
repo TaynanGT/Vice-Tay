@@ -85,6 +85,8 @@ mod container;
 #[cfg(all(test, windows))]
 mod cube_lod_tests;
 #[cfg(all(test, windows))]
+mod dataflow_tests;
+#[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;
@@ -215,15 +217,19 @@ pub fn builder_bounds() -> bool {
 /// is exact, so the switch is for telling a translator fault from a
 /// clean-up fault, and for measuring what the clean-up is worth.
 /// `VICTORY_SHADER_OPT`:
-/// - unset: every pass but the last one below (63).
+/// - unset: every pass except `WIDE` and opt-in `DATAFLOW` (63).
 /// - `0`: none (the module as the lowering made it).
 /// - a number (decimal or `0x` hex): those passes; 1 dead code, 2 constants
 ///   and identities, 4 one instruction for one value, 8 what a branch taken
 ///   says about its condition, 16 one read for one place within a block,
 ///   32 a first-lane read of two host waves without the round that asks
-///   which half has a lane (where every lane has one).
+///   which half has a lane (where every lane has one),
 ///   64 the dwords of one console load read by one call for every four
-///   (not on unless asked: `127` is every pass with it).
+///   (not on unless asked),
+///   512 whole-function sparse conditional known-bits, `exec`-predicate
+///   correlation, bitfield collapse, and backward demanded-bits dataflow
+///   (opt-in: `575` enables it alongside the default passes; `639` is every
+///   pass with `WIDE`).
 ///
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
@@ -240,6 +246,19 @@ pub fn shader_opt() -> u32 {
 thread_local! {
     /// For a test's thread alone: [`shader_opt`].
     pub(super) static TEST_SHADER_OPT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` with `shader_opt()` overridden to `passes` on the current thread.
+#[cfg(test)]
+pub(crate) fn with_shader_opt<R>(passes: u32, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<u32>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_SHADER_OPT.set(self.0);
+        }
+    }
+    let _reset = Reset(TEST_SHADER_OPT.replace(Some(passes & bitcode::opt::ALL)));
+    f()
 }
 
 /// On a host whose shaders run on the console's own kind of hardware (AMD
@@ -1604,12 +1623,17 @@ mod tests {
     #[test]
     fn the_clean_up_switch_parses_or_runs_every_pass() {
         let (all, usual) = (super::bitcode::opt::ALL, super::bitcode::opt::DEFAULT);
-        assert_eq!(usual, 63, "the passes of the builds before the wide loads");
+        assert_eq!(usual, 63, "the passes of the builds before WIDE and DATAFLOW");
         assert_eq!(parse_shader_opt(None), usual);
         assert_eq!(parse_shader_opt(Some("0")), 0);
         assert_eq!(parse_shader_opt(Some(" 1 ")), 1);
         assert_eq!(parse_shader_opt(Some("0x1")), 1);
-        assert_eq!(parse_shader_opt(Some("127")), all);
+        assert_eq!(parse_shader_opt(Some("512")), super::bitcode::opt::DATAFLOW);
+        assert_eq!(
+            parse_shader_opt(Some("575")),
+            usual | super::bitcode::opt::DATAFLOW
+        );
+        assert_eq!(parse_shader_opt(Some("639")), all);
         assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
         assert_eq!(parse_shader_opt(Some("on")), usual);
     }

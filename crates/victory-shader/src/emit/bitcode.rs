@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 
 pub mod census;
+mod dataflow;
 pub mod opt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -386,7 +387,7 @@ impl Module {
 
     /// Notes what instruction `v` is for (see [`Tag`]); only when modules
     /// are counted, except clamps, which the clean-up keeps one per handle
-    /// ([`opt::REUSE`]).
+    /// ([`opt::REUSE`] and [`opt::DATAFLOW`]).
     pub fn tag(&mut self, v: V, tag: Tag) {
         if let V::Inst(i) = v
             && (tag == Tag::Clamp || census::enabled())

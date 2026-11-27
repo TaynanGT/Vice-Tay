@@ -324,6 +324,10 @@ struct Lower<'a> {
     tail: Vec<Option<usize>>,
     /// The program writes UAVs: barriers fence them too.
     writes_uavs: bool,
+    /// The program may store through raw 40-bit addresses (spilled structure
+    /// builders or any non-LDS flat/global store or atomic): its [`SLOT_MEMORY`]
+    /// views stay UAVs rather than using the read-only SRV run.
+    stores_by_address: bool,
     /// src0 of the current instruction as DPP fetched it.
     src0: Option<V>,
     /// Compute code that reads other lanes: thread ids follow the host
@@ -1961,6 +1965,11 @@ impl<'a> Lower<'a> {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
+        let stores_by_address = crate::spill::is_spilled(x.native)
+            || insts().any(|i| {
+                matches!(i.fields, Fields::Flat { lds: false, .. })
+                    && (i.name().contains("store") || i.name().contains("atomic"))
+            });
         let mut console_lanes = false;
         // LDS accesses get a group barrier each (a console wave split in two host waves)
         let mut split_lds = false;
@@ -2263,6 +2272,7 @@ impl<'a> Lower<'a> {
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
             writes_uavs,
+            stores_by_address,
             src0: None,
             console_lanes,
             split_lds,
@@ -3812,15 +3822,25 @@ impl<'a> Lower<'a> {
     }
 
     /// Title memory at the 40-bit address `lo`, `hi` (`shader.rs`
-    /// `SLOT_MEMORY`): the handle of the raw view of the host copy holding
-    /// it and the byte in that view. A page without a copy reads zeros
-    /// (and drops writes) through the null view at the first slot, and its
-    /// number is left for the host, for lanes that run (`guard`). Goes on in
-    /// another block.
-    /// With `store`, a page that is not to be written ([`super::shader::MEMORY_READ_ONLY`])
-    /// is the null view.
-    fn memory(&mut self, lo: V, hi: V, guard: Option<V>, store: bool) -> (V, V) {
-        use super::shader::{MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
+    /// `SLOT_MEMORY`): the view-heap slot of the host copy holding it, the
+    /// byte offset in that view, and the DXIL resource-annotation properties
+    /// (`(11, 0)` read-only raw SRV when `!store && !self.stores_by_address`,
+    /// else `(11 | 0x1000 | coherent, 0)` raw UAV). A page without a copy
+    /// resolves to slot 0 of the run (null view) and records its page number
+    /// in `SLOT_FAULTS` for lanes that run (`guard`). Goes on in another block.
+    /// With `store`, a page marked [`super::shader::MEMORY_READ_ONLY`] resolves
+    /// to the null view.
+    pub(super) fn memory_slot(
+        &mut self,
+        lo: V,
+        hi: V,
+        guard: Option<V>,
+        store: bool,
+    ) -> (V, V, (u32, u32)) {
+        use super::shader::{
+            MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, SLOT_FAULTS, SLOT_MEMORY,
+            USER_MEMORY_BASE, USER_MEMORY_SRV_BASE,
+        };
         let c = self.cur;
         let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -3888,15 +3908,33 @@ impl<'a> Lower<'a> {
         } else {
             copy
         };
-        let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
+        let use_srv = !store && !self.stores_by_address;
+        let base_kind = if use_srv {
+            USER_MEMORY_SRV_BASE
+        } else {
+            USER_MEMORY_BASE
+        };
+        let base = self.host_word(RootType::Other(base_kind), 0, 0);
         let slot = self.s.m.bin(c, Bin::Add, base, copy);
-        // The builder's threads read what others of the dispatch wrote (a
-        // refit climbs from children to parents): globally coherent.
-        let coherent = if crate::spill::is_spilled(self.x.native) { 0x4000 } else { 0 };
-        let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000 | coherent, 0));
+        let props = if use_srv {
+            (11, 0)
+        } else {
+            // The builder's threads read what others of the dispatch wrote (a
+            // refit climbs from children to parents): globally coherent.
+            let coherent = if crate::spill::is_spilled(self.x.native) { 0x4000 } else { 0 };
+            (11 | 0x1000 | coherent, 0)
+        };
         let k64k = k(self, 0xFFFF);
         let within = self.s.m.bin(c, Bin::And, lo, k64k);
         let byte = self.s.m.bin(c, Bin::Add, start, within);
+        (slot, byte, props)
+    }
+
+    /// Title memory at the 40-bit address `lo`, `hi`: [`Self::memory_slot`]
+    /// followed by a per-lane (`NonUniformResourceIndex`) descriptor handle.
+    fn memory(&mut self, lo: V, hi: V, guard: Option<V>, store: bool) -> (V, V) {
+        let (slot, byte, props) = self.memory_slot(lo, hi, guard, store);
+        let h = self.s.heap_handle(self.cur, slot, false, true, props);
         (h, byte)
     }
 

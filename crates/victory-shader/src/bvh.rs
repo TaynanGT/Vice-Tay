@@ -131,6 +131,18 @@ pub fn intersect(words: &[u32; 28], kind: u32, ray: &Ray, sort: bool) -> [u32; 4
     }
 }
 
+/// [`intersect`] matching hardware fused multiply-add (`dx.op.tertiary.f32`
+/// `FMad`, single rounding on GPU hardware; WARP evaluates `FMad` unfused and
+/// matches [`intersect`]).
+pub fn intersect_fused(words: &[u32; 28], kind: u32, ray: &Ray, sort: bool) -> [u32; 4] {
+    match kind & 7 {
+        4 => boxes(&children(words), &boxes16(words), ray, sort),
+        5 => boxes(&children(words), &boxes32(words), ray, sort),
+        k @ 0..=3 => triangle_fused(&triangle_vertices(words, k), ray).map(f32::to_bits),
+        _ => MISS.map(f32::to_bits),
+    }
+}
+
 /// A box node's four child pointers.
 pub fn children(words: &[u32; 28]) -> [u32; 4] {
     [words[0], words[1], words[2], words[3]]
@@ -226,6 +238,17 @@ pub const MISS: [f32; 4] = [f32::INFINITY, 1.0, 0.0, 0.0];
 /// between two triangles that share an edge cannot miss both. Any NaN
 /// misses, and so does a triangle seen edge-on.
 pub fn triangle(p: &[[f32; 3]; 3], ray: &Ray) -> [f32; 4] {
+    triangle_impl(p, ray, false)
+}
+
+/// [`triangle`] with fused multiply-add on vertex shearing and hit distance `t`
+/// (preserving unfused edge cross products `u, v, w` for watertight
+/// antisymmetry across shared edges).
+pub fn triangle_fused(p: &[[f32; 3]; 3], ray: &Ray) -> [f32; 4] {
+    triangle_impl(p, ray, true)
+}
+
+fn triangle_impl(p: &[[f32; 3]; 3], ray: &Ray, fused: bool) -> [f32; 4] {
     let d = ray.direction;
     let size = d.map(f32::abs);
     // The largest axis, and the other two in an order that keeps the
@@ -249,7 +272,15 @@ pub fn triangle(p: &[[f32; 3]; 3], ray: &Ray) -> [f32; 4] {
             v[1] - ray.origin[1],
             v[2] - ray.origin[2],
         ];
-        (r[kx] - sx * r[kz], r[ky] - sy * r[kz], sz * r[kz])
+        if fused {
+            (
+                (-sx).mul_add(r[kz], r[kx]),
+                (-sy).mul_add(r[kz], r[ky]),
+                sz * r[kz],
+            )
+        } else {
+            (r[kx] - sx * r[kz], r[ky] - sy * r[kz], sz * r[kz])
+        }
     };
     let (ax, ay, az) = sheared(&p[0]);
     let (bx, by, bz) = sheared(&p[1]);
@@ -260,7 +291,11 @@ pub fn triangle(p: &[[f32; 3]; 3], ray: &Ray) -> [f32; 4] {
     let behind = u < 0.0 || v < 0.0 || w < 0.0;
     let before = u > 0.0 || v > 0.0 || w > 0.0;
     let det = u + (v + w);
-    let t = (u * az + v * bz) + w * cz;
+    let t = if fused {
+        w.mul_add(cz, v.mul_add(bz, u * az))
+    } else {
+        (u * az + v * bz) + w * cz
+    };
     let ahead = det > 0.0 && t >= 0.0 || det < 0.0 && t <= 0.0;
     if !(behind && before) && ahead {
         [t, det, v, w]

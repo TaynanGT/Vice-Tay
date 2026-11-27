@@ -1529,9 +1529,15 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{
+            USER_MEMORY_BASE, USER_MEMORY_SRV_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS,
+            USER_VIEW_BIAS,
+        };
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
+        }
+        if kind == USER_MEMORY_SRV_BASE {
+            return memory.map_or(0, |m| m.srv_base);
         }
         // All of every group, unless the dispatch says otherwise.
         if kind == victory_shader::emit::USER_DISPATCH_THREADS_X {
@@ -1888,8 +1894,22 @@ impl State {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return prepare_failed!(self, ShaderMemoryViews);
                 };
+                let uses_uav = t
+                    .host
+                    .user_data
+                    .iter()
+                    .any(|u| u.root == RootType::Other(victory_shader::emit::USER_MEMORY_BASE));
+                let uses_srv = t
+                    .host
+                    .user_data
+                    .iter()
+                    .any(|u| u.root == RootType::Other(victory_shader::emit::USER_MEMORY_SRV_BASE));
+                list.note_memory_access(uses_srv, uses_uav || (writes && t.stores));
                 Some(ready)
             } else {
+                if writes && t.stores {
+                    list.note_memory_access(false, true);
+                }
                 None
             };
             if let Some((param, dwords)) = stage.user_data {

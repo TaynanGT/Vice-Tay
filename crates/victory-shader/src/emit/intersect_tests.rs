@@ -475,8 +475,18 @@ fn buffer(scene: &Scene, batch: &[Case], base: u64) -> Vec<u32> {
 }
 
 fn expected(scene: &Scene, case: &Case, sort: bool) -> [u32; 4] {
+    expected_for(scene, case, sort, false)
+}
+
+fn expected_for(scene: &Scene, case: &Case, sort: bool, fused: bool) -> [u32; 4] {
     match case {
-        Some((n, kind, ray)) => bvh::intersect(&scene.node(*n), *kind, ray, sort),
+        Some((n, kind, ray)) => {
+            if fused {
+                bvh::intersect_fused(&scene.node(*n), *kind, ray, sort)
+            } else {
+                bvh::intersect(&scene.node(*n), *kind, ray, sort)
+            }
+        }
         None => BEFORE,
     }
 }
@@ -575,7 +585,9 @@ fn run(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool) {
             for t in 0..THREADS as usize {
                 let case = batch.get(t).copied().flatten();
                 let want = match batch.get(t) {
-                    Some(c) => expected(&scene, c, sort),
+                    // GPU hardware fuses DXIL `FMad` (single rounding); WARP
+                    // evaluates `FMad` unfused.
+                    Some(c) => expected_for(&scene, c, sort, !warp),
                     // A thread past the batch: its record is zeros, so it
                     // is masked out.
                     None => BEFORE,
@@ -857,4 +869,567 @@ fn mask_operations_on_a_joined_number_give_the_number() {
     if ran == 0 {
         eprintln!("not run on a device; lowered only");
     }
+}
+
+/// Encodes one thread's 16-dword record (64 bytes) for [`program`]:
+/// `addr` is the 64-byte-aligned title byte address of the node and `kind`
+/// is its 3-bit node type (0..=7).
+fn put_record(records: &mut [u32], thread: usize, addr: u64, kind: u32, ray: &Ray, active: bool) {
+    assert_eq!(addr & 63, 0, "node address must be 64-byte aligned");
+    let r = &mut records[thread * (RECORD / 4) as usize..][..13];
+    let pointer = (addr >> 3) | u64::from(kind & 7);
+    r[0] = pointer as u32;
+    r[1] = (pointer >> 32) as u32;
+    r[2] = ray.extent.to_bits();
+    for a in 0..3 {
+        r[3 + a] = ray.origin[a].to_bits();
+        r[6 + a] = ray.direction[a].to_bits();
+        r[9 + a] = ray.inverse[a].to_bits();
+    }
+    r[12] = u32::from(active);
+}
+
+/// Builds the user-data constants vector for a shader that uses
+/// `USER_MEMORY_SRV_BASE` or `USER_MEMORY_BASE` alongside the test's s0..s3
+/// constants and table at slot 0.
+fn memory_user_data(shader: &HostShader, memory_base: u32) -> Vec<u32> {
+    let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    for u in &shader.user_data {
+        ud[u.index as usize] = match u.root {
+            RootType::Other(k)
+                if k == super::USER_MEMORY_SRV_BASE || k == super::USER_MEMORY_BASE =>
+            {
+                memory_base
+            }
+            RootType::Table => 0,
+            RootType::Constants => 0,
+            other => panic!("unexpected user-data entry {other:?}"),
+        };
+    }
+    ud
+}
+
+/// Real directory (`SLOT_MEMORY`) + faults (`SLOT_FAULTS`) + read-only SRV
+/// (`USER_MEMORY_SRV_BASE`) end-to-end test on hardware and WARP covering:
+/// - intra-page `Box32` at `0x0000` (same-page fast path, 1 directory load),
+/// - intra-page `Box32` at `0xFF80` (last same-page offset; next page unmapped
+///   to prove no cross-page lookup or fault occurs),
+/// - cross-page `Box32` at `0xFFC0` spanning TWO DIFFERENT copies in the
+///   directory (with poison bytes immediately after page P in copy 1 to prove
+///   the second half actually performs the second lookup into copy 2),
+/// - cross-page `Box32` at `0xFFC0` whose second page is unmapped (copy 0):
+///   children 0..1 still hit while children 2..3 are masked to `NONE` and
+///   `SLOT_FAULTS` records only that missing page.
+#[test]
+fn box32_same_page_and_cross_page_directory_on_the_card() {
+    let (shader, _) = build(true, WHOLE).expect("lowers through directory");
+    assert!(shader.root_srvs.contains(&super::SLOT_MEMORY));
+    assert!(shader.root_uavs.contains(&super::SLOT_FAULTS));
+    assert!(
+        shader
+            .user_data
+            .iter()
+            .any(|u| u.root == RootType::Other(super::USER_MEMORY_SRV_BASE)),
+        "read-only walker must request USER_MEMORY_SRV_BASE"
+    );
+    assert!(
+        !shader
+            .user_data
+            .iter()
+            .any(|u| u.root == RootType::Other(super::USER_MEMORY_BASE)),
+        "read-only walker must not request UAV USER_MEMORY_BASE"
+    );
+
+    const PAGE_DWORDS: usize = 65536 / 4;
+    const UNIT: [f32; 6] = [-1.0, -1.0, -1.0, 1.0, 1.0, 1.0];
+    let moved = |by: [f32; 3]| -> [f32; 6] { std::array::from_fn(|k| UNIT[k] + by[k % 3]) };
+    let ray = Ray::new([0.0; 3], [1.0, 0.0, 0.0], 1000.0);
+
+    // Distinct Box32 nodes whose 4 children all lie along +x at distinct distances.
+    let node_a = nodes::box32(
+        [0x105, 0x205, 0x305, 0x405],
+        [
+            moved([30.0, 0.0, 0.0]),
+            moved([10.0, 0.0, 0.0]),
+            moved([40.0, 0.0, 0.0]),
+            moved([20.0, 0.0, 0.0]),
+        ],
+    );
+    let node_b = nodes::box32(
+        [0x505, 0x605, 0x705, 0x805],
+        [
+            moved([25.0, 0.0, 0.0]),
+            moved([5.0, 0.0, 0.0]),
+            moved([15.0, 0.0, 0.0]),
+            moved([35.0, 0.0, 0.0]),
+        ],
+    );
+    let node_c = nodes::box32(
+        [0x905, 0xA05, 0xB05, 0xC05],
+        [
+            moved([50.0, 0.0, 0.0]),
+            moved([30.0, 0.0, 0.0]),
+            moved([12.0, 0.0, 0.0]),
+            moved([6.0, 0.0, 0.0]),
+        ],
+    );
+    let node_d = nodes::box32(
+        [0xD05, 0xE05, 0xF05, 0x1005],
+        [
+            moved([22.0, 0.0, 0.0]),
+            moved([8.0, 0.0, 0.0]),
+            moved([4.0, 0.0, 0.0]),
+            moved([2.0, 0.0, 0.0]),
+        ],
+    );
+
+    // Copy 1 (4 pages = 256 KiB):
+    //   offset 0x0_0000: page 1 -> node_a at 0x0000 (intra-page)
+    //   offset 0x1_0000: page 2 -> node_b at 0xFF80 (last intra-page Box32)
+    //   offset 0x2_0000: page 4 -> node_c first half [0..16] at 0xFFC0
+    //   offset 0x3_0000: POISON (all NaN boxes so skipping 2nd lookup fails!)
+    let mut copy1 = vec![0u32; 4 * PAGE_DWORDS];
+    copy1[..28].copy_from_slice(&node_a);
+    let b_at = PAGE_DWORDS + (0xFF80 / 4);
+    copy1[b_at..b_at + 28].copy_from_slice(&node_b);
+    let c_first_at = 2 * PAGE_DWORDS + (0xFFC0 / 4);
+    copy1[c_first_at..c_first_at + 16].copy_from_slice(&node_c[..16]);
+    for w in &mut copy1[3 * PAGE_DWORDS..3 * PAGE_DWORDS + 16] {
+        *w = f32::NAN.to_bits();
+    }
+
+    // Copy 2 (1 page = 64 KiB):
+    //   offset 0x0_0000: page 5 -> node_c second half [16..28] at 0x0000
+    let mut copy2 = vec![0u32; PAGE_DWORDS];
+    copy2[..12].copy_from_slice(&node_c[16..28]);
+
+    // Copy 3 (2 pages = 128 KiB):
+    //   offset 0x0_0000: page 6 -> node_d first half [0..16] at 0xFFC0
+    //   offset 0x1_0000: valid boxes (decoy: page 7 is unmapped so children 2..3
+    //                    MUST be masked to NONE, not read from copy 3 + 0x10000!)
+    let mut copy3 = vec![0u32; 2 * PAGE_DWORDS];
+    let d_first_at = 0xFFC0 / 4;
+    copy3[d_first_at..d_first_at + 16].copy_from_slice(&node_d[..16]);
+    copy3[PAGE_DWORDS..PAGE_DWORDS + 12].copy_from_slice(&node_d[16..28]);
+
+    // Directory (16 pages):
+    //   page 1 -> (copy 1, 0x0_0000)
+    //   page 2 -> (copy 1, 0x1_0000)
+    //   page 3 -> unmapped (0, 0) — proves 0x2_FF80 does NOT look up page 3
+    //   page 4 -> (copy 1, 0x2_0000)
+    //   page 5 -> (copy 2, 0x0_0000) — different copy for 0x4_FFC0 second half
+    //   page 6 -> (copy 3, 0x0_0000)
+    //   page 7 -> unmapped (0, 0) — 0x6_FFC0 second half unmapped & faulted
+    let mut directory = vec![0u32; 16 * 2];
+    let set_dir = |dir: &mut [u32], page: usize, copy: u32, byte_off: u32| {
+        dir[2 * page] = copy;
+        dir[2 * page + 1] = byte_off;
+    };
+    set_dir(&mut directory, 1, 1, 0x0_0000);
+    set_dir(&mut directory, 2, 1, 0x1_0000);
+    set_dir(&mut directory, 4, 1, 0x2_0000);
+    set_dir(&mut directory, 5, 2, 0x0_0000);
+    set_dir(&mut directory, 6, 3, 0x0_0000);
+
+    let mut records = vec![0u32; (NODES / 4) as usize];
+    let want_a = bvh::intersect(&node_a, 5, &ray, true);
+    let want_b = bvh::intersect(&node_b, 5, &ray, true);
+    let want_c = bvh::intersect(&node_c, 5, &ray, true);
+    // Page 7 is unmapped -> only children 0 & 1 of node_d (at x=22 and x=8) hit, sorted.
+    let want_d = [0xE05, 0xD05, bvh::NONE, bvh::NONE];
+
+    let mut expected_threads = vec![BEFORE; THREADS as usize];
+    for t in 0..THREADS as usize {
+        match t {
+            0..8 => {
+                put_record(&mut records, t, 0x1_0000, 5, &ray, true);
+                expected_threads[t] = want_a;
+            }
+            8..16 => {
+                put_record(&mut records, t, 0x2_FF80, 5, &ray, true);
+                expected_threads[t] = want_b;
+            }
+            16..24 => {
+                put_record(&mut records, t, 0x4_FFC0, 5, &ray, true);
+                expected_threads[t] = want_c;
+            }
+            24..28 => {
+                put_record(&mut records, t, 0x6_FFC0, 5, &ray, true);
+                expected_threads[t] = want_d;
+            }
+            // Inactive lanes pointing at an unmapped page: must not fault!
+            _ => {
+                put_record(&mut records, t, 0x9_0000, 5, &ray, false);
+                expected_threads[t] = BEFORE;
+            }
+        }
+    }
+
+    // Heap layout: 0=records SRV, 1=output UAV, 2=null SRV (copy 0),
+    // 3=copy 1 SRV, 4=copy 2 SRV, 5=copy 3 SRV.
+    let null_srv = [0u32; 4];
+    let ud = memory_user_data(&shader, 2);
+
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        // Root signature order: param 0 = user_data constants,
+        // param 1 = SLOT_FAULTS (253, UAV), param 2 = SLOT_MEMORY (254, SRV).
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud.clone())),
+                        (1, Root::Uav(super::MEMORY_FAULTS)),
+                        (2, Root::View { srv: true, data: directory.clone() }),
+                    ],
+                    views: &[
+                        View::Buffer { data: &records, stride: Stride::Raw },
+                        View::RawUav(4 * THREADS),
+                        View::Buffer { data: &null_srv, stride: Stride::Raw },
+                        View::Buffer { data: &copy1, stride: Stride::Raw },
+                        View::Buffer { data: &copy2, stride: Stride::Raw },
+                        View::Buffer { data: &copy3, stride: Stride::Raw },
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        for t in 0..THREADS as usize {
+            let got = &out[0][4 * t..4 * t + 4];
+            assert_eq!(
+                got, expected_threads[t],
+                "{label}: thread {t} mismatch (got {got:x?}, want {:x?})",
+                expected_threads[t]
+            );
+        }
+        let faults = &out[1];
+        let faulted_pages: Vec<u32> = faults.iter().copied().filter(|&p| p != 0).collect();
+        assert_eq!(
+            faulted_pages,
+            vec![7],
+            "{label}: expected only unmapped page 7 in SLOT_FAULTS (no fault for 0x0000, 0xFF80, mapped 0xFFC0, or inactive lanes)"
+        );
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device available");
+}
+
+/// Tests BOTH coherent waves (all 32 active lanes hit the same copy ->
+/// `WaveReadLaneFirst` + `WaveAllTrue` uniform handle fast path) and divergent
+/// waves (lanes interleaved across 3 copies + unmapped copy 0 ->
+/// `NonUniformResourceIndex` fallback), for BOTH:
+/// 1. Read-only BVH walkers (`USER_MEMORY_SRV_BASE`, raw SRV `ByteAddressBuffer`),
+/// 2. Shaders that also contain a `global_store_dword` (`USER_MEMORY_BASE`,
+///    raw UAV `RWByteAddressBuffer`).
+#[test]
+fn wave_uniform_and_divergent_srv_vs_uav_on_the_card() {
+    let (ro_shader, _) = build(true, WHOLE).expect("ro walker lowers");
+    assert!(
+        ro_shader
+            .user_data
+            .iter()
+            .any(|u| u.root == RootType::Other(super::USER_MEMORY_SRV_BASE))
+    );
+
+    // Same program with a never-taken (when s0 == 0) `global_store_dword` to
+    // raw address v[1:2], forcing `stores_by_address = true` so the shader
+    // must use `USER_MEMORY_BASE` raw UAVs instead of read-only SRVs.
+    let mut rw_words = program(true, WHOLE);
+    let end = rw_words.pop().unwrap(); // s_endpgm
+    rw_words.extend([
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0xBF85_0002, // s_cbranch_scc1 +2 (skips 2-dword global_store_dword)
+        0xDC70_8000,
+        0x007D_0D01, // global_store_dword v[1:2], v13, off
+        end,
+    ]);
+    let (rw_shader, _) = build_compute_shader(&native(&rw_words)).expect("rw shader lowers");
+    assert!(
+        rw_shader
+            .user_data
+            .iter()
+            .any(|u| u.root == RootType::Other(super::USER_MEMORY_BASE)),
+        "shader with global_store must use UAV USER_MEMORY_BASE"
+    );
+    assert!(
+        !rw_shader
+            .user_data
+            .iter()
+            .any(|u| u.root == RootType::Other(super::USER_MEMORY_SRV_BASE)),
+        "shader with global_store must not use read-only USER_MEMORY_SRV_BASE"
+    );
+
+    const UNIT: [f32; 6] = [-1.0, -1.0, -1.0, 1.0, 1.0, 1.0];
+    let moved = |by: [f32; 3]| -> [f32; 6] { std::array::from_fn(|k| UNIT[k] + by[k % 3]) };
+    let ray_x = Ray::new([0.0; 3], [1.0, 0.0, 0.0], 1000.0);
+    let ray_z = Ray::new([0.0; 3], [0.0, 0.0, 1.0], 100.0);
+
+    // Copy 1: Box32 at +0x000, Box16 at +0x100, Triangle at +0x200.
+    let box32_c1 = nodes::box32(
+        [0x115, 0x225, 0x335, 0x445],
+        [
+            moved([40.0, 0.0, 0.0]),
+            moved([10.0, 0.0, 0.0]),
+            moved([20.0, 0.0, 0.0]),
+            moved([30.0, 0.0, 0.0]),
+        ],
+    );
+    let box16_c1 = nodes::box16(
+        [0x514, 0x624, 0x734, 0x844],
+        [
+            moved([12.0, 0.0, 0.0]),
+            moved([24.0, 0.0, 0.0]),
+            moved([6.0, 0.0, 0.0]),
+            moved([18.0, 0.0, 0.0]),
+        ],
+    );
+    let tri_c1 = nodes::triangles(&[[0.0, 2.0, 5.0], [2.0, -2.0, 5.0], [-2.0, -2.0, 5.0]], 9);
+
+    // Copy 2: distinct Box32 at +0x000, distinct Triangle at +0x200.
+    let box32_c2 = nodes::box32(
+        [0xA15, 0xB25, 0xC35, 0xD45],
+        [
+            moved([15.0, 0.0, 0.0]),
+            moved([5.0, 0.0, 0.0]),
+            moved([25.0, 0.0, 0.0]),
+            moved([35.0, 0.0, 0.0]),
+        ],
+    );
+    let tri_c2 = nodes::triangles(&[[0.0, 3.0, 8.0], [3.0, -3.0, 8.0], [-3.0, -3.0, 8.0]], 9);
+
+    // Copy 3: distinct Box16 at +0x100.
+    let box16_c3 = nodes::box16(
+        [0xE14, 0xF24, 0x1034, 0x1144],
+        [
+            moved([32.0, 0.0, 0.0]),
+            moved([16.0, 0.0, 0.0]),
+            moved([8.0, 0.0, 0.0]),
+            moved([4.0, 0.0, 0.0]),
+        ],
+    );
+
+    let mut copy1 = vec![0u32; 256];
+    copy1[..28].copy_from_slice(&box32_c1);
+    copy1[64..80].copy_from_slice(&box16_c1[..16]);
+    copy1[128..144].copy_from_slice(&tri_c1[..16]);
+
+    let mut copy2 = vec![0u32; 256];
+    copy2[..28].copy_from_slice(&box32_c2);
+    copy2[128..144].copy_from_slice(&tri_c2[..16]);
+
+    let mut copy3 = vec![0u32; 256];
+    copy3[64..80].copy_from_slice(&box16_c3[..16]);
+
+    // Directory: page 1 -> copy 1, page 2 -> copy 2, page 3 -> copy 3, page 4 -> unmapped.
+    let mut directory = vec![0u32; 16 * 2];
+    directory[2] = 1;
+    directory[4] = 2;
+    directory[6] = 3;
+
+    // Batch 0: Coherent wave (all 32 lanes hit copy 1: mix of Box32, Box16, Triangle).
+    let mut coherent_rec = vec![0u32; (NODES / 4) as usize];
+    let mut coherent_want_hw = Vec::with_capacity(THREADS as usize);
+    let mut coherent_want_warp = Vec::with_capacity(THREADS as usize);
+    for t in 0..THREADS as usize {
+        let (addr, kind, node, ray) = match t % 3 {
+            0 => (0x1_0000, 5, &box32_c1, &ray_x),
+            1 => (0x1_0100, 4, &box16_c1, &ray_x),
+            _ => (0x1_0200, 0, &tri_c1, &ray_z),
+        };
+        put_record(&mut coherent_rec, t, addr, kind, ray, true);
+        coherent_want_hw.push(bvh::intersect_fused(node, kind, ray, true));
+        coherent_want_warp.push(bvh::intersect(node, kind, ray, true));
+    }
+
+    // Batch 1: Divergent wave (lanes interleaved across copies 1, 2, 3 and unmapped page 4).
+    let mut divergent_rec = vec![0u32; (NODES / 4) as usize];
+    let mut divergent_want_hw = Vec::with_capacity(THREADS as usize);
+    let mut divergent_want_warp = Vec::with_capacity(THREADS as usize);
+    for t in 0..THREADS as usize {
+        match t % 4 {
+            0 => {
+                put_record(&mut divergent_rec, t, 0x1_0000, 5, &ray_x, true);
+                divergent_want_hw.push(bvh::intersect_fused(&box32_c1, 5, &ray_x, true));
+                divergent_want_warp.push(bvh::intersect(&box32_c1, 5, &ray_x, true));
+            }
+            1 => {
+                put_record(&mut divergent_rec, t, 0x2_0000, 5, &ray_x, true);
+                divergent_want_hw.push(bvh::intersect_fused(&box32_c2, 5, &ray_x, true));
+                divergent_want_warp.push(bvh::intersect(&box32_c2, 5, &ray_x, true));
+            }
+            2 => {
+                put_record(&mut divergent_rec, t, 0x3_0100, 4, &ray_x, true);
+                divergent_want_hw.push(bvh::intersect_fused(&box16_c3, 4, &ray_x, true));
+                divergent_want_warp.push(bvh::intersect(&box16_c3, 4, &ray_x, true));
+            }
+            _ => {
+                put_record(&mut divergent_rec, t, 0x4_0000, 5, &ray_x, true);
+                divergent_want_hw.push([bvh::NONE; 4]);
+                divergent_want_warp.push([bvh::NONE; 4]);
+            }
+        }
+    }
+
+    // Batch 2: Divergent triangles across copies 1 and 2 (tests triangle wave-uniform fallback).
+    let mut div_tri_rec = vec![0u32; (NODES / 4) as usize];
+    let mut div_tri_want_hw = Vec::with_capacity(THREADS as usize);
+    let mut div_tri_want_warp = Vec::with_capacity(THREADS as usize);
+    for t in 0..THREADS as usize {
+        let (addr, node) = if t % 2 == 0 {
+            (0x1_0200, &tri_c1)
+        } else {
+            (0x2_0200, &tri_c2)
+        };
+        put_record(&mut div_tri_rec, t, addr, 0, &ray_z, true);
+        div_tri_want_hw.push(bvh::intersect_fused(node, 0, &ray_z, true));
+        div_tri_want_warp.push(bvh::intersect(node, 0, &ray_z, true));
+    }
+
+    let null_buf = [0u32; 4];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        for (mode_name, shader, use_uav) in [
+            ("ro_srv", &ro_shader, false),
+            ("rw_uav", &rw_shader, true),
+        ] {
+            let (root, pso) = host
+                .compute_pipeline(shader)
+                .unwrap_or_else(|e| panic!("{label}/{mode_name}: compute_pipeline failed: {e}"));
+            let ud = memory_user_data(shader, 2);
+            let batches = [
+                ("coherent", &coherent_rec, &coherent_want_hw, &coherent_want_warp),
+                ("divergent_box", &divergent_rec, &divergent_want_hw, &divergent_want_warp),
+                ("divergent_tri", &div_tri_rec, &div_tri_want_hw, &div_tri_want_warp),
+            ];
+            for (batch_name, rec, want_hw, want_warp) in batches {
+                let want = if warp { want_warp } else { want_hw };
+                let views: Vec<View<'_>> = if use_uav {
+                    vec![
+                        View::Buffer { data: rec, stride: Stride::Raw },
+                        View::RawUav(4 * THREADS),
+                        View::RawUavData(&null_buf),
+                        View::RawUavData(&copy1),
+                        View::RawUavData(&copy2),
+                        View::RawUavData(&copy3),
+                    ]
+                } else {
+                    vec![
+                        View::Buffer { data: rec, stride: Stride::Raw },
+                        View::RawUav(4 * THREADS),
+                        View::Buffer { data: &null_buf, stride: Stride::Raw },
+                        View::Buffer { data: &copy1, stride: Stride::Raw },
+                        View::Buffer { data: &copy2, stride: Stride::Raw },
+                        View::Buffer { data: &copy3, stride: Stride::Raw },
+                    ]
+                };
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![
+                                (0, Root::Constants(ud.clone())),
+                                (1, Root::Uav(super::MEMORY_FAULTS)),
+                                (2, Root::View { srv: true, data: directory.clone() }),
+                            ],
+                            views: &views,
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label}/{mode_name}/{batch_name}: dispatch failed: {e}"));
+                for t in 0..THREADS as usize {
+                    let got = &out[0][4 * t..4 * t + 4];
+                    assert_eq!(
+                        got, want[t],
+                        "{label}/{mode_name}/{batch_name} thread {t}: got {got:x?}, want {:x?}",
+                        want[t]
+                    );
+                }
+            }
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device available");
+}
+
+/// Pixel-shader helper lanes are excluded from `WaveReadLaneFirst` /
+/// `WaveActiveAllTrue`, so `bvh_with_handle` must skip wave ops in `StageIo::Ps`
+/// (falling back to `NonUniformResourceIndex`) while keeping wave ops enabled
+/// for compute shaders.
+#[test]
+fn pixel_shader_bvh_memory_skips_wave_ops_for_helper_lane_safety() {
+    let lower_native = |prog: &NativeProgram| {
+        let p = ir::build(&prog.code, prog.wave64, prog.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &prog.layout, prog.stage, Some(&st)).expect("resource");
+        let io = io::raise(&p, prog).expect("io::raise");
+        let lowered = lower::lower(&lower::Parts {
+            native: prog,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .expect("lower");
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            let mut copy = lowered.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+        lowered
+    };
+    let cs_prog = native(&program(true, WHOLE));
+    let cs = lower_native(&cs_prog);
+    // Prepend `v_mov_b32 v0, 0` so `v0` is defined in PS (no CS thread ID).
+    let mut ps_words = vec![0x7E00_0280u32];
+    ps_words.extend(program(true, WHOLE));
+    let mut ps_prog = native(&ps_words);
+    ps_prog.stage = HwStage::Ps;
+    ps_prog.io = StageIo::Ps {
+        inputs: vec![],
+        input_addr: 0,
+        db_shader_control: 0,
+        patches: vec![],
+    };
+    let ps = lower_native(&ps_prog);
+    assert!(
+        cs.wave_ops,
+        "compute shader by-address BVH walk must emit wave-uniform fast path"
+    );
+    assert!(
+        !ps.wave_ops,
+        "pixel shader by-address BVH walk must skip wave ops for helper-lane safety"
+    );
+    assert!(
+        ps.user_data
+            .iter()
+            .any(|u| u.root == RootType::Other(super::USER_MEMORY_SRV_BASE)),
+        "read-only PS walker must still use USER_MEMORY_SRV_BASE"
+    );
 }

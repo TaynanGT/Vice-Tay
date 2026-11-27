@@ -41,8 +41,13 @@ param(
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [ValidateSet('auto', '7900xtx', '4070', '4070tisuper', '4080', '4090', '3060', 'laptop')][string]$Machine = 'auto',
     [ValidateRange(0, 3600)][int]$TestSeconds = 0,
+    [string]$TestFfmpeg,
     [hashtable]$More = @{}
 )
+if ($TestFfmpeg) {
+    if (!$TestSeconds) { throw '-TestFfmpeg requires -TestSeconds.' }
+    $TestFfmpeg = (Get-Command $TestFfmpeg -CommandType Application -ErrorAction Stop).Source
+}
 $settings = @{
     VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
     VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '1'; VICTORY_CARD_STEPS = '2'
@@ -326,7 +331,7 @@ try {
         if ($LASTEXITCODE -ne 0) { Write-Host "victory warm ended with exit code $LASTEXITCODE; starting anyway." }
     }
     if ($TestSeconds) {
-        & "$PSScriptRoot\measure-world.ps1" -Victory $victory -Exe $Exe -Console $Console -Seconds $TestSeconds
+        & "$PSScriptRoot\measure-world.ps1" -Victory $victory -Exe $Exe -Console $Console -Seconds $TestSeconds -Ffmpeg $TestFfmpeg
         $runtimeExitCode = 0
     } else {
         & $victory run $Exe --console $Console --execute

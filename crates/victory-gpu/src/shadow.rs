@@ -2354,9 +2354,15 @@ pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
 /// this one, the next number to whichever is free: for thousands of small
 /// pieces of work, where a job each ([`wide`]) is mostly the jobs' queue.
 pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) {
+    if n < 2 {
+        if n == 1 {
+            work(0);
+        }
+        return;
+    }
     let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let work = Arc::new(work);
-    let threads = (wide_threads() + 1).min(n);
+    let threads = (workers().thread_count + 1).min(n);
     let jobs = (0..threads)
         .map(|_| {
             let (next, work) = (next.clone(), work.clone());
@@ -4872,7 +4878,7 @@ impl Shadow {
 
     /// Whether [`Shadow::update`] of `[address, address + len)` would copy
     /// nothing, and knows it without asking anything
-    /// (`crate::watch::nothing_new`). `false` if it would have to ask.
+    /// (`crate::watch::unchanged_since_copy`). `false` if it would have to ask.
     pub(crate) fn nothing_new(&self, address: usize, len: usize) -> bool {
         if self.place.is_some() {
             return true;
@@ -4895,7 +4901,7 @@ impl Shadow {
         let ranged = self.ranged(from, to);
         let base = start / PAGE;
         let same = (ranged != 0 || copied.range_all_copied(from / PAGE - base, (to - 1) / PAGE - base))
-            && crate::watch::nothing_new(from, to, base, &copied.at, ranged);
+            && crate::watch::unchanged_since_copy(from, to, base, &copied.at, ranged);
         #[cfg(feature = "diagnostics")]
         if same {
             use crate::copystat::{C, add};

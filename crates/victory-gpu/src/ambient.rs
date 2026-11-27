@@ -32,6 +32,8 @@
 //! `VICTORY_AMBIENT_FLAT=<level>` optionally supplies a diffuse minimum
 //! when the resolve's depth SRV is missing (positive finite, at most 2).
 //! It requires the stand-in to be on and does not reconstruct geometry.
+//! `VICTORY_AMBIENT_FLAT_REPLACE=1` replaces that pass's probe irradiance
+//! with the neutral value instead, discarding valid indirect colour too.
 //!
 //! The air of a room is lit by the same probes: without rays they hold the
 //! sky's light indoors too, a brown veil at sunset. `VICTORY_AMBIENT_AIR`
@@ -134,6 +136,12 @@ fn parse_flat(set: &str) -> Option<f32> {
 pub(crate) fn flat_level() -> Option<f32> {
     static LEVEL: OnceLock<Option<f32>> = OnceLock::new();
     *LEVEL.get_or_init(|| parse_flat(&std::env::var("VICTORY_AMBIENT_FLAT").unwrap_or_default()))
+}
+
+/// Optional isolation of probe irradiance, only in the depth-free resolve.
+fn flat_replaces() -> bool {
+    static REPLACE: OnceLock<bool> = OnceLock::new();
+    *REPLACE.get_or_init(|| std::env::var_os("VICTORY_AMBIENT_FLAT_REPLACE").is_some_and(|v| v == "1"))
 }
 
 /// Missing depth can use the flat minimum; an incompatible real view cannot.
@@ -532,12 +540,19 @@ uint pack(float3 c) {
 
 #ifdef FLAT
 // A diffuse minimum before materials are applied. No depth/normal reads,
-// colour rejection or luminance cap: valid existing illumination remains.
+// colour rejection or luminance cap: valid existing illumination remains
+// unless the separate probe-replacement option is explicitly enabled.
 [RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void flat(uint3 at : SV_DispatchThreadID) {
     if (at.x >= width || at.y >= height) return;
     float3 floor_light = float3(1.0, 0.98, 0.94) * constant;
+    // FLAT has no crease shading. Only here, strength selects replacement.
+    // Do not read original irradiance, including its stale colour, in this mode.
+    if (strength > 0.5) {
+        light[at.xy] = pack(floor_light);
+        return;
+    }
     light[at.xy] = pack(max(unpack(light[at.xy]), floor_light));
 }
 #endif
@@ -975,6 +990,15 @@ pub(crate) fn after(
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
+    if role == Role::Resolve && views.depth.is_none() {
+        // The FLAT entry point never uses geometric crease strength.
+        let replace = flat_replaces();
+        words[2] = (if replace { 1.0f32 } else { 0.0f32 }).to_bits();
+        static SAID_REPLACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if replace && !SAID_REPLACE.swap(true, Ordering::Relaxed) {
+            tracing::info!(constant, "ambient isolation: replacing depth-free probe light with neutral illumination");
+        }
+    }
     words[6] = views.size[0];
     words[7] = views.size[1];
     words[8] = follow(role).to_bits();
@@ -1160,6 +1184,15 @@ mod tests {
 
     #[test]
     fn depth_free_floor_preserves_bright_and_colored_light_and_bounds() {
+        check_flat_light(false);
+    }
+
+    #[test]
+    fn depth_free_replacement_discards_colored_and_bright_light_and_preserves_bounds() {
+        check_flat_light(true);
+    }
+
+    fn check_flat_light(replace: bool) {
         use crate::indirect::tests::WarpHarness;
         use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_UINT, DXGI_SAMPLE_DESC};
 
@@ -1228,6 +1261,7 @@ mod tests {
             l.SetComputeRootSignature(&pass.root);
             let mut words = [0u32; 16];
             words[1] = 0.3f32.to_bits();
+            words[2] = (if replace { 1.0f32 } else { 0.0f32 }).to_bits();
             words[6] = 7;
             words[7] = 1;
             l.SetComputeRoot32BitConstants(0, 16, words.as_ptr().cast(), 0);
@@ -1245,17 +1279,24 @@ mod tests {
                 let scale = 2.0f32.powi((v >> 27) as i32 - 24);
                 [v & 511, (v >> 9) & 511, (v >> 18) & 511].map(|n| n as f32 * scale)
             };
-            for (v, wanted) in rgb(pixels[0]).iter().zip([0.3, 0.294, 0.282]) {
-                assert!((v - wanted).abs() < 0.002, "ambient floor {:?}", rgb(pixels[0]));
-            }
-            assert_eq!(pixels[1], gray, "existing illumination stays intact");
-            assert_eq!(pixels[2], bright, "bright light is not capped");
-            for (pixel, original) in pixels[3..7].iter().zip([red, green, blue, magenta]) {
-                for (value, was) in rgb(*pixel).into_iter().zip(rgb(original)) {
-                    if was > 0.0 {
-                        assert_eq!(value, was, "saturated light is preserved");
-                    } else {
-                        assert!((0.25..=0.325).contains(&value), "missing channels receive the floor");
+            let neutral = |pixel| {
+                for (value, wanted) in rgb(pixel).iter().zip([0.3, 0.294, 0.282]) {
+                    assert!((value - wanted).abs() < 0.002, "neutral ambient {:?}", rgb(pixel));
+                }
+            };
+            if replace {
+                for pixel in &pixels[..7] { neutral(*pixel); }
+            } else {
+                neutral(pixels[0]);
+                assert_eq!(pixels[1], gray, "existing illumination stays intact");
+                assert_eq!(pixels[2], bright, "bright light is not capped");
+                for (pixel, original) in pixels[3..7].iter().zip([red, green, blue, magenta]) {
+                    for (value, was) in rgb(*pixel).into_iter().zip(rgb(original)) {
+                        if was > 0.0 {
+                            assert_eq!(value, was, "saturated light is preserved");
+                        } else {
+                            assert!((0.25..=0.325).contains(&value), "missing channels receive the floor");
+                        }
                     }
                 }
             }

@@ -279,11 +279,11 @@ impl Pool {
             };
             state.running += 1;
             drop(state);
+            priority.keep();
             let working = crate::timeline::span("a landing's job");
             // SAFETY: counted in `running`, so `each` has not returned.
             let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { (*work.0)(i) }));
             working.end();
-            priority.keep();
             state = self.state();
             state.running -= 1;
             state.panicked |= ran.is_err();

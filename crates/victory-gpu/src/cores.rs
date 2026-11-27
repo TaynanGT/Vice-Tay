@@ -297,12 +297,12 @@ fn helpers_raised() -> bool {
 /// A helper's priority ([`helpers_raised`]). [`Self::keep`] is called before
 /// each piece of work; it asks the system only when the switch has changed.
 pub(crate) struct Priority {
-    applied: Option<bool>,
+    requested: Option<bool>,
 }
 
 impl Priority {
     pub(crate) fn new() -> Self {
-        let mut priority = Self { applied: None };
+        let mut priority = Self { requested: None };
         priority.keep();
         priority
     }
@@ -312,13 +312,19 @@ impl Priority {
             GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_NORMAL,
         };
         let on = helpers_raised();
-        if self.applied == Some(on) {
+        if self.requested == Some(on) {
             return;
         }
         let priority = if on { THREAD_PRIORITY_ABOVE_NORMAL } else { THREAD_PRIORITY_NORMAL };
         // SAFETY: our own thread.
-        unsafe { SetThreadPriority(GetCurrentThread(), priority) };
-        self.applied = Some(on);
+        if unsafe { SetThreadPriority(GetCurrentThread(), priority) } == 0 {
+            let error = std::io::Error::last_os_error();
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| {
+                tracing::warn!(%error, priority, "could not set the submitting helper's priority");
+            });
+        }
+        self.requested = Some(on);
     }
 }
 

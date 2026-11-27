@@ -95,11 +95,11 @@ The matching launch log records a `host memory pressure` warning with 3,024 MiB 
 .\scripts\play.ps1 -Exe 'C:\Misc\Torrents\downloads\vc\game_scarlett_master.exe' -Machine laptop -More @{ VICTORY_GAME_DIR = 'C:\Misc\Torrents\downloads\vc' } -DryRun
 ```
 
-The title executable hashes to `E95020B2FA4A721DB3DF59FDECF75621730AC559D8835252F6C3B658D5A08993`. Before rebuilding, `victory.exe` and its symbols were preserved under the local, ignored `target\startup-memory-evidence-20261127` directory. That executable hashes to `2D6DCB9FBEF84B5B00D216254BCB59DAE85390E9F3FB24CFAAF439266D2088BC`, consistent with the abbreviated runtime hash in `claude-context.md`. The capture has no title-executable hash, so identity with the original game binary is not established. The new diagnostic executable hashes to `84224AF1B1081148CF78F250D69FFADDCAC0584F7A53BE1CA0CB36FB0BA331FB`.
+The title executable hashes to `E95020B2FA4A721DB3DF59FDECF75621730AC559D8835252F6C3B658D5A08993`. Before rebuilding, `victory.exe` and its symbols were preserved under the local, ignored `target\startup-memory-evidence-20261127` directory. That executable hashes to `2D6DCB9FBEF84B5B00D216254BCB59DAE85390E9F3FB24CFAAF439266D2088BC`, consistent with the abbreviated runtime hash in `claude-context.md`. The capture has no title-executable hash, so identity with the original game binary is not established. The diagnostic executable built after incorporating upstream through `5e588e8` hashes to `CEF75DF2C89A02E3EF4D9413BB82ACFF6718440471AB2A74477DC95D19F2AFFC`.
 
 The `-More` plumbing was also dry-run checked one variable at a time for `VICTORY_ASYNC_SUBMIT=0`, `VICTORY_THIN=0`, and `VICTORY_MAP_THREADS=1`, always retaining the corrected `VICTORY_GAME_DIR`. Those `-DryRun` checks establish launcher precedence only; they do not exercise the title.
 
-The inherited `VICTORY_THIN=1` setting initially made `resource::tests::buffer_data_reaches_the_host_texture` fail because thin lists intentionally have no host command list to retain the host texture. With `VICTORY_THIN=0`, the focused test passed and the GPU suite passed (487 passed, 43 ignored). The following checks passed after synchronization:
+The inherited `VICTORY_THIN=1` setting initially made `resource::tests::buffer_data_reaches_the_host_texture` fail because thin lists intentionally have no host command list to retain the host texture. With `VICTORY_THIN=0`, the focused test passed and the GPU suite passed (489 passed, 43 ignored after incorporating upstream through `5e588e8`). The following checks passed after synchronization:
 
 ```powershell
 $env:VICTORY_THIN = '0'

@@ -231,8 +231,7 @@ illumination. Unlike the ordinary floor, replacement does not preserve
 existing probe light, even when brighter than the configured level.
 
 Compare with replacement off while keeping the ambient level and all other
-settings identical. The local implementation comes from `31bd277` by
-Vladimir Vasiltsov. Existing user observations compare a combined local
+settings identical. Existing user observations compare a combined local
 configuration; an isolation-only recorded comparison is still required.
 
 Synthetic GPU readback covers replacement of black, gray, bright and

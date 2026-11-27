@@ -150,8 +150,14 @@ pub(crate) fn wanted(n: u64) -> bool {
     // In the world: every 8th frame's picture, a timeline of the opening
     // cutscene (its shots do not fall on the same frame numbers from run to
     // run, so single frames cannot be compared between runs).
+    // (`VICTORY_CAPTURE_EVERY=<n>`, 1 to 64: every nth instead, for a
+    // picture that is wrong for a frame or two, as right after a cut.)
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let every = *EVERY.get_or_init(|| {
+        std::env::var("VICTORY_CAPTURE_EVERY").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(8, |n| n.clamp(1, 64))
+    });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
-    let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
+    let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(every);
     folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
 }
 

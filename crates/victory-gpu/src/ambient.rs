@@ -1085,6 +1085,10 @@ pub(crate) fn after(
             Role::Resolve => {
                 if let Some(flat) = depth_free {
                     run(flat, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
+                    static FLAT_RECORDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if !FLAT_RECORDED.swap(true, Ordering::Relaxed) {
+                        tracing::info!(size = ?views.size, level = constant, "depth-free ambient floor dispatch recorded");
+                    }
                     return true;
                 }
                 if constant == 0.0 {

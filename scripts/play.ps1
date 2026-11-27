@@ -48,21 +48,25 @@ $ram = (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).Tota
 $controllers = @(if ($Machine -in 'auto', '7900xtx') {
     Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue
 })
-$hasNvidia = [bool]($controllers.PNPDeviceID -match 'VEN_10DE')
+$nvidiaControllers = @($controllers | Where-Object { $_.PNPDeviceID -match 'VEN_10DE' })
+$hasNvidia = $nvidiaControllers.Count -gt 0
 $autoNvidia = $Machine -eq 'auto' -and $hasNvidia
 $cardGb = 0
 $autoAdds = @{}
 if ($Machine -eq 'auto') {
     # Keep the vendor defaults for rendering. The measured machine profiles are explicit.
     $Machine = if ($hasNvidia) { '4090' } else { '7900xtx' }
-    if ($autoNvidia) {
-        # The card's memory as its driver records it (Win32_VideoController's AdapterRAM stops at
-        # 4 GB); 0 when it cannot be read, which leaves the vendor defaults as they are.
-        $cardBytes = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}\0*' -ErrorAction SilentlyContinue |
-            Where-Object { $_.MatchingDeviceId -match 'ven_10de' } |
-            ForEach-Object { $_.'HardwareInformation.qwMemorySize' -as [uint64] } |
-            Sort-Object -Descending | Select-Object -First 1
-        $cardGb = [int][math]::Round($cardBytes / 1GB)
+    # Read the driver key for the detected NVIDIA adapter. Old driver entries and
+    # ambiguous adapter selections must not determine the automatic memory profile.
+    if ($autoNvidia -and -not $Safe -and $nvidiaControllers.Count -eq 1 -and
+        -not $More.ContainsKey('VICTORY_D3D12_ADAPTER') -and
+        (Get-Command Get-PnpDeviceProperty -ErrorAction SilentlyContinue)) {
+        $driverKey = (Get-PnpDeviceProperty -InstanceId $nvidiaControllers[0].PNPDeviceID -KeyName 'DEVPKEY_Device_Driver' -ErrorAction SilentlyContinue).Data
+        if ($driverKey -match '^\{4d36e968-e325-11ce-bfc1-08002be10318\}\\\d+$') {
+            $entry = Get-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Control\Class\$driverKey" -Name 'HardwareInformation.qwMemorySize' -ErrorAction SilentlyContinue
+            $cardBytes = $entry.'HardwareInformation.qwMemorySize' -as [uint64]
+            $cardGb = [int][math]::Round($cardBytes / 1GB)
+        }
     }
 }
 

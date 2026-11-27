@@ -9267,7 +9267,7 @@ impl HostList {
                         copies += 1;
                     }
                     batch.fill();
-                    batch.title_written(TitleWrite::Copy);
+                    batch.title_wrote(TitleWrite::Copy, dst, len);
                     crate::port::copied(dst, src, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // Raise the heap-sync floor *after* the copy lands in
@@ -9304,7 +9304,7 @@ impl HostList {
                     let free = !touches(air, p.src, p.src + p.len) && !touches(air, p.dst, p.dst + p.len);
                     batch.fill();
                     if free {
-                        batch.title_written(TitleWrite::PlacedCopy);
+                        batch.title_wrote(TitleWrite::PlacedCopy, p.dst, p.len);
                     }
                     if let Some(bytes) = p.prepare(free) {
                         batch.placed.push((p.shadow.clone(), p.dst, bytes));
@@ -9544,6 +9544,13 @@ fn split_line(frames: f64) {
              {placed_ms:.2} ms, deferred writes {deferred:.1} in {deferred_ms:.2} ms"
         );
     }
+    if keep_ahead() {
+        let [writes, kept, dropped, views] = KEPT_AHEAD.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
+        tracing::info!(
+            "title writes at submission per frame (VICTORY_KEEP_AHEAD): {writes:.1} kept the copies brought up to date ahead \
+             that they missed, {kept:.0} kept and {dropped:.0} dropped; {views:.1} into views made all of them count again"
+        );
+    }
     tracing::info!(
         "asking about title memory per frame, all threads: {:.0} kernel askings over {:.0} MB ({:.1} ms, {:.0} pages of 4 KiB found \
          written, {:.0} askings refused); {:.0} questions about holes; view ranges: {:.0} answered by their \
@@ -9687,6 +9694,37 @@ fn refresh_front() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     ahead_of_writes() && (joins_asked().0 > 1 || *ON.get_or_init(|| crate::switch::on("VICTORY_REFRESH_FRONT")))
 }
+
+/// Whether a buffer copy into title memory at submission (one done there, or
+/// one at its place in the lists) lets the copies brought up to date ahead of
+/// the steps ([`Batch::refresh_front`], [`Batch::refresh_ahead`]) whose
+/// ranges it does not touch stay so (`VICTORY_KEEP_AHEAD=1`; off by default:
+/// any such write makes every later refresh of the submission count again).
+///
+/// The refreshes in front are done once for all of a submission's lists; a
+/// copy into a few bytes of title memory threw all of them away, and each
+/// copy the later lists refresh was added, flushed and looked at again: 85 to
+/// 89 % of a frame's 9,000-11,000 refreshes were found to copy nothing, and
+/// the refreshes cost 38 ms a frame on the submitting thread (runs VT-R1 and
+/// BB-R0; in VT-R1 19 flushes a frame came before placed copies). How much
+/// of that this saves is not measured yet.
+///
+/// What is kept is what the write left alone byte for byte: the copy's bytes
+/// still are the title's there, as a refresh would find. A write into memory
+/// that views of physical pages show (which other addresses may show too,
+/// `crate::inplace::shown_elsewhere`) makes all of them count again, as
+/// without the switch. Pending refreshes are still done before the write, and
+/// textures are still checked again after it.
+fn keep_ahead() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_KEEP_AHEAD"))
+}
+
+/// Since the last frame-rate line, with [`keep_ahead`]: title writes that
+/// kept the copies brought up to date ahead they missed, those kept, those
+/// dropped, and title writes over views that dropped all of them.
+#[cfg(feature = "diagnostics")]
+static KEPT_AHEAD: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// Per copy what is refreshed in front of a submission's steps, as
 /// [`written_spans`]'s but of all copies, up to the copy's first write by
@@ -10118,6 +10156,46 @@ impl Batch {
     fn title_written(&mut self, write: TitleWrite) {
         self.flush(Some(write));
         self.ahead.clear();
+        self.textures.clear();
+    }
+
+    /// Before a step that writes title memory `[dst, dst + len)` and nothing
+    /// else: [`Batch::title_written`], or with [`keep_ahead`] the copies
+    /// brought up to date ahead stay so where the write misses them.
+    fn title_wrote(&mut self, write: TitleWrite, dst: usize, len: usize) {
+        self.title_wrote_keeping(write, dst, len, keep_ahead());
+    }
+
+    /// [`Batch::title_wrote`], the switch given (`keep`).
+    fn title_wrote_keeping(&mut self, write: TitleWrite, dst: usize, len: usize, keep: bool) {
+        if !keep {
+            self.title_written(write);
+            return;
+        }
+        // The same bytes may show at other addresses: everything again.
+        if crate::inplace::shown_bytes(dst, len).is_some() {
+            #[cfg(feature = "diagnostics")]
+            KEPT_AHEAD[3].fetch_add(1, Ordering::Relaxed);
+            self.title_written(write);
+            return;
+        }
+        // What was recorded before the write still reads the title's bytes
+        // of before it.
+        self.flush(Some(write));
+        let end = dst.saturating_add(len);
+        #[cfg(feature = "diagnostics")]
+        let all = self.ahead.len();
+        // Byte for byte, not by 64 KiB page: a copy beside the write on its
+        // page holds the title's bytes still (the journal, which notes the
+        // page written, has its next refresh copy that page again). A write
+        // of no bytes touches none.
+        self.ahead.retain(|_, &mut (from, to)| len == 0 || to <= dst || end <= from);
+        #[cfg(feature = "diagnostics")]
+        {
+            KEPT_AHEAD[0].fetch_add(1, Ordering::Relaxed);
+            KEPT_AHEAD[1].fetch_add(self.ahead.len() as u64, Ordering::Relaxed);
+            KEPT_AHEAD[2].fetch_add((all - self.ahead.len()) as u64, Ordering::Relaxed);
+        }
         self.textures.clear();
     }
 
@@ -12557,7 +12635,7 @@ mod spare {
 
 #[cfg(test)]
 mod refresh_tests {
-    use super::Batch;
+    use super::{Batch, TitleWrite};
     use crate::shadow::Shadow;
     use std::sync::Arc;
     use windows_sys::Win32::System::Memory::{
@@ -12817,6 +12895,61 @@ mod refresh_tests {
                     std::slice::from_raw_parts(*at as *const u8, *n) == std::slice::from_raw_parts(data.add(at - start), *n)
                 };
                 assert!(same, "round {round}: {at:#x}+{n:#x} of a copy at {start:#x}; first byte {}", byte(*at));
+            }
+        }
+    }
+
+    /// `VICTORY_KEEP_AHEAD`, as a submission prepares: the copies refreshed
+    /// in front of its steps, a buffer copy into title memory over the end of
+    /// the first copy's range (and on the 64 KiB page the second copy's range
+    /// begins on), and the lists' refreshes after it. With the switch only
+    /// the first copy is refreshed again; with it or without, every copy
+    /// holds what title memory holds when the submission is prepared.
+    #[test]
+    fn a_title_write_refreshes_again_only_the_copies_it_touches() {
+        let _one = crate::watch::one_asking_test();
+        const LEN: usize = 8 * PAGE;
+        for keep in [false, true] {
+            // SAFETY (all blocks): title memory and copies of the test's own,
+            // written by this thread and, in the flushes, by the threads that
+            // refresh, which are done when they return.
+            let region = title(LEN, false);
+            for i in 0..LEN {
+                unsafe { ((region + i) as *mut u8).write_volatile((i * 7 + 3) as u8) };
+            }
+            let copy = |from: usize, len: usize| {
+                let data = memory(len);
+                (Shadow::unbacked((region + from) as u64, data, len as u64, false), data)
+            };
+            let copies = [copy(0, 2 * PAGE + 100), copy(2 * PAGE + 200, PAGE), copy(5 * PAGE, 3 * PAGE)];
+            let spans: Vec<_> = copies
+                .iter()
+                .map(|(shadow, _)| {
+                    let (start, len) = shadow.span();
+                    (shadow.clone(), start as usize, (start + len) as usize)
+                })
+                .collect();
+            let asked: Vec<(usize, usize)> = spans.iter().map(|r| (r.1, r.2)).collect();
+            crate::watch::ask_once(&asked);
+            let mut batch = Batch::default();
+            batch.refresh_spans(spans.clone(), Vec::new(), crate::timeline::span("refreshes in front"));
+            // The title's buffer copy, as `HostList::run_deferred` does it.
+            let (dst, len) = (region + 2 * PAGE + 50, 50);
+            batch.title_wrote_keeping(TitleWrite::Copy, dst, len, keep);
+            let bytes = [0xA5u8; 50];
+            super::copy_mapped(dst as *mut u8, bytes.as_ptr(), len, true);
+            crate::watch::wrote(dst, len);
+            for (shadow, from, to) in &spans {
+                batch.add(shadow, *from, *to - *from);
+            }
+            assert_eq!(batch.refreshes.len(), if keep { 1 } else { spans.len() }, "keep {keep}");
+            batch.flush(None);
+            crate::watch::ask_once_end();
+            for (shadow, data) in &copies {
+                let (start, n) = shadow.span();
+                let (start, n) = (start as usize, n as usize);
+                let same = unsafe { std::slice::from_raw_parts(start as *const u8, n) == std::slice::from_raw_parts(*data, n) };
+                assert!(same, "keep {keep}: the copy at {start:#x}+{n:#x}");
             }
         }
     }
@@ -13385,6 +13518,32 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // A fresh submission starts over.
         let mut next = Batch::default();
         assert!(next.texture_due(&a));
+    }
+
+    /// `VICTORY_KEEP_AHEAD`: a title write drops only the copies brought up
+    /// to date ahead whose ranges hold one of its bytes; without the switch,
+    /// all of them. Textures are checked again either way.
+    #[test]
+    fn a_title_write_drops_only_the_ranges_ahead_it_touches() {
+        // Not memory views show (nor any memory at all): nothing shows
+        // these bytes elsewhere.
+        const AT: usize = 0x7f00_0000_0000;
+        let ahead = [(1, (AT, AT + 100)), (2, (AT + 100, AT + 200)), (3, (AT + 150, AT + 300)), (4, (AT + 300, AT + 400))];
+        for keep in [false, true] {
+            let mut batch = Batch::default();
+            batch.ahead.extend(ahead);
+            let texture = Arc::new(1u32);
+            assert!(batch.texture_due(&texture));
+            // Bytes [AT + 120, AT + 160): the second copy's and the third's.
+            batch.title_wrote_keeping(TitleWrite::Copy, AT + 120, 40, keep);
+            let mut left: Vec<usize> = batch.ahead.keys().copied().collect();
+            left.sort_unstable();
+            assert_eq!(left, if keep { vec![1, 4] } else { vec![] });
+            assert!(batch.texture_due(&texture));
+            // A write of nothing drops nothing.
+            batch.title_wrote_keeping(TitleWrite::PlacedCopy, AT + 50, 0, keep);
+            assert_eq!(batch.ahead.len(), left.len());
+        }
     }
 
     /// The hashing a submission does for textures in physical-page memory,

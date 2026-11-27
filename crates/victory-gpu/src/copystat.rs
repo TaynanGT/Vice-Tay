@@ -948,6 +948,12 @@ fn log_memory() {
         made[4],
         mb(made[5]),
     );
+    if let Some(line) = crate::host::ram_gate_line() {
+        tracing::info!(
+            "memory, {line}; windows in card memory the CPU maps: {:.0} MB",
+            mb(crate::shadow::window_mapped_bytes())
+        );
+    }
     tracing::info!(
         "memory, placed textures: {} of them were asked for again with other filler words in their description          (one resource and host copy each since the filler left the key; VICTORY_PLACED_FILLER=1 keeps it)",
         crate::resource::placed_filler_twins()

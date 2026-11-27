@@ -155,6 +155,308 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
     ok.then_some(m.ullAvailPhys)
 }
 
+/// The floor of the RAM throttle in bytes (zero disables it).
+fn parse_ram_floor(value: &str) -> Option<u64> {
+    value.trim().parse::<u64>().ok()?.checked_mul(1 << 20)
+}
+
+/// The floor of the RAM throttle in bytes (`VICTORY_RAM_FLOOR_MB`; 0, the
+/// default, no throttle). See [`ram_gate`].
+fn ram_floor() -> u64 {
+    static FLOOR: OnceLock<u64> = OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        let floor = std::env::var("VICTORY_RAM_FLOOR_MB")
+            .ok()
+            .and_then(|v| parse_ram_floor(&v))
+            .unwrap_or(0);
+        if floor > 0 {
+            tracing::info!(
+                floor_mb = floor >> 20,
+                wait_ms = ram_wait_most(),
+                share_ms = ram_wait_share(),
+                frame_wait_ms = ram_frame_wait(),
+                "RAM throttle on: buffers in the PC's memory wait while less is free"
+            );
+        }
+        floor
+    })
+}
+
+fn parse_ram_wait(value: &str) -> Option<u64> {
+    let ms = value.trim().parse::<u64>().ok()?;
+    // The title checks its heartbeat about every 30 seconds. Reject a
+    // single configured wait that could occupy that entire interval.
+    (ms < 30_000).then_some(ms)
+}
+
+fn ram_wait_step(now: u64, begun: u64, most: u64) -> u64 {
+    most.saturating_sub(now.saturating_sub(begun)).min(10)
+}
+
+/// The longest one buffer waits at the RAM throttle, in milliseconds
+/// (`VICTORY_RAM_WAIT_MS`, 250 by default, below 30,000).
+fn ram_wait_most() -> u64 {
+    static MOST: OnceLock<u64> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_RAM_WAIT_MS")
+            .ok()
+            .and_then(|v| parse_ram_wait(&v))
+            .unwrap_or(250)
+    })
+}
+
+/// Of every second, the most milliseconds spent waiting at the RAM throttle,
+/// all threads together (`VICTORY_RAM_WAIT_SHARE_MS`, 600 by default, 1000
+/// at most): past it buffers are made at once, so the title always moves on.
+fn ram_wait_share() -> u64 {
+    static MOST: OnceLock<u64> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_RAM_WAIT_SHARE_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(600)
+            .min(1000)
+    })
+}
+
+/// Free RAM as last looked at, and when (milliseconds since the start, 0:
+/// never): looked at again after 20 ms ([`ram_gate`] is asked thousands of
+/// times a second while the world streams in).
+static RAM_SEEN: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+fn ram_free_now() -> Option<u64> {
+    let now = now_ms();
+    let at = RAM_SEEN[0].load(Ordering::Relaxed);
+    if at != 0 && now < at + 20 {
+        return Some(RAM_SEEN[1].load(Ordering::Relaxed));
+    }
+    let free = available_physical_ram()?;
+    RAM_SEEN[1].store(free, Ordering::Relaxed);
+    RAM_SEEN[0].store(now.max(1), Ordering::Relaxed);
+    Some(free)
+}
+
+/// The RAM throttle, since the start: buffers that waited, milliseconds
+/// waited, buffers made at once for the second's share being spent, waits
+/// cut at [`ram_wait_most`], the longest wait in ms, the least RAM free
+/// seen while waiting (MB, `u64::MAX` before any wait).
+static RAM_GATE: [std::sync::atomic::AtomicU64; 6] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(u64::MAX),
+];
+/// The second [`ram_wait_share`] is counted in (above [`SPENT_BITS`]) and
+/// the milliseconds spent of it (below), in one word: a new second and a
+/// charge to it are one operation ([`take_share`]).
+static RAM_SHARE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The bits of [`RAM_SHARE`] that hold the milliseconds spent (at most
+/// 1,000 of a second).
+const SPENT_BITS: u32 = 20;
+
+/// [`RAM_SHARE`]'s word after `step` ms are charged in `second`, or `None`
+/// when that would spend more than `share` ms of it. A second later than the
+/// word's starts at 0; an earlier one (a thread that read the clock before
+/// another moved the word on) is charged to the word's own second, so the
+/// word never goes back and no charge is lost.
+fn charged(word: u64, second: u64, step: u64, share: u64) -> Option<u64> {
+    let at = (word >> SPENT_BITS).max(second);
+    let spent = if word >> SPENT_BITS == at {
+        word & ((1 << SPENT_BITS) - 1)
+    } else {
+        0
+    };
+    (spent + step <= share).then_some((at << SPENT_BITS) | (spent + step))
+}
+
+/// Charges `step` ms of `second` to `slot` if the share has room for them.
+fn take_share(slot: &std::sync::atomic::AtomicU64, second: u64, step: u64, share: u64) -> bool {
+    slot.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |word| {
+        charged(word, second, step, share)
+    })
+    .is_ok()
+}
+
+/// Whether the RAM throttle holds back a buffer of `size` bytes about to be
+/// made in the PC's memory, with `free` bytes of RAM free and `floor` the
+/// throttle's floor (0: no throttle).
+fn ram_held(free: Option<u64>, size: u64, floor: u64) -> bool {
+    floor > 0 && free.is_some_and(|free| free < floor.saturating_add(size))
+}
+
+/// Holds back a buffer of `size` bytes about to be made in the PC's memory
+/// (shared with the card, or upload memory: either is locked in RAM as long
+/// as it lives) while less than the floor ([`ram_floor`]) would be left
+/// free: for up to [`ram_wait_most`] ms each, at most [`ram_wait_share`] ms
+/// of every second for all threads, in steps of at most 10 ms. Then it is made,
+/// room or not: the throttle only slows the making, it never refuses.
+///
+/// Why: as the world streams in, the layer makes gigabytes of such buffers
+/// in seconds (on the RTX 3050 laptop with 16 GB, the memory shared with
+/// the card went from 0.7 to 5.3 GB in 20 s of one measured run), faster than
+/// Windows writes what it takes from others to the page file (2.5 GB were
+/// waiting to be written then). Free RAM fell under 300 MB for seconds and
+/// the PC paged the game itself in and out (28,000 pages a second). Each
+/// buffer that waits gives the system time to write those pages out. A
+/// frame there takes a second or two anyway.
+pub(crate) fn ram_gate(size: u64) {
+    let floor = ram_floor();
+    if floor == 0 || !ram_held(ram_free_now(), size, floor) {
+        return;
+    }
+    let (most, share) = (ram_wait_most(), ram_wait_share());
+    let begun = now_ms();
+    let mut waited = false;
+    loop {
+        let free = ram_free_now();
+        if !ram_held(free, size, floor) {
+            break;
+        }
+        if let Some(free) = free {
+            RAM_GATE[5].fetch_min(free >> 20, Ordering::Relaxed);
+        }
+        let now = now_ms();
+        let step = ram_wait_step(now, begun, most);
+        if step == 0 {
+            RAM_GATE[3].fetch_add(1, Ordering::Relaxed);
+            break;
+        }
+        // The second's share, for all threads together.
+        if !take_share(&RAM_SHARE, now / 1000, step, share) {
+            RAM_GATE[2].fetch_add(1, Ordering::Relaxed);
+            break;
+        }
+        if !waited {
+            waited = true;
+            RAM_GATE[0].fetch_add(1, Ordering::Relaxed);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(step));
+    }
+    if waited {
+        let ms = now_ms() - begun;
+        RAM_GATE[1].fetch_add(ms, Ordering::Relaxed);
+        RAM_GATE[4].fetch_max(ms, Ordering::Relaxed);
+        ram_gate_said();
+    }
+}
+
+/// Says what the RAM throttle did, every 5 s at most while it holds things
+/// back: the memory line comes with the frame reports, and while the world
+/// loads there may be no frame for many seconds.
+fn ram_gate_said() {
+    static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = now_ms();
+    let said = SAID.load(Ordering::Relaxed);
+    if now < said + 5000
+        || SAID
+            .compare_exchange(said, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    if let Some(line) = ram_gate_line() {
+        tracing::info!("{line}; free now {} MB", ram_free_now().unwrap_or(0) >> 20);
+    }
+}
+
+/// The most milliseconds a submission waits at its start while free RAM is
+/// under the RAM throttle's floor (`VICTORY_RAM_FRAME_WAIT_MS`; 0, the
+/// default, none; below 30,000). See [`ram_gate_submission`].
+fn ram_frame_wait() -> u64 {
+    static MOST: OnceLock<u64> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_RAM_FRAME_WAIT_MS")
+            .ok()
+            .and_then(|v| parse_ram_wait(&v))
+            .unwrap_or(0)
+    })
+}
+
+/// Submissions that waited at [`ram_gate_submission`], and the milliseconds;
+/// and when the last wait ended (ms since the start).
+static RAM_FRAME: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// The RAM throttle for the whole title: before a submission starts, while
+/// free RAM is under the floor ([`ram_floor`]), waits in steps of at most 10 ms for
+/// up to [`ram_frame_wait`] ms. [`ram_gate`] holds back the layer's own
+/// buffers; the title's threads meanwhile keep touching their memory (the
+/// world streams into it), and Windows trims and compresses those pages as
+/// fast as they come. A title waits for its frames, so holding the
+/// submission back holds the title back too, and nothing new is touched
+/// while the system writes out what it took. After a wait the title gets
+/// at least that long before the next submission wait. Multiple waits
+/// during a world load can still delay it long enough to trip its watchdog.
+pub(crate) fn ram_gate_submission() {
+    let (floor, most) = (ram_floor(), ram_frame_wait());
+    if floor == 0 || most == 0 {
+        return;
+    }
+    let begun = now_ms();
+    let last = RAM_FRAME[2].load(Ordering::Relaxed);
+    if (last != 0 && begun.saturating_sub(last) < last_wait_ms().max(100))
+        || !ram_held(ram_free_now(), 0, floor)
+    {
+        return;
+    }
+    loop {
+        let step = ram_wait_step(now_ms(), begun, most);
+        if step == 0 || !ram_held(ram_free_now(), 0, floor) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(step));
+    }
+    let end = now_ms();
+    LAST_WAIT.store(end - begun, Ordering::Relaxed);
+    RAM_FRAME[0].fetch_add(1, Ordering::Relaxed);
+    RAM_FRAME[1].fetch_add(end - begun, Ordering::Relaxed);
+    RAM_FRAME[2].store(end.max(1), Ordering::Relaxed);
+    ram_gate_said();
+}
+
+/// How long the last wait at [`ram_gate_submission`] took, in ms.
+static LAST_WAIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn last_wait_ms() -> u64 {
+    LAST_WAIT.load(Ordering::Relaxed)
+}
+
+/// For the memory line: what the RAM throttle did since the start
+/// ([`RAM_GATE`]); `None` with no throttle.
+pub(crate) fn ram_gate_line() -> Option<String> {
+    let floor = ram_floor();
+    if floor == 0 {
+        return None;
+    }
+    let g = |i: usize| RAM_GATE[i].load(Ordering::Relaxed);
+    let least = g(5);
+    Some(format!(
+        "RAM throttle (floor {} MB): {} buffers waited {:.1} s in all (the longest {} ms), {} cut at {} ms, {} made at once \
+         for the second's {} ms being spent; the least RAM free while waiting: {}; submissions held back: {} for {:.1} s \
+         (at most {} ms each)",
+        floor >> 20,
+        g(0),
+        g(1) as f64 / 1000.0,
+        g(4),
+        g(3),
+        ram_wait_most(),
+        g(2),
+        ram_wait_share(),
+        if least == u64::MAX {
+            "-".to_string()
+        } else {
+            format!("{least} MB")
+        },
+        RAM_FRAME[0].load(Ordering::Relaxed),
+        RAM_FRAME[1].load(Ordering::Relaxed) as f64 / 1000.0,
+        ram_frame_wait(),
+    ))
+}
+
 /// How long host copies of textures the title fills must have been idle to
 /// be let go, in milliseconds, and how many bytes of them go at most (the
 /// longest idle first): none but those of ten minutes while what is in use
@@ -6222,6 +6524,8 @@ impl Host {
             None => runs,
         };
         let parts: Vec<usize> = parts.iter().map(|&n| n + usize::from(own.is_some())).collect();
+        // While RAM is short the title waits here (`VICTORY_RAM_FRAME_WAIT_MS`).
+        ram_gate_submission();
         stage.next("submit: the sweep");
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
@@ -9644,6 +9948,7 @@ impl Host {
 
     /// A buffer in the upload heap, mapped for writing.
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        ram_gate(size);
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -10635,6 +10940,7 @@ impl Host {
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        ram_gate(size);
         MADE[2].fetch_add(1, Ordering::Relaxed);
         MADE[3].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -11948,6 +12254,83 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!((ms, bytes), (5_000, 5 * gib));
         assert_eq!(vram_keep(100 * gib, 120 * gib), (1_500, 35 * gib));
         assert_eq!(vram_keep(0, 7).0, 5_000);
+    }
+
+    #[test]
+    fn ram_throttle_rejects_overflowing_floors_and_excessive_waits() {
+        assert_eq!(super::parse_ram_floor(" 1500 "), Some(1500 << 20));
+        assert_eq!(super::parse_ram_floor("0"), Some(0));
+        let max_mib = u64::MAX >> 20;
+        assert_eq!(super::parse_ram_floor(&max_mib.to_string()), Some(max_mib << 20));
+        assert_eq!(super::parse_ram_floor(&(max_mib + 1).to_string()), None);
+        assert_eq!(super::parse_ram_floor("-1"), None);
+        assert_eq!(super::parse_ram_wait("0"), Some(0));
+        assert_eq!(super::parse_ram_wait(" 1000 "), Some(1000));
+        assert_eq!(super::parse_ram_wait("29999"), Some(29_999));
+        assert_eq!(super::parse_ram_wait("30000"), None);
+        assert_eq!(super::parse_ram_wait(&u64::MAX.to_string()), None);
+
+        let begun = u64::MAX - 15;
+        assert_eq!(super::ram_wait_step(begun + 4, begun, 15), 10);
+        assert_eq!(super::ram_wait_step(begun + 9, begun, 15), 6);
+        assert_eq!(super::ram_wait_step(u64::MAX, begun, 15), 0);
+    }
+
+    /// The share of a second is spent once over all threads, across the
+    /// turn of a second too: no charge is lost and none is given twice.
+    #[test]
+    fn the_ram_throttle_share_holds_across_a_second_with_concurrent_callers() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, Barrier};
+        assert_eq!(super::charged(0, 5, 10, 30), Some((5 << super::SPENT_BITS) | 10));
+        let full = (5 << super::SPENT_BITS) | 30;
+        assert_eq!(super::charged(full, 5, 10, 30), None);
+        // A new second starts at 0; an earlier one is charged to the word's.
+        assert_eq!(super::charged(full, 6, 10, 30), Some((6 << super::SPENT_BITS) | 10));
+        assert_eq!(super::charged((6 << super::SPENT_BITS) | 10, 5, 10, 30), Some((6 << super::SPENT_BITS) | 20));
+        let (share, step, threads, tries) = (900u64, 10u64, 8usize, 400usize);
+        let slot = Arc::new(AtomicU64::new(0));
+        let counts: Arc<[AtomicU64; 2]> = Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
+        let barrier = Arc::new(Barrier::new(threads));
+        let workers: Vec<_> = (0..threads)
+            .map(|t| {
+                let (slot, counts, barrier) = (slot.clone(), counts.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    for (i, second) in [(0usize, 7u64), (1, 8)] {
+                        barrier.wait();
+                        for n in 0..tries {
+                            // Half of the threads read the clock late: the
+                            // second before, once the word has moved on.
+                            let asked = if i == 1 && t % 2 == 1 && n % 3 == 0 { 7 } else { second };
+                            if super::take_share(&slot, asked, step, share) {
+                                counts[i].fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap();
+        }
+        // Far more asked than the share has room for: exactly the share each second.
+        assert_eq!(counts[0].load(Ordering::Relaxed), share / step);
+        assert_eq!(counts[1].load(Ordering::Relaxed), share / step);
+        assert_eq!(slot.load(Ordering::Relaxed), (8 << super::SPENT_BITS) | share);
+    }
+
+    #[test]
+    fn the_ram_throttle_holds_a_buffer_only_below_its_floor() {
+        let mib = 1u64 << 20;
+        // No throttle.
+        assert!(!super::ram_held(Some(0), mib, 0));
+        // Free RAM not known: never held.
+        assert!(!super::ram_held(None, mib, 1000 * mib));
+        // What would be left counts, not what is free now.
+        assert!(!super::ram_held(Some(1001 * mib), mib, 1000 * mib));
+        assert!(super::ram_held(Some(1001 * mib), 2 * mib, 1000 * mib));
+        assert!(super::ram_held(Some(300 * mib), mib, 1000 * mib));
+        assert!(!super::ram_held(Some(u64::MAX), u64::MAX, u64::MAX));
     }
 
     #[test]

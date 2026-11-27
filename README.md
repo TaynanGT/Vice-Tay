@@ -180,6 +180,7 @@ PowerShell asks for the executable's path.
 | `-Windowed` | Start in a window |
 | `-Console series-s` | Run as a Series S: a smaller picture, lighter on the card, faster; the profile every session uses |
 | `-Machine 4090` / `7900xtx` | Force the settings for NVIDIA (measured on the RTX 4090) or AMD |
+| `-Machine laptop` | The settings for an NVIDIA PC with 16 GB of RAM (measured on an RTX 3050 6 GB laptop, [docs/laptop-16gb.md](docs/laptop-16gb.md)) |
 | `-Safe` | Leave out the changes still on trial; try it first when something goes wrong |
 | `-RayTracing` | Build the ray-traced structures, so the title's ray-traced indirect light runs |
 | `-Build release` | Run `target\release\victory.exe` (`cargo build --release --locked -p victory`); it has no panel |
@@ -188,6 +189,26 @@ Every `VICTORY_...` switch is described in a comment where the code reads it.
 More commands and debugging switches:
 [docs/README-fxceless.md](docs/README-fxceless.md) and [docs/findings.md](docs/findings.md);
 recording one frame and running it again: [docs/replay.md](docs/replay.md).
+
+### Direct3D 12 on Windows 10
+
+If the Windows runtime rejects root signature flags `c00` or `c01`, build an
+executable that requests the application-local DirectX Agility SDK. Download
+[Microsoft.Direct3D.D3D12 1.620.2](https://www.nuget.org/packages/Microsoft.Direct3D.D3D12/1.620.2),
+open the `.nupkg` as a ZIP and copy `build/native/bin/x64/D3D12Core.dll` into
+`target\diag\D3D12\`. Build from the repository root:
+
+```powershell
+$env:VICTORY_AGILITY_SDK = '1'
+try { cargo build --locked --profile diag -p victory --features diagnostics }
+finally { Remove-Item Env:VICTORY_AGILITY_SDK }
+```
+
+Launch with `scripts\play.ps1` as usual. The `D3D12` folder goes next to the
+executable. Use `target\release\D3D12\` for a release build. Keep the folder
+beside the executable if you move it. For the optional D3D12 debug layer,
+use `D3D12SDKLayers.dll` from the same package. A normal rebuild with
+`VICTORY_AGILITY_SDK` unset uses the Windows runtime.
 
 ## How this tree is built
 

@@ -193,6 +193,17 @@ pub fn run(
             println!("renderer port 2: {copies} of {} table copies of the title patched", done.len());
         }
     }
+    // Apply the optional working set limit before the title allocates memory.
+    #[cfg(windows)]
+    if execute {
+        victory_loader::working_set::apply_asked();
+        // The optional RAM throttle checks the heartbeat address against the build.
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image stays mapped for the run.
+        if let Some(flag) = unsafe { victory_loader::heartbeat::asked(image.base(), size) } {
+            victory_hle::ram_keep_alive_at(flag);
+        }
+    }
     // The frame rate (VICTORY_FRAME_INTERVAL_MS, off without it): our frame
     // clock ticks at that interval (victory-gpu), and the title is given
     // the matching rate in place of its setting's 30 (VICTORY_TITLE_FPS

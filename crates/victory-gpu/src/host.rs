@@ -61,6 +61,7 @@ pub(crate) struct Host {
     /// omits a view or sampler heap while using directly-indexed root signatures.
     fallback_view: OnceLock<Option<ID3D12DescriptorHeap>>,
     fallback_sampler: OnceLock<Option<ID3D12DescriptorHeap>>,
+    texture_readbacks: ReadbackPool<ID3D12Resource>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -152,6 +153,309 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
     // SAFETY: a sized structure.
     let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
     ok.then_some(m.ullAvailPhys)
+}
+
+/// The floor of the RAM throttle in bytes (`VICTORY_RAM_FLOOR_MB`; 0, the
+/// default, no throttle). See [`ram_gate`].
+fn ram_floor() -> u64 {
+    static FLOOR: OnceLock<u64> = OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        let mb = std::env::var("VICTORY_RAM_FLOOR_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        if mb > 0 {
+            tracing::info!(
+                floor_mb = mb,
+                wait_ms = ram_wait_most(),
+                share_ms = ram_wait_share(),
+                frame_wait_ms = ram_frame_wait(),
+                "RAM throttle on: buffers in the PC's memory wait while less is free"
+            );
+        }
+        mb << 20
+    })
+}
+
+/// The longest one buffer waits at the RAM throttle, in milliseconds
+/// (`VICTORY_RAM_WAIT_MS`, 250 by default).
+fn ram_wait_most() -> u64 {
+    static MOST: OnceLock<u64> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_RAM_WAIT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(250)
+    })
+}
+
+/// Of every second, the most milliseconds spent waiting at the RAM throttle,
+/// all threads together (`VICTORY_RAM_WAIT_SHARE_MS`, 600 by default, 1000
+/// at most): past it buffers are made at once, so the title always moves on.
+fn ram_wait_share() -> u64 {
+    static MOST: OnceLock<u64> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_RAM_WAIT_SHARE_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(600)
+            .min(1000)
+    })
+}
+
+/// Free RAM as last looked at, and when (milliseconds since the start, 0:
+/// never): looked at again after 20 ms ([`ram_gate`] is asked thousands of
+/// times a second while the world streams in).
+static RAM_SEEN: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+fn ram_free_now() -> Option<u64> {
+    let now = now_ms();
+    let at = RAM_SEEN[0].load(Ordering::Relaxed);
+    if at != 0 && now < at + 20 {
+        return Some(RAM_SEEN[1].load(Ordering::Relaxed));
+    }
+    let free = available_physical_ram()?;
+    RAM_SEEN[1].store(free, Ordering::Relaxed);
+    RAM_SEEN[0].store(now.max(1), Ordering::Relaxed);
+    Some(free)
+}
+
+/// The RAM throttle, since the start: buffers that waited, milliseconds
+/// waited, buffers made at once for the second's share being spent, waits
+/// cut at [`ram_wait_most`], the longest wait in ms, the least RAM free
+/// seen while waiting (MB, `u64::MAX` before any wait).
+static RAM_GATE: [std::sync::atomic::AtomicU64; 6] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(u64::MAX),
+];
+/// The title's heartbeat flag the throttle sets while it holds the title
+/// back (`VICTORY_RAM_KEEP_ALIVE=1`, `victory_loader::heartbeat`), 0: none.
+static RAM_KEEP_ALIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// See [`RAM_KEEP_ALIVE`]: `flag` is a byte of the title's image.
+pub fn ram_keep_alive_at(flag: usize) {
+    RAM_KEEP_ALIVE.store(flag, Ordering::Relaxed);
+}
+
+/// In a wait of the throttle: the title's main loop would have ticked.
+fn ram_keep_alive() {
+    let flag = RAM_KEEP_ALIVE.load(Ordering::Relaxed);
+    if flag != 0 {
+        // SAFETY: a byte of the mapped title image (checked by its build's
+        // code, `victory_loader::heartbeat`), which the title itself writes
+        // the same way.
+        unsafe { (flag as *mut u8).write_volatile(1) };
+    }
+}
+
+/// The second [`ram_wait_share`] is counted in (above [`SPENT_BITS`]) and
+/// the milliseconds spent of it (below), in one word: a new second and a
+/// charge to it are one operation ([`take_share`]).
+static RAM_SHARE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The bits of [`RAM_SHARE`] that hold the milliseconds spent (at most
+/// 1,000 of a second).
+const SPENT_BITS: u32 = 20;
+
+/// [`RAM_SHARE`]'s word after `step` ms are charged in `second`, or `None`
+/// when that would spend more than `share` ms of it. A second later than the
+/// word's starts at 0; an earlier one (a thread that read the clock before
+/// another moved the word on) is charged to the word's own second, so the
+/// word never goes back and no charge is lost.
+fn charged(word: u64, second: u64, step: u64, share: u64) -> Option<u64> {
+    let at = (word >> SPENT_BITS).max(second);
+    let spent = if word >> SPENT_BITS == at {
+        word & ((1 << SPENT_BITS) - 1)
+    } else {
+        0
+    };
+    (spent + step <= share).then_some((at << SPENT_BITS) | (spent + step))
+}
+
+/// Charges `step` ms of `second` to `slot` if the share has room for them.
+fn take_share(slot: &std::sync::atomic::AtomicU64, second: u64, step: u64, share: u64) -> bool {
+    slot.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |word| {
+        charged(word, second, step, share)
+    })
+    .is_ok()
+}
+
+/// Whether the RAM throttle holds back a buffer of `size` bytes about to be
+/// made in the PC's memory, with `free` bytes of RAM free and `floor` the
+/// throttle's floor (0: no throttle).
+fn ram_held(free: Option<u64>, size: u64, floor: u64) -> bool {
+    floor > 0 && free.is_some_and(|free| free < floor.saturating_add(size))
+}
+
+/// Holds back a buffer of `size` bytes about to be made in the PC's memory
+/// (shared with the card, or upload memory: either is locked in RAM as long
+/// as it lives) while less than the floor ([`ram_floor`]) would be left
+/// free: for up to [`ram_wait_most`] ms each, at most [`ram_wait_share`] ms
+/// of every second for all threads, in steps of 10 ms. Then it is made,
+/// room or not: the throttle only slows the making, it never refuses.
+///
+/// Why: as the world streams in, the layer makes gigabytes of such buffers
+/// in seconds (on the RTX 3050 laptop with 16 GB, the memory shared with
+/// the card went from 0.7 to 5.3 GB in 20 s of one measured run), faster than
+/// Windows writes what it takes from others to the page file (2.5 GB were
+/// waiting to be written then). Free RAM fell under 300 MB for seconds and
+/// the PC paged the game itself in and out (28,000 pages a second). Each
+/// buffer that waits gives the system time to write those pages out. A
+/// frame there takes a second or two anyway.
+pub(crate) fn ram_gate(size: u64) {
+    let floor = ram_floor();
+    if floor == 0 || !ram_held(ram_free_now(), size, floor) {
+        return;
+    }
+    let (most, share) = (ram_wait_most(), ram_wait_share());
+    let begun = now_ms();
+    let mut waited = false;
+    loop {
+        let free = ram_free_now();
+        if !ram_held(free, size, floor) {
+            break;
+        }
+        if let Some(free) = free {
+            RAM_GATE[5].fetch_min(free >> 20, Ordering::Relaxed);
+        }
+        let now = now_ms();
+        if now >= begun + most {
+            RAM_GATE[3].fetch_add(1, Ordering::Relaxed);
+            break;
+        }
+        // The second's share, for all threads together.
+        if !take_share(&RAM_SHARE, now / 1000, 10, share) {
+            RAM_GATE[2].fetch_add(1, Ordering::Relaxed);
+            break;
+        }
+        if !waited {
+            waited = true;
+            RAM_GATE[0].fetch_add(1, Ordering::Relaxed);
+        }
+        ram_keep_alive();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if waited {
+        let ms = now_ms() - begun;
+        RAM_GATE[1].fetch_add(ms, Ordering::Relaxed);
+        RAM_GATE[4].fetch_max(ms, Ordering::Relaxed);
+        ram_gate_said();
+    }
+}
+
+/// Says what the RAM throttle did, every 5 s at most while it holds things
+/// back: the memory line comes with the frame reports, and while the world
+/// loads there may be no frame for many seconds.
+fn ram_gate_said() {
+    static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = now_ms();
+    let said = SAID.load(Ordering::Relaxed);
+    if now < said + 5000
+        || SAID
+            .compare_exchange(said, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    if let Some(line) = ram_gate_line() {
+        tracing::info!("{line}; free now {} MB", ram_free_now().unwrap_or(0) >> 20);
+    }
+}
+
+/// The most milliseconds a submission waits at its start while free RAM is
+/// under the RAM throttle's floor (`VICTORY_RAM_FRAME_WAIT_MS`; 0, the
+/// default, none). See [`ram_gate_submission`].
+fn ram_frame_wait() -> u64 {
+    static MOST: OnceLock<u64> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_RAM_FRAME_WAIT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// Submissions that waited at [`ram_gate_submission`], and the milliseconds;
+/// and when the last wait ended (ms since the start).
+static RAM_FRAME: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// The RAM throttle for the whole title: before a submission starts, while
+/// free RAM is under the floor ([`ram_floor`]), waits in steps of 10 ms for
+/// up to [`ram_frame_wait`] ms. [`ram_gate`] holds back the layer's own
+/// buffers; the title's threads meanwhile keep touching their memory (the
+/// world streams into it), and Windows trims and compresses those pages as
+/// fast as they come. A title waits for its frames, so holding the
+/// submission back holds the title back too, and nothing new is touched
+/// while the system writes out what it took. After a wait the title runs
+/// for as long again before the next (a frame has many submissions): it
+/// is held back half of the time at most, and never long enough for its
+/// watchdog (30 s without a frame).
+pub(crate) fn ram_gate_submission() {
+    let (floor, most) = (ram_floor(), ram_frame_wait());
+    if floor == 0 || most == 0 {
+        return;
+    }
+    let begun = now_ms();
+    let last = RAM_FRAME[2].load(Ordering::Relaxed);
+    if (last != 0 && begun < last + last_wait_ms().max(100)) || !ram_held(ram_free_now(), 0, floor)
+    {
+        return;
+    }
+    while now_ms() < begun + most && ram_held(ram_free_now(), 0, floor) {
+        ram_keep_alive();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let end = now_ms();
+    LAST_WAIT.store(end - begun, Ordering::Relaxed);
+    RAM_FRAME[0].fetch_add(1, Ordering::Relaxed);
+    RAM_FRAME[1].fetch_add(end - begun, Ordering::Relaxed);
+    RAM_FRAME[2].store(end.max(1), Ordering::Relaxed);
+    ram_gate_said();
+}
+
+/// How long the last wait at [`ram_gate_submission`] took, in ms.
+static LAST_WAIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn last_wait_ms() -> u64 {
+    LAST_WAIT.load(Ordering::Relaxed)
+}
+
+/// For the memory line: what the RAM throttle did since the start
+/// ([`RAM_GATE`]); `None` with no throttle.
+pub(crate) fn ram_gate_line() -> Option<String> {
+    let floor = ram_floor();
+    if floor == 0 {
+        return None;
+    }
+    let g = |i: usize| RAM_GATE[i].load(Ordering::Relaxed);
+    let least = g(5);
+    Some(format!(
+        "RAM throttle (floor {} MB): {} buffers waited {:.1} s in all (the longest {} ms), {} cut at {} ms, {} made at once \
+         for the second's {} ms being spent; the least RAM free while waiting: {}; submissions held back: {} for {:.1} s \
+         (at most {} ms each)",
+        floor >> 20,
+        g(0),
+        g(1) as f64 / 1000.0,
+        g(4),
+        g(3),
+        ram_wait_most(),
+        g(2),
+        ram_wait_share(),
+        if least == u64::MAX {
+            "-".to_string()
+        } else {
+            format!("{least} MB")
+        },
+        RAM_FRAME[0].load(Ordering::Relaxed),
+        RAM_FRAME[1].load(Ordering::Relaxed) as f64 / 1000.0,
+        ram_frame_wait(),
+    ))
 }
 
 /// How long host copies of textures the title fills must have been idle to
@@ -1099,6 +1403,7 @@ fn create() -> windows::core::Result<Host> {
             adapter,
             fallback_view: OnceLock::new(),
             fallback_sampler: OnceLock::new(),
+            texture_readbacks: ReadbackPool::new(),
         })
     }
 }
@@ -2010,6 +2315,332 @@ impl<T> Spare<T> {
         self.bytes += size;
         self.kept.push((thing, size));
         None
+    }
+}
+
+/// Texture readback buffers are kept apart from the mapped upload chunks.
+/// Pool only common sizes and count buffer widths, not driver residency.
+fn texture_readback_idle_limit() -> u64 {
+    static LIMIT: OnceLock<u64> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        if !std::env::var_os("VICTORY_READBACK_POOL").is_some_and(|value| value == "1") {
+            return 0;
+        }
+        std::env::var("VICTORY_READBACK_POOL_MB")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .and_then(|mib| mib.checked_mul(1 << 20))
+            .unwrap_or(256 << 20)
+    })
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ReadbackStats {
+    pub(crate) created: u64,
+    pub(crate) reused: u64,
+    pub(crate) allocation_failures: u64,
+    pub(crate) allocation_us: u64,
+    pub(crate) peak_allocation_us: u64,
+    pub(crate) active_buffers: u64,
+    pub(crate) active_bytes: u64,
+    pub(crate) peak_active_bytes: u64,
+    pub(crate) idle_bytes: u64,
+    pub(crate) peak_idle_bytes: u64,
+}
+
+struct ReadbackPool<T>(Mutex<(Spare<T>, ReadbackStats)>);
+
+impl<T> ReadbackPool<T> {
+    fn new() -> Self {
+        Self(Mutex::new((Spare::new(), ReadbackStats::default())))
+    }
+
+    fn take(
+        &self,
+        size: u64,
+        idle_limit: u64,
+        mut allocate: impl FnMut(u64) -> Option<T>,
+    ) -> Option<ReadbackLease<'_, T>> {
+        let size = size.max(1);
+        let class = size
+            .max(64 << 10)
+            .checked_next_power_of_two()
+            .filter(|&bytes| bytes <= (16 << 20) && bytes <= idle_limit);
+        if let Some(bytes) = class {
+            let (idle, stats) = &mut *self.0.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(buffer) = idle.take(bytes) {
+                stats.reused += 1;
+                stats.idle_bytes = idle.bytes;
+                return Some(self.lease(buffer, bytes, idle_limit, stats));
+            }
+        }
+
+        // Do not hold the pool lock across a driver allocation. If rounding
+        // up was refused, make the old, exact-sized allocation once.
+        let capacity = class.unwrap_or(size);
+        let mut allocation_us = 0;
+        let mut peak_allocation_us = 0;
+        let mut measured_allocate = |bytes| {
+            let started = std::time::Instant::now();
+            let buffer = allocate(bytes);
+            let us = started.elapsed().as_micros() as u64;
+            allocation_us += us;
+            peak_allocation_us = peak_allocation_us.max(us);
+            buffer
+        };
+        let (buffer, bytes, retain, failed_first) = match measured_allocate(capacity) {
+            Some(buffer) => (Some(buffer), capacity, class.map_or(0, |_| idle_limit), 0),
+            None if capacity != size => (measured_allocate(size), size, 0, 1),
+            None => (None, size, 0, 0),
+        };
+        let (_, stats) = &mut *self.0.lock().unwrap_or_else(|e| e.into_inner());
+        stats.allocation_failures += failed_first + u64::from(buffer.is_none());
+        stats.allocation_us += allocation_us;
+        stats.peak_allocation_us = stats.peak_allocation_us.max(peak_allocation_us);
+        let buffer = buffer?;
+        stats.created += 1;
+        Some(self.lease(buffer, bytes, retain, stats))
+    }
+
+    fn lease(
+        &self,
+        buffer: T,
+        bytes: u64,
+        idle_limit: u64,
+        stats: &mut ReadbackStats,
+    ) -> ReadbackLease<'_, T> {
+        stats.active_buffers += 1;
+        stats.active_bytes += bytes;
+        stats.peak_active_bytes = stats.peak_active_bytes.max(stats.active_bytes);
+        ReadbackLease { pool: self, buffer: Some(buffer), bytes, idle_limit }
+    }
+}
+
+pub(crate) type TextureReadback = ReadbackLease<'static, ID3D12Resource>;
+
+/// An exclusive buffer owned by a list's recorded texture readback. It stays
+/// checked out while that recording exists, even after one execution lands.
+pub(crate) struct ReadbackLease<'a, T> {
+    pool: &'a ReadbackPool<T>,
+    buffer: Option<T>,
+    bytes: u64,
+    idle_limit: u64,
+}
+
+impl<T> ReadbackLease<'_, T> {
+    pub(crate) fn resource(&self) -> &T {
+        self.buffer.as_ref().expect("a live readback has its buffer")
+    }
+
+    pub(crate) fn stats(&self) -> ReadbackStats {
+        self.pool.0.lock().unwrap_or_else(|e| e.into_inner()).1
+    }
+}
+
+impl<T> Drop for ReadbackLease<'_, T> {
+    fn drop(&mut self) {
+        let Some(buffer) = self.buffer.take() else { return };
+        let released = {
+            let (idle, stats) = &mut *self.pool.0.lock().unwrap_or_else(|e| e.into_inner());
+            stats.active_buffers -= 1;
+            stats.active_bytes -= self.bytes;
+            let released = idle.give(buffer, self.bytes, self.idle_limit);
+            stats.idle_bytes = idle.bytes;
+            stats.peak_idle_bytes = stats.peak_idle_bytes.max(stats.idle_bytes);
+            released
+        };
+        // Drop a committed D3D12 resource outside the lock.
+        drop(released);
+    }
+}
+
+fn texture_readback_fence_error(
+    completed: u64,
+    submitted: u64,
+    report_removed: impl FnOnce() -> String,
+) -> Option<String> {
+    // D3D12 uses UINT64_MAX for a removed device.
+    if completed == u64::MAX {
+        Some(report_removed())
+    } else if completed < submitted {
+        Some(format!("texture readback pool cannot retire before fence {submitted} (completed {completed})"))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod readback_pool_tests {
+    use super::*;
+
+    #[test]
+    fn readback_fence_preserves_device_removal_details() {
+        let describe = || "device removed with breadcrumbs".to_owned();
+        assert_eq!(
+            texture_readback_fence_error(u64::MAX, 8, describe).as_deref(),
+            Some("device removed with breadcrumbs")
+        );
+        assert!(texture_readback_fence_error(7, 8, || panic!("no device removal"))
+            .unwrap().contains("before fence 8 (completed 7)"));
+        assert!(texture_readback_fence_error(8, 8, || panic!("fence complete")).is_none());
+    }
+
+    #[test]
+    fn readback_pool_leases_are_exclusive_until_retired_and_idle_bytes_are_bounded() {
+        const CLASS: u64 = 64 << 10;
+        let pool = ReadbackPool::new();
+        let mut created = 0;
+        let mut allocate = |bytes| {
+            assert_eq!(bytes, CLASS);
+            created += 1;
+            Some(created)
+        };
+        let first = pool.take(32 << 10, CLASS, &mut allocate).unwrap();
+        let second = pool.take(32 << 10, CLASS, &mut allocate).unwrap();
+        assert_eq!(*first.resource(), 1);
+        assert_eq!(*second.resource(), 2);
+        // Inspecting the same recording again (as a repeated submission
+        // does at landing) cannot make its still-owned buffer available.
+        assert_eq!(*first.resource(), 1);
+        let stats = first.stats();
+        assert_eq!((stats.created, stats.reused, stats.active_buffers), (2, 0, 2));
+        assert_eq!((stats.active_bytes, stats.peak_active_bytes, stats.idle_bytes), (2 * CLASS, 2 * CLASS, 0));
+
+        drop(first);
+        let reused = pool.take(32 << 10, CLASS, &mut allocate).unwrap();
+        assert_eq!(*reused.resource(), 1);
+        assert_eq!(*second.resource(), 2);
+        drop(reused);
+        drop(second);
+        let stats = pool.0.lock().unwrap().1;
+        assert_eq!((stats.created, stats.reused, stats.active_buffers, stats.active_bytes), (2, 1, 0, 0));
+        assert_eq!((stats.idle_bytes, stats.peak_idle_bytes), (CLASS, CLASS));
+    }
+
+    #[test]
+    fn readback_pool_uses_exact_unshared_allocations_when_disabled_or_over_the_class_limit() {
+        let pool = ReadbackPool::new();
+        for (size, limit) in [(32 << 10, 0), (32 << 10, 16 << 10), ((16 << 20) + 1, 256 << 20)] {
+            let lease = pool.take(size, limit, Some).unwrap();
+            assert_eq!(*lease.resource(), size);
+        }
+        let stats = pool.0.lock().unwrap().1;
+        assert_eq!((stats.created, stats.reused, stats.idle_bytes, stats.active_buffers), (3, 0, 0, 0));
+    }
+
+    #[test]
+    fn readback_pool_tries_original_size_after_a_rounded_allocation_fails() {
+        let pool = ReadbackPool::new();
+        let mut attempts = Vec::new();
+        let lease = pool
+            .take(32 << 10, 256 << 20, |size| {
+                attempts.push(size);
+                (size == (32 << 10)).then_some(size)
+            })
+            .unwrap();
+        assert_eq!(attempts, [64 << 10, 32 << 10]);
+        assert_eq!(lease.stats().allocation_failures, 1);
+        assert_eq!(*lease.resource(), 32 << 10);
+        drop(lease);
+        assert!(pool.take(32 << 10, 256 << 20, |_| None).is_none());
+        let stats = pool.0.lock().unwrap().1;
+        assert_eq!((stats.created, stats.allocation_failures, stats.idle_bytes), (1, 3, 0));
+    }
+
+    #[test]
+    fn readback_pool_keeps_closed_recordings_exclusive_until_reset() {
+        const ROW: u64 = 256;
+        const CLASS: u64 = 64 << 10;
+        let host = host().expect("D3D12 is needed for the readback recording test");
+        // SAFETY: a private queue and fence on the same device as the test lists.
+        let (queue, fence): (ID3D12CommandQueue, ID3D12Fence) = unsafe {
+            (
+                host.device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                }).unwrap(),
+                host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap(),
+            )
+        };
+        let submit = |lists: &[Option<ID3D12CommandList>], target| {
+            // SAFETY: lists are closed and their resources are kept through completion.
+            let signal = unsafe {
+                queue.ExecuteCommandLists(lists);
+                queue.Signal(&fence, target)
+            };
+            if signal.is_err() {
+                return false;
+            }
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                // SAFETY: a plain query of the test's private fence.
+                let completed = unsafe { fence.GetCompletedValue() };
+                if completed == u64::MAX || std::time::Instant::now() >= end {
+                    return false;
+                }
+                if completed >= target {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        };
+        let take = || -> TextureReadback {
+            host.texture_readbacks
+                .take(ROW, CLASS, |bytes| host.read_back_buffer(bytes))
+                .expect("a pooled readback buffer")
+        };
+        let record = |source: &ID3D12Resource, lease: TextureReadback, dst: &mut [u8; ROW as usize]| {
+            let list = host.new_list().unwrap();
+            // SAFETY: a full initialized upload row, an open list, and a
+            // live readback resource in COPY_DEST.
+            unsafe { list.list.CopyBufferRegion(lease.resource(), 0, source, 0, ROW) };
+            list.deferred().texture_backs.push(crate::texback::buffer_back_for_test(lease, dst));
+            list.close();
+            list
+        };
+        let upload = |value: u8| {
+            let (buffer, data) = host.upload_buffer(ROW).expect("a mapped upload row");
+            assert!(!data.is_null());
+            // SAFETY: the upload row is mapped and has no GPU users yet.
+            unsafe { data.write_bytes(value, ROW as usize) };
+            (buffer, data)
+        };
+        let (source_a, data_a) = upload(0x1a);
+        let mut dst_a = [0; ROW as usize];
+        let lease_a = take();
+        let address_a = lease_a.resource().as_raw();
+        let list_a = record(&source_a, lease_a, &mut dst_a);
+        if !submit(&[Some(list_a.list.cast().unwrap())], 1) {
+            // Keep potential GPU uses alive on the failure path.
+            std::mem::forget((list_a, source_a, queue.clone(), fence.clone()));
+            panic!("first readback fence did not complete");
+        }
+        read_backs(&list_a);
+        assert_eq!(&dst_a[..4], &[0x1a; 4]);
+
+        // The first fence did not retire the closed recording. A second
+        // list must get a different destination before both run together.
+        let lease_b = take();
+        assert_ne!(lease_b.resource().as_raw(), address_a);
+        let (source_b, _) = upload(0x2b);
+        let mut dst_b = [0; ROW as usize];
+        let list_b = record(&source_b, lease_b, &mut dst_b);
+        // SAFETY: the previous GPU read of source_a has finished.
+        unsafe { data_a.write_bytes(0x3c, ROW as usize) };
+        let lists = [Some(list_a.list.cast().unwrap()), Some(list_b.list.cast().unwrap())];
+        if !submit(&lists, 2) {
+            std::mem::forget((list_a, list_b, source_a, source_b, queue.clone(), fence.clone()));
+            panic!("second readback fence did not complete");
+        }
+        drop(lists);
+        read_backs(&list_a);
+        read_backs(&list_b);
+        assert_eq!(&dst_a[..4], &[0x3c; 4]);
+        assert_eq!(&dst_b[..4], &[0x2b; 4]);
+
+        list_a.reset();
+        let reassigned = take();
+        assert_eq!(reassigned.resource().as_raw(), address_a);
     }
 }
 
@@ -3686,6 +4317,10 @@ fn relay_worker() {
                     .collect();
                 // SAFETY: a plain query.
                 let completed = unsafe { host.fence.GetCompletedValue() };
+                if texture_readback_idle_limit() != 0 && completed == u64::MAX {
+                    drop(line);
+                    fail(format_args!("texture readback pool cannot retire after device removal"));
+                }
                 let n = landable(&fences, completed);
                 if n == 0 {
                     // The first thing is a flight the card has not run.
@@ -5691,6 +6326,21 @@ impl Host {
                         Err(e) => tracing::warn!(error = %e, "submissions sent ahead not waited for"),
                     }
                 }
+                let report_removed = || {
+                    let runs: Vec<&HostList> = items
+                        .iter()
+                        .filter_map(|i| match i {
+                            Late::Run(f) => Some(f),
+                            _ => None,
+                        })
+                        .flat_map(|f| f.order.iter().map(|&i| f.lists[i].host()))
+                        .collect();
+                    format!(
+                        "host GPU device removed after {flights} submissions sent ahead (VICTORY_LATE_WAIT=1) of {} lists{}{}",
+                        runs.len(), self.removal_data(&runs), last_notes(&runs)
+                    )
+                };
+                self.verify_texture_readback_fence(*submitted, report_removed);
                 let gpu = waiting.elapsed();
                 LATE_STATS[12].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 LATE_WAITED[why.min(10)].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
@@ -5701,20 +6351,7 @@ impl Host {
                 });
                 // SAFETY: a plain query.
                 if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
-                    let runs: Vec<&HostList> = items
-                        .iter()
-                        .filter_map(|i| match i {
-                            Late::Run(f) => Some(f),
-                            _ => None,
-                        })
-                        .flat_map(|f| f.order.iter().map(|&i| f.lists[i].host()))
-                        .collect();
-                    fail(format_args!(
-                        "host GPU device removed after {flights} submissions sent ahead (VICTORY_LATE_WAIT=1) of {} lists{}{}",
-                        runs.len(),
-                        self.removal_data(&runs),
-                        last_notes(&runs)
-                    ));
+                    fail(format_args!("{}", report_removed()));
                 }
                 submitting(3, flights);
                 let copying = std::time::Instant::now();
@@ -5886,6 +6523,8 @@ impl Host {
             None => runs,
         };
         let parts: Vec<usize> = parts.iter().map(|&n| n + usize::from(own.is_some())).collect();
+        // While RAM is short the title waits here (`VICTORY_RAM_FRAME_WAIT_MS`).
+        ram_gate_submission();
         stage.next("submit: the sweep");
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
@@ -6150,6 +6789,12 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [(&lists[..], ())];
+        let report_removed = || {
+            format!(
+                "host GPU device removed after a submission of {} lists{}{}",
+                runs.len(), self.removal_data(runs), last_notes(runs)
+            )
+        };
         submitting(2, runs.len());
         for (_i, &(group, _kind)) in groups.iter().enumerate() {
             *submitted += 1;
@@ -6176,6 +6821,7 @@ impl Host {
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
             }
+            self.verify_texture_readback_fence(*submitted, report_removed);
             // With timing on each group is one of `runs` (and the compare
             // of copies in the card's memory, with the last): every
             // command's time on the card goes to the sums by pipeline.
@@ -6236,12 +6882,7 @@ impl Host {
         }
         // SAFETY: a plain query.
         if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
-            fail(format_args!(
-                "host GPU device removed after a submission of {} lists{}{}",
-                runs.len(),
-                self.removal_data(runs),
-                last_notes(runs)
-            ));
+            fail(format_args!("{}", report_removed()));
         }
         submitting(3, runs.len());
         stage.next("submit: copying back");
@@ -6717,7 +7358,12 @@ impl HostList {
         let _resetting = crate::timeline::span("resetting a host list");
         self._alive.used();
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *self.deferred() = Deferred::default();
+        let texture_backs = {
+            let mut deferred = self.deferred();
+            let texture_backs = std::mem::take(&mut deferred.texture_backs);
+            *deferred = Deferred::default();
+            texture_backs
+        };
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -6743,6 +7389,8 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        // Reuse only after the old native commands have been discarded.
+        drop(texture_backs);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
     }
@@ -9216,7 +9864,25 @@ impl Host {
         &self.queue
     }
 
-    /// A buffer in the upload heap, mapped for writing.
+    pub(crate) fn texture_readback_buffer(&'static self, size: u64) -> Option<TextureReadback> {
+        self.texture_readbacks.take(size, texture_readback_idle_limit(), |bytes| {
+            self.read_back_buffer(bytes)
+        })
+    }
+
+    /// The synchronous wait paths can warn and proceed when setting the
+    /// event fails. A pooled buffer cannot be retired on an unverified wait.
+    /// The relay already selects flights by their completed fence value.
+    fn verify_texture_readback_fence(&self, submitted: u64, report_removed: impl FnOnce() -> String) {
+        if texture_readback_idle_limit() != 0 {
+            // SAFETY: a plain query.
+            let completed = unsafe { self.fence.GetCompletedValue() };
+            if let Some(error) = texture_readback_fence_error(completed, submitted, report_removed) {
+                fail(format_args!("{error}"));
+            }
+        }
+    }
+
     /// A buffer of `size` bytes the card writes and we read (a read back),
     /// in the state copies into it need.
     pub(crate) fn read_back_buffer(&self, size: u64) -> Option<ID3D12Resource> {
@@ -9258,7 +9924,9 @@ impl Host {
         }
     }
 
+    /// A buffer in the upload heap, mapped for writing.
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        ram_gate(size);
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -10250,6 +10918,7 @@ impl Host {
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        ram_gate(size);
         MADE[2].fetch_add(1, Ordering::Relaxed);
         MADE[3].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -11563,6 +12232,63 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!((ms, bytes), (5_000, 5 * gib));
         assert_eq!(vram_keep(100 * gib, 120 * gib), (1_500, 35 * gib));
         assert_eq!(vram_keep(0, 7).0, 5_000);
+    }
+
+    /// The share of a second is spent once over all threads, across the
+    /// turn of a second too: no charge is lost and none is given twice.
+    #[test]
+    fn the_ram_throttle_share_holds_across_a_second_with_concurrent_callers() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, Barrier};
+        assert_eq!(super::charged(0, 5, 10, 30), Some((5 << super::SPENT_BITS) | 10));
+        let full = (5 << super::SPENT_BITS) | 30;
+        assert_eq!(super::charged(full, 5, 10, 30), None);
+        // A new second starts at 0; an earlier one is charged to the word's.
+        assert_eq!(super::charged(full, 6, 10, 30), Some((6 << super::SPENT_BITS) | 10));
+        assert_eq!(super::charged((6 << super::SPENT_BITS) | 10, 5, 10, 30), Some((6 << super::SPENT_BITS) | 20));
+        let (share, step, threads, tries) = (900u64, 10u64, 8usize, 400usize);
+        let slot = Arc::new(AtomicU64::new(0));
+        let counts: Arc<[AtomicU64; 2]> = Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
+        let barrier = Arc::new(Barrier::new(threads));
+        let workers: Vec<_> = (0..threads)
+            .map(|t| {
+                let (slot, counts, barrier) = (slot.clone(), counts.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    for (i, second) in [(0usize, 7u64), (1, 8)] {
+                        barrier.wait();
+                        for n in 0..tries {
+                            // Half of the threads read the clock late: the
+                            // second before, once the word has moved on.
+                            let asked = if i == 1 && t % 2 == 1 && n % 3 == 0 { 7 } else { second };
+                            if super::take_share(&slot, asked, step, share) {
+                                counts[i].fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap();
+        }
+        // Far more asked than the share has room for: exactly the share each second.
+        assert_eq!(counts[0].load(Ordering::Relaxed), share / step);
+        assert_eq!(counts[1].load(Ordering::Relaxed), share / step);
+        assert_eq!(slot.load(Ordering::Relaxed), (8 << super::SPENT_BITS) | share);
+    }
+
+    #[test]
+    fn the_ram_throttle_holds_a_buffer_only_below_its_floor() {
+        let mib = 1u64 << 20;
+        // No throttle.
+        assert!(!super::ram_held(Some(0), mib, 0));
+        // Free RAM not known: never held.
+        assert!(!super::ram_held(None, mib, 1000 * mib));
+        // What would be left counts, not what is free now.
+        assert!(!super::ram_held(Some(1001 * mib), mib, 1000 * mib));
+        assert!(super::ram_held(Some(1001 * mib), 2 * mib, 1000 * mib));
+        assert!(super::ram_held(Some(300 * mib), mib, 1000 * mib));
+        assert!(!super::ram_held(Some(u64::MAX), u64::MAX, u64::MAX));
     }
 
     #[test]

@@ -3,6 +3,8 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+#[cfg(agility_sdk)]
+mod agility;
 mod census;
 mod inspect;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -187,6 +189,8 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let cli = Cli::parse();
+    #[cfg(agility_sdk)]
+    agility::check_runtime()?;
     match cli.command {
         Command::Inspect {
             file,

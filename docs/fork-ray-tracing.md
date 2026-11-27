@@ -190,6 +190,34 @@ on black pixels, preserved bright and saturated light, and dispatch bounds.
 Settings and routing tests cover disabled or invalid levels, the maximum
 clamp, valid depth, and incompatible dimensions, samples or texture type.
 
+## Optional neutral probe replacement
+
+With the depth-free minimum enabled, `VICTORY_AMBIENT_FLAT_REPLACE=1`
+replaces that resolve's entire diffuse probe output with the configured
+warm-neutral level. For example, enable the ambient stand-in and set
+`VICTORY_AMBIENT_FLAT=0.3` and `VICTORY_AMBIENT_FLAT_REPLACE=1`.
+The option defaults off; only the exact value `1` enables it. Restart after
+changing it. The ordinary valid-depth estimate and existing builder gate
+are unchanged. A diagnostic message identifies actual replacement use.
+
+This isolates the diffuse probe contribution when surfaces show spurious
+coloured illumination. It is a workaround, not a repair of the producer:
+it also discards legitimate indirect colour, intensity and variation.
+Other lighting passes, including direct lights and reflections, are not
+disabled, but their final composite appearance can change with diffuse
+illumination. Unlike the ordinary floor, replacement does not preserve
+existing probe light, even when brighter than the configured level.
+
+Compare with replacement off while keeping the ambient level and all other
+settings identical. The local implementation comes from `31bd277` by
+Vladimir Vasiltsov. Existing user observations compare a combined local
+configuration; an isolation-only recorded comparison is still required.
+
+Synthetic GPU readback covers replacement of black, gray, bright and
+saturated red, green, blue and magenta inputs with the same neutral value.
+It also checks that the ordinary floor still preserves existing light
+when replacement is disabled, and leaves out-of-bounds pixels untouched.
+
 ## Where to look
 
 - `crates/victory-shader/src/bvh.rs`: the reference for the node test.

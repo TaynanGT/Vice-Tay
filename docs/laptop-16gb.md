@@ -76,3 +76,39 @@ to the binary it used.
 | `VICTORY_TEXTURE_ROOM_PERCENT=75` | 1,210 / 1,263 ms | no more windows on the card, less free RAM |
 
 Identical settings vary about 2× in frame counts between runs, so these numbers show the runs survive, not how fast they are.
+
+## Optional upload guardrails
+
+Speculative texture uploads now leave the existing 1 GiB commit reserve **after** subtracting the requested new staging storage: a full 64 MiB pool block, or the calculated standalone upload footprint. Existing pool space can still be reused, and a smaller standalone upload can fit even when a new pool block cannot. Deferred uploads remain retryable. Table-bound textures and decoration bakes are not treated as speculative uploads, because dropping those uploads would leave required textures uninitialized.
+
+These are sampled admission checks, not a hard cap on concurrent process or system allocations. They preserve the existing pressure hysteresis and allocation-failure cooldown; they do not shrink required title allocations, guarantee that a world load fits, or correct an unrelated null dereference.
+
+## Validation on the RTX 2060 host
+
+The following is a host snapshot, not a game-run measurement. On 2026-11-27 at 16:07:51 +01:00, Windows reported 16,326 MiB physical RAM, 8,157 MiB free, and system commitment of 12,254 / 25,030 MiB (12,776 MiB headroom). The system-managed page file was 8,704 MiB allocated, 308 MiB in use, and 1,586 MiB peak. The laptop preset reported `VICTORY_WORKING_SET_MB=4702`; that limits the game's resident working set, not its private commit or total system commitment. The page file was left unchanged. Earlier Series S measurements in this document are from another machine and do not establish this host's peak requirement.
+
+The matching launch log records a `host memory pressure` warning with 3,024 MiB of available commit and 7,702 MiB of free physical RAM. That is evidence of limited system headroom, but not a failed title allocation or proof that memory pressure caused the crash. The crash report's `TileHeap` value (174 MiB used of 6,236 MiB) is allocator accounting, not proof that the same amount of physical RAM was committed. The repeated `0xc0000005` null read at `victory-image-…+0xb5a5f8` occurs in `Game Init`, frame 0; its cause remains unproven.
+
+`victory.toml` still names the old game directory. This corrected-path preparation command was verified with `-DryRun` only:
+
+```powershell
+.\scripts\play.ps1 -Exe 'C:\Misc\Torrents\downloads\vc\game_scarlett_master.exe' -Machine laptop -More @{ VICTORY_GAME_DIR = 'C:\Misc\Torrents\downloads\vc' } -DryRun
+```
+
+The title executable hashes to `E95020B2FA4A721DB3DF59FDECF75621730AC559D8835252F6C3B658D5A08993`. Before rebuilding, `victory.exe` and its symbols were preserved under the local, ignored `target\startup-memory-evidence-20261127` directory. That executable hashes to `2D6DCB9FBEF84B5B00D216254BCB59DAE85390E9F3FB24CFAAF439266D2088BC`, consistent with the abbreviated runtime hash in `claude-context.md`. The capture has no title-executable hash, so identity with the original game binary is not established. The diagnostic executable built at `b25e759` after incorporating upstream through `16edfec` hashes to `9BE540C215B1C85C6040658CF9FBC718F0D4864D01FA757134AAC0E20875FACF`.
+
+The `-More` plumbing was also dry-run checked one variable at a time for `VICTORY_ASYNC_SUBMIT=0`, `VICTORY_THIN=0`, and `VICTORY_MAP_THREADS=1`, always retaining the corrected `VICTORY_GAME_DIR`. Those `-DryRun` checks establish launcher precedence only; they do not exercise the title.
+
+The inherited `VICTORY_THIN=1` setting initially made `resource::tests::buffer_data_reaches_the_host_texture` fail because thin lists intentionally have no host command list to retain the host texture. With `VICTORY_THIN=0`, the focused test passed. After incorporating upstream through `16edfec`, both serial and parallel GPU runs passed (491 passed, 43 ignored each). An earlier combined parallel run failed two other tests, which passed individually and in the subsequent complete runs; the unmodified upstream baseline also passed (487 passed, 43 ignored). That intermittent failure remains unexplained, not established as pre-existing. The following checks passed after synchronization:
+
+```powershell
+$env:VICTORY_THIN = '0'
+cargo test --locked -p victory-gpu
+cargo test --locked -p victory-gpu -- --test-threads=1
+cargo build --locked --profile diag -p victory --features diagnostics
+.\scripts\test-play.ps1
+```
+
+The launcher check mocks CIM and file queries, covers unavailable/partial memory data, inherited paths and explicit overrides, and never invokes an executable. `git diff --check` passed. Rust edition 2024 formatting checks still report differences in all four touched Rust files; formatting the default-branch versions also changes those files, so unrelated whole-file formatting was not applied.
+
+No debugger was available on PATH or in the checked Windows SDK locations. The Agility SDK support exists in `apps/victory/build.rs` and `apps/victory/src/agility.rs`, but `target\diag\D3D12\D3D12Core.dll` was absent and that route was not tested. No usable full-session recording/external low-memory-stop workflow was established. Do not remove `-DryRun` until those safeguards are ready. Repeated startup, world loading, video review, frame-time/image-quality comparison, and the diagnostic controls remain unverified. No page-file, watchdog, console-identity, or image-quality setting was changed, and no startup correction is claimed.

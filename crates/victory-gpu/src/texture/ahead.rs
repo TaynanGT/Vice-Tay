@@ -105,7 +105,9 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
         return way.iter().find(|(serial, _)| *serial == copy.serial).map(|(_, job)| Taken::Known(job.clone()));
     }
     let most = if crate::residency::limited_host_ram() { 32 << 20 } else { MOST };
-    if !crate::residency::allow_staging_growth(false)
+    // Work eligibility is distinct from staging growth: `staging` charges a
+    // new block or standalone buffer only if the existing pool cannot reuse one.
+    if !crate::residency::admit_texture_pass(false)
         || BYTES.load(Relaxed) >= most
         || copy.flags() & 0x7 != 0
         || copy.state.load(Relaxed) != 0

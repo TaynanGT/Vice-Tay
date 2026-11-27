@@ -175,6 +175,19 @@ $discarded = $inherited | Where-Object {
 if ($discarded) {
     Write-Host "Discarded inherited values for $($discarded.Name -join ', '). Use -More to pass them explicitly."
 }
+if ($hasNvidia -or $Machine -ne '7900xtx') {
+    $waveWideActive = $settings['VICTORY_WAVE_WIDE'] -eq '1' -and [string]::IsNullOrEmpty([string]$settings['VICTORY_WAVE_WIDE_ONLY'])
+    $inheritedWaveWide = $inherited | Where-Object { $_.Name -eq 'VICTORY_WAVE_WIDE' } | Select-Object -First 1
+    $inheritedWaveWideOnly = $inherited | Where-Object { $_.Name -eq 'VICTORY_WAVE_WIDE_ONLY' } | Select-Object -First 1
+    $waveWideInherited = -not $More.ContainsKey('VICTORY_WAVE_WIDE') -and
+        $inheritedWaveWide -and $inheritedWaveWide.Value -eq '1' -and
+        (-not $inheritedWaveWideOnly -or [string]::IsNullOrEmpty($inheritedWaveWideOnly.Value))
+    if ($waveWideActive) {
+        Write-Warning "VICTORY_WAVE_WIDE=1 without VICTORY_WAVE_WIDE_ONLY enables unrestricted wave-wide barriers across all wave64 compute shaders on NVIDIA, which can cause TDR (0x887A0006) hangs. Since PR #161, the 4 safe shaders are enabled by default; unset VICTORY_WAVE_WIDE or pass VICTORY_WAVE_WIDE_ONLY."
+    } elseif ($waveWideInherited) {
+        Write-Warning "Inherited VICTORY_WAVE_WIDE=1 without VICTORY_WAVE_WIDE_ONLY was discarded for this launch. Since PR #161, the 4 safe shaders are enabled by default; VICTORY_WAVE_WIDE=1 alone enables unrestricted wave-wide barriers across all wave64 compute shaders on NVIDIA (which can cause TDR 0x887A0006 hangs). Unset VICTORY_WAVE_WIDE or pass VICTORY_WAVE_WIDE_ONLY."
+    }
+}
 $Exe = (Resolve-Path -LiteralPath $Exe).Path
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
 try {

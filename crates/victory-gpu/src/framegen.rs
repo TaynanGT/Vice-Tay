@@ -14,8 +14,13 @@ use std::time::Instant;
 
 use windows::Win32::Foundation::{HWND, S_OK};
 use windows::Win32::Graphics::Direct3D12::{
-    ID3D12CommandQueue, ID3D12Device, ID3D12GraphicsCommandList, ID3D12Resource,
+    D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_DESC,
+    D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+    D3D12_RESOURCE_STATES, ID3D12CommandQueue, ID3D12Device, ID3D12GraphicsCommandList,
+    ID3D12Resource,
 };
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
     DXGI_PRESENT, DXGI_SWAP_CHAIN_DESC1, IDXGIFactory2, IDXGISwapChain3, IDXGISwapChain4,
 };
@@ -777,6 +782,73 @@ fn configure(api: &Api, state: &State, frame: u64, enabled: bool) -> bool {
     result == OK
 }
 
+pub(crate) const UI_READ: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATES(
+    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0,
+);
+
+pub(crate) fn separate_title_ui() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var_os("VICTORY_FRAMEGEN_SEPARATE_UI").is_some_and(|v| v == "1"))
+}
+
+/// The straight copy path needs identical layouts. Other planes still use
+/// the scaled two-plane compositor.
+pub(crate) fn ui_copy_source(desc: &D3D12_RESOURCE_DESC, (width, height): (u32, u32)) -> bool {
+    desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && desc.Width == u64::from(width)
+        && desc.Height == height
+        && desc.DepthOrArraySize == 1
+        && desc.MipLevels == 1
+        && desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM
+        && desc.SampleDesc.Count == 1
+        && desc.SampleDesc.Quality == 0
+}
+
+pub(crate) fn title_ui_texture(
+    device: &ID3D12Device,
+    (width, height): (u32, u32),
+) -> windows::core::Result<ID3D12Resource> {
+    let mut resource = None;
+    // SAFETY: the single-sample RGBA texture and out pointer are valid.
+    unsafe {
+        device.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            },
+            D3D12_HEAP_FLAG_NONE,
+            &D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: u64::from(width),
+                Height: height,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                ..Default::default()
+            },
+            UI_READ,
+            None,
+            &mut resource,
+        )?;
+    }
+    resource.ok_or_else(windows::core::Error::empty)
+}
+
+/// Register a surface before omitting the title UI from the base frame.
+/// An unsuccessful registration leaves the normal compositor available.
+pub(crate) fn set_ui(ui: Option<&ID3D12Resource>) -> bool {
+    let Some(api) = api() else { return false };
+    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let _sdk = SDK.lock().unwrap_or_else(|e| e.into_inner());
+    state.swap_context != 0 && register_ui(api, &mut state, ui)
+}
+
 /// Set the optional image that the proxy composites after interpolation.
 /// With internal buffering, Present consumes this registration and copies
 /// the image before the game queue can update it again.
@@ -811,7 +883,7 @@ fn register_ui(api: &Api, state: &mut State, ui: Option<&ID3D12Resource>) -> boo
         REPORTED.call_once(|| {
             tracing::warn!(
                 result,
-                "frame generation: AMD could not register the performance panel"
+                "frame generation: AMD could not register the UI texture"
             )
         });
         return false;
@@ -819,21 +891,14 @@ fn register_ui(api: &Api, state: &mut State, ui: Option<&ID3D12Resource>) -> boo
     if ui.is_some() {
         static FIRST: std::sync::Once = std::sync::Once::new();
         FIRST.call_once(|| {
-            tracing::info!(
-                "frame generation: performance panel registered for separate composition"
-            )
+            tracing::info!("frame generation: UI texture registered for separate composition")
         });
     }
     state.ui = ui.cloned();
     true
 }
 
-pub(crate) fn present(
-    swap_chain: &IDXGISwapChain3,
-    frame: u64,
-    token: Option<u64>,
-    ui: Option<&ID3D12Resource>,
-) -> HRESULT {
+pub(crate) fn present(swap_chain: &IDXGISwapChain3, frame: u64, token: Option<u64>) -> HRESULT {
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
     let _sdk = SDK.lock().unwrap_or_else(|e| e.into_inner());
     let enabled = match state.prepared.take() {
@@ -860,9 +925,6 @@ pub(crate) fn present(
             false
         }
     };
-    if let Some(api) = api() {
-        register_ui(api, &mut state, ui);
-    }
     // SAFETY: the caller holds the presenter and has submitted the back buffer.
     let status = unsafe { swap_chain.Present(0, DXGI_PRESENT(0)) };
     state.last_present = Some(frame);
@@ -998,7 +1060,8 @@ pub(crate) fn resize(
 
 #[cfg(test)]
 mod tests {
-    use super::Prepared;
+    use super::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 
     #[test]
     fn generation_uses_only_the_submitted_list_for_the_presented_frame() {
@@ -1018,5 +1081,29 @@ mod tests {
         assert!(!input.matches_present(31, Some(450)));
         assert!(!input.matches_present(30, Some(451)));
         assert!(!input.matches_present(30, None));
+    }
+
+    #[test]
+    fn the_direct_ui_copy_requires_matching_dimensions_and_format() {
+        let mut desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 1920,
+            Height: 1080,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        assert!(ui_copy_source(&desc, (1920, 1080)));
+        assert!(!ui_copy_source(&desc, (1280, 720)));
+        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        assert!(!ui_copy_source(&desc, (1920, 1080)));
+        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.SampleDesc.Count = 2;
+        assert!(!ui_copy_source(&desc, (1920, 1080)));
     }
 }

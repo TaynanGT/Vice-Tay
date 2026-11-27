@@ -9823,6 +9823,7 @@ struct Presenter {
     hwnd: HWND,
     meter: Meter,
     composer: Option<crate::compose::Composer>,
+    title_ui: OnceLock<Option<ID3D12Resource>>,
     #[cfg(feature = "diagnostics")]
     panel: panel::Panel,
 }
@@ -10324,6 +10325,7 @@ impl Host {
                         p.composer = None;
                     }
                     (p.width, p.height, p.format) = (width, height, format);
+                    p.title_ui = OnceLock::new();
                     tracing::info!(
                         width,
                         height,
@@ -10363,6 +10365,27 @@ impl Host {
             let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
             #[cfg(not(feature = "diagnostics"))]
             let read_now = false;
+            let output_size = (width, height);
+            let separated = if p.framegen
+                && !read_now
+                && crate::framegen::separate_title_ui()
+                && let Some((over, over_state, _, _)) = planes
+                && over != texture
+                && crate::framegen::ui_copy_source(&desc, output_size)
+                && crate::framegen::ui_copy_source(&over.GetDesc(), output_size)
+            {
+                p.title_ui
+                    .get_or_init(|| {
+                        crate::framegen::title_ui_texture(&self.device, output_size)
+                            .inspect_err(|err| tracing::warn!(%err, "could not allocate a separate title UI surface"))
+                            .ok()
+                    })
+                    .as_ref()
+                    .filter(|ui| crate::framegen::set_ui(Some(ui)))
+                    .map(|ui| (over, over_state, ui))
+            } else {
+                None
+            };
             let slot = if late_free_present() && !read_now {
                 let finished = FINISHED.load(Ordering::Acquire);
                 p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
@@ -10381,7 +10404,9 @@ impl Host {
             copy.reset();
             copy.keep(texture);
             let list = &copy.list;
-            let composed = if let Some((over, over_state, base_fmt, over_fmt)) = planes {
+            let composed = if separated.is_none()
+                && let Some((over, over_state, base_fmt, over_fmt)) = planes
+            {
                 copy.keep(over);
                 if let Some(composer) = p.composer.as_mut() {
                     let mut pre = Vec::with_capacity(3);
@@ -10452,6 +10477,22 @@ impl Host {
                 list.ResourceBarrier(&pre);
                 list.CopyResource(&back, texture);
             }
+            if let Some((over, over_state, ui)) = separated {
+                copy.keep(over);
+                copy.keep(ui);
+                if over_state != D3D12_RESOURCE_STATE_COPY_SOURCE {
+                    list.ResourceBarrier(&[transition(over, over_state, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                }
+                list.ResourceBarrier(&[transition(ui, crate::framegen::UI_READ, D3D12_RESOURCE_STATE_COPY_DEST)]);
+                list.CopyResource(ui, over);
+                if over_state != D3D12_RESOURCE_STATE_COPY_SOURCE {
+                    list.ResourceBarrier(&[transition(over, D3D12_RESOURCE_STATE_COPY_SOURCE, over_state)]);
+                }
+                static REPORTED: OnceLock<()> = OnceLock::new();
+                REPORTED.get_or_init(|| {
+                    tracing::info!(width, height, "display output: title UI composed after frame generation");
+                });
+            }
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| {
@@ -10486,7 +10527,19 @@ impl Host {
                 crate::popwatch::take(&self.device, list, texture)
             };
             #[cfg(feature = "diagnostics")]
-            let panel_copy = p.panel.draw(self, copy, &back, (width, height), format, p.framegen);
+            let panel_copy = {
+                let target = if let Some((_, _, ui)) = separated {
+                    panel::PanelTarget::TitleUi(ui)
+                } else if p.framegen {
+                    panel::PanelTarget::FrameGen
+                } else {
+                    panel::PanelTarget::BackBuffer(&back, format)
+                };
+                p.panel.draw(self, copy, target, output_size)
+            };
+            if let Some((_, _, ui)) = separated {
+                list.ResourceBarrier(&[transition(ui, D3D12_RESOURCE_STATE_COPY_DEST, crate::framegen::UI_READ)]);
+            }
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             if composed {
@@ -10532,11 +10585,14 @@ impl Host {
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
             let status = if p.framegen {
-                #[cfg(feature = "diagnostics")]
-                let ui = panel_copy.as_ref().and_then(|panel| panel.ui.as_ref());
-                #[cfg(not(feature = "diagnostics"))]
-                let ui = None;
-                crate::framegen::present(&p.swap_chain, frame, token, ui)
+                if separated.is_none() {
+                    #[cfg(feature = "diagnostics")]
+                    let ui = panel_copy.as_ref().and_then(|panel| panel.ui.as_ref());
+                    #[cfg(not(feature = "diagnostics"))]
+                    let ui = None;
+                    crate::framegen::set_ui(ui);
+                }
+                crate::framegen::present(&p.swap_chain, frame, token)
             } else {
                 p.swap_chain.Present(0, DXGI_PRESENT(0))
             };
@@ -10615,6 +10671,7 @@ impl Host {
                 hwnd,
                 meter: Meter::new(),
                 composer: None,
+                title_ui: OnceLock::new(),
                 #[cfg(feature = "diagnostics")]
                 panel: panel::Panel::new(),
             })

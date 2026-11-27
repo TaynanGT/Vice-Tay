@@ -741,9 +741,7 @@ fn free_upload(fences: &[u64; UPLOADS], turn: usize, completed: u64) -> Option<u
 }
 
 const UI_FORMAT: DXGI_FORMAT = DXGI_FORMAT_R8G8B8A8_UNORM;
-const UI_READ: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATES(
-    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0,
-);
+use crate::framegen::UI_READ;
 
 /// A full-size premultiplied UI image for AMD's final composition.
 struct UiSurface {
@@ -799,6 +797,12 @@ impl UiSurface {
 pub(super) struct PanelCopy {
     upload: Option<usize>,
     pub(super) ui: Option<ID3D12Resource>,
+}
+
+pub(super) enum PanelTarget<'a> {
+    BackBuffer(&'a ID3D12Resource, DXGI_FORMAT),
+    FrameGen,
+    TitleUi(&'a ID3D12Resource),
 }
 
 /// The panel of a presenter.
@@ -952,10 +956,8 @@ impl Panel {
         &mut self,
         host: &Host,
         list: &HostList,
-        back: &ID3D12Resource,
+        target: PanelTarget<'_>,
         (width, height): (u32, u32),
-        format: DXGI_FORMAT,
-        framegen: bool,
     ) -> Option<PanelCopy> {
         self.last_size = (width, height);
         if !shown().load(Ordering::Relaxed) || self.failed {
@@ -967,8 +969,13 @@ impl Panel {
         #[cfg(feature = "diagnostics")]
         let _ours = crate::replay::record::unrecorded();
         let scale = scale(height);
-        let format = if framegen { UI_FORMAT } else { format };
-        if framegen && self.ui.as_ref().is_none_or(|ui| ui.size != (width, height)) {
+        let (format, framegen, target) = match target {
+            PanelTarget::BackBuffer(buffer, format) => (format, false, Some(buffer)),
+            PanelTarget::FrameGen => (UI_FORMAT, true, None),
+            PanelTarget::TitleUi(texture) => (UI_FORMAT, true, Some(texture)),
+        };
+        let owns_ui = target.is_none();
+        if owns_ui && self.ui.as_ref().is_none_or(|ui| ui.size != (width, height)) {
             // The presenter drains the proxy before replacing its back buffers.
             self.ui = UiSurface::new(host, (width, height));
             if self.ui.is_none() {
@@ -1001,7 +1008,7 @@ impl Panel {
         let upload = if self.changed { buffers.write(snap, completed, framegen) } else { None };
         if upload.is_some() { self.changed = false; }
         let (w, h) = size(scale);
-        let ui = self.ui.as_mut().filter(|_| framegen);
+        let ui = self.ui.as_mut().filter(|_| owns_ui);
         if let Some(ui) = ui.as_ref() {
             if ui.ready && upload.is_none() {
                 self.cost += began.elapsed();
@@ -1041,7 +1048,7 @@ impl Panel {
                 ui.ready = true;
                 &ui.texture
             } else {
-                back
+                target?
             };
             let from = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: std::mem::transmute_copy(&buffers.card),
@@ -1073,14 +1080,14 @@ impl Panel {
                 back: 1,
             };
             list.CopyTextureRegion(&to, 0, 0, 0, &from, Some(&part));
-            if framegen {
+            if owns_ui {
                 list.ResourceBarrier(&[transition(target, D3D12_RESOURCE_STATE_COPY_DEST, UI_READ)]);
             }
         }
         self.cost += began.elapsed();
         Some(PanelCopy {
             upload,
-            ui: self.ui.as_ref().filter(|_| framegen).map(|ui| ui.texture.clone()),
+            ui: self.ui.as_ref().filter(|_| owns_ui).map(|ui| ui.texture.clone()),
         })
     }
 

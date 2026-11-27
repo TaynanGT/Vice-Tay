@@ -37,7 +37,13 @@ GE=${1:-$(find_ge)}
     echo "could not find $TAG. Pass its folder: bash build.sh /path/to/$TAG"
     exit 1
 }
-grep -qs "$TAG" "$GE/version" || echo "warning: $GE/version does not say $TAG; the server must match that Proton exactly"
+# The server must match the Proton it runs with exactly: the version file's
+# second field is the tag ("<build number> GE-Proton11-14").
+version_of() { awk 'NR == 1 { print $2 }' "$1/version" 2>/dev/null; }
+[ "$(version_of "$GE")" = "$TAG" ] || {
+    echo "$GE/version says '$(version_of "$GE")', not $TAG: this patch is for $TAG only"
+    exit 1
+}
 echo "using $GE"
 
 # The copy goes in the user's own compatibility tools folder, beside Steam's.
@@ -50,9 +56,25 @@ if [ -z "${OUT:-}" ]; then
     esac
 fi
 [ -n "${OUT:-}" ] || { echo "no Steam folder found for the copy; set OUT=/path/to/compatibilitytools.d/$TAG-viewtree"; exit 1; }
+# Never write into the source Proton: OUT must resolve to a folder of its own,
+# neither GE's folder nor one inside it (nor one containing it).
+GE_REAL=$(realpath -e "$GE")
+OUT_REAL=$(realpath -m "$OUT")
+case "$OUT_REAL/" in
+    "$GE_REAL/"*) echo "OUT ($OUT) resolves into the source Proton ($GE_REAL); choose another folder"; exit 1 ;;
+esac
+case "$GE_REAL/" in
+    "$OUT_REAL/"*) echo "OUT ($OUT) contains the source Proton ($GE_REAL); choose another folder"; exit 1 ;;
+esac
+# An existing copy must be of the same Proton.
+if [ -e "$OUT" ] && [ "$(version_of "$OUT")" != "$TAG" ]; then
+    echo "$OUT exists but its version file does not say $TAG; remove it or set OUT elsewhere"
+    exit 1
+fi
 mkdir -p "$(dirname "$OUT")"
 
-mkdir -p "$WORK" && cd "$WORK"
+mkdir -p "$WORK"
+cd "$WORK"
 if [ ! -d pge ]; then
     git clone --depth 1 --branch "$TAG" https://github.com/GloriousEggroll/proton-ge-custom pge
 fi

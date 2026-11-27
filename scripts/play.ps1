@@ -47,9 +47,8 @@ $controllers = @(if ($Machine -in 'auto', '7900xtx') {
 })
 $hasNvidia = [bool]($controllers.PNPDeviceID -match 'VEN_10DE')
 if ($Machine -eq 'auto') {
-    # Use the existing vendor defaults. The 4070 / 7800X3D profile is explicit; the
-    # RTX 4070 Ti SUPER (16 GB) gets its own profile by name.
-    $Machine = if ($controllers.Name -match 'RTX 4070 Ti SUPER') { '4070tisuper' } elseif ($hasNvidia) { '4090' } else { '7900xtx' }
+    # Use the existing vendor defaults. The 4070 / 7800X3D and 4070 Ti SUPER profiles are explicit.
+    $Machine = if ($hasNvidia) { '4090' } else { '7900xtx' }
 }
 if ($Machine -eq '7900xtx') {
     # i9-12900K, RX 7900 XTX, 64 GB: the page-mapping lock was fastest with one

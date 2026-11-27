@@ -2,6 +2,8 @@
 //! what it cannot handle yet is tallied (decision 0003).
 
 pub(crate) mod host_wave;
+mod stamp;
+use stamp::precompile_stamp;
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -181,13 +183,17 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>, wave: Option<
     let cfg = victory_core::Config::load()?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let paths = crate::default_paths(paths)?;
-    let threads = jobs.unwrap_or(4).max(1);
+    let threads = jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get())).max(1);
     let began = std::time::Instant::now();
     let done = Mutex::new(HashSet::new());
     let counts = [const { AtomicUsize::new(0) }; 5];
     let not_cached = NotCached::default();
-    for root in &paths {
+    'scan: for root in &paths {
         for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
+            if limit.is_some_and(|n| began.elapsed().as_secs() >= n) {
+                counts[3].store(1, Ordering::Relaxed);
+                break 'scan;
+            }
             if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
                 continue;
             }
@@ -229,6 +235,9 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>, wave: Option<
                     });
                 }
             });
+            if !all && counts[4].load(Ordering::Relaxed) == wanted.len() {
+                break 'scan;
+            }
         }
     }
     let [translated, there, failed] = [0, 1, 2].map(|i| counts[i].load(Ordering::Relaxed));
@@ -438,46 +447,6 @@ pub fn run(
     Ok(())
 }
 
-fn precompile_stamp(dir: &Path, key: &[u8; 32], paths: &[PathBuf]) -> Option<PathBuf> {
-    let mut hash = blake3::Hasher::new();
-    hash.update(key);
-    for path in paths {
-        let path = path.canonicalize().ok()?;
-        let metadata = path.metadata().ok()?;
-        let modified = metadata.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
-        let bytes = path.as_os_str().as_encoded_bytes();
-        hash.update(&(bytes.len() as u64).to_le_bytes());
-        hash.update(bytes);
-        hash.update(&metadata.len().to_le_bytes());
-        hash.update(&modified.as_nanos().to_le_bytes());
-    }
-    Some(dir.join(format!("precompiled-v1-{}", hash.finalize().to_hex())))
-}
-
-#[cfg(test)]
-mod precompile_stamp_tests {
-    use super::*;
-
-    #[test]
-    fn an_old_key_or_other_source_cannot_complete_the_current_scan() {
-        let temp = tempfile::tempdir().unwrap();
-        let dir = temp.path();
-        let first = dir.join("first");
-        let second = dir.join("second");
-        std::fs::write(&first, b"first source").unwrap();
-        std::fs::write(&second, b"second source").unwrap();
-
-        let old = precompile_stamp(dir, &[1; 32], std::slice::from_ref(&first)).unwrap();
-        std::fs::write(&old, []).unwrap();
-        let current = precompile_stamp(dir, &[2; 32], std::slice::from_ref(&first)).unwrap();
-        assert!(!current.is_file());
-        std::fs::write(&current, []).unwrap();
-        assert!(precompile_stamp(dir, &[2; 32], std::slice::from_ref(&first)).unwrap().is_file());
-        assert!(!precompile_stamp(dir, &[2; 32], &[second]).unwrap().is_file());
-        assert!(precompile_stamp(dir, &[2; 32], &[dir.join("missing")]).is_none());
-    }
-}
-
 /// Every shader found into the cache runs translate from.
 pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>, list: Option<PathBuf>, if_needed: bool) -> Result<()> {
     let cfg = victory_core::Config::load()?;
@@ -500,7 +469,7 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>, list: Option<PathBuf
     let lines = Mutex::new(Vec::<String>::new());
     let mut scan = FileScan::new(MAX_FILE, false);
     for root in &paths {
-        for (path, data) in scan.files(root) {
+        for (path, data) in scan.read_entries(root, crate::shader::scan::precompile_entries(root, &cache)) {
             let jobs = sources(&data);
             let next = AtomicUsize::new(0);
             std::thread::scope(|s| {

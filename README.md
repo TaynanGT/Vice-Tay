@@ -43,6 +43,7 @@ Checkpoint retries worked after the boat ran aground. The HUD, minimap, mission 
 
 > [!IMPORTANT]
 > Bring your own copy of the title. Keep the executable, game data and derived cache outside this checkout. See the [asset policy](docs/asset-policy.md).
+> The runtime reports unverified game and package licences as inactive. A title that requires a verified licence may stop at startup.
 
 1. Clone the repository and copy the configuration template.
 
@@ -61,6 +62,8 @@ Checkpoint retries worked after the boat ran aground. The HUD, minimap, mission 
 
 Use [`Play-VIctory.cmd`](Play-VIctory.cmd) to pass the same options from Command Prompt. Double-click it to enter the executable's path at a prompt. The launcher defaults to full screen, the Series X profile and an automatic GPU preset. **F11** or **Alt+Enter** toggles full screen during play.
 
+For titles that use BCPack, set `VICTORY_BCPACK_TABLES` to the path of a local copy of the [format tables](docs/asset-policy.md#bcpack) you are authorised to use.
+
 If the title reaches the menu but stops at world load, verify your title files before changing graphics settings. Compare the full file hashes against a trusted manifest for the exact release you own, using the algorithm listed in that manifest. An archive with missing or zero-filled data can still have the expected size. Re-copy any mismatched files from your verified source and check the hashes again before launching.
 
 | Option | Use it to |
@@ -74,6 +77,8 @@ If the title reaches the menu but stops at world load, verify your title files b
 | `-Windowed` / `-NoPanel` | Start in a window or hide the diagnostics overlay at launch. |
 | `-RayTracing` | Enable the structures needed for the title's ray-traced indirect lighting. |
 | `-Fsr4K quality` / `-Dlss4K quality` | Upscale to 3840 × 2160 with PC FSR or DLSS on Series X. |
+| `-FrameIntervalMs 16.67` | Set the frame interval in milliseconds. Use `0` to remove the limit or omit the option to keep the title's setting. |
+| `-WarmPipelines` | Warm pipelines used in previous runs before starting the title. |
 | `-Build release` | Use the executable built with `cargo build --locked --release -p victory`. The overlay requires a diagnostics build. |
 
 <details>
@@ -82,12 +87,15 @@ If the title reaches the menu but stops at world load, verify your title files b
 The Series X 4K profiles support `quality`, `balanced` and `performance` on
 build 1.0.2.1. They render at 2560 × 1440, 2258 × 1270 and 1920 × 1080
 respectively. For Series S, use `-Dlss` or `-Fsr` with the same three
-presets to keep the console profile's output size.
+presets to keep the console profile's output size. These presets set the
+render scale, including when used with `-Machine laptop`.
 
 For FSR, point `VICTORY_FIDELITYFX_DIR` or `[paths].fidelityfx_dir` at the
 folder containing `amd_fidelityfx_upscaler_dx12.dll`. The 4K mode prefers
-FSR 4.1.2 and uses 3.1.6 when that is what the adapter supports. Series S
-uses FSR 3.1.6. Both profiles can use FSR when DLSS fails.
+FSR 4.1.2 and uses 3.1.6 when that is what the adapter supports. In Series S,
+pass `-More @{VICTORY_FSR4_SERIES_S='1'}` to prefer FSR 4.1.2 on a supported
+adapter. Series S uses FSR 3.1.6 by default. Both profiles can use FSR when
+DLSS fails.
 For DLSS on an RTX card, get `nvngx_dlss.dll` from the NVIDIA DLSS SDK.
 Set `VICTORY_DLSS_DIR` or `[paths].dlss_dir` to its folder, or put the DLL
 beside `victory.exe`. Some drivers ship without this library. Vice-Tay
@@ -130,7 +138,11 @@ Run these steps separately from the repository root to warm the shader cache and
 .\target\diag\victory.exe warm --used
 ```
 
-Pass an archive path to `shaders` to scan just that archive. `-SkipShaders` skips pretranslation at launch.
+Pass an archive path to `shaders` to scan just that archive. At launch, `--if-needed` checks file metadata throughout each input directory before reusing a completed scan. On Windows volumes that do not report file change times, it scans the input again. `-SkipShaders` skips pretranslation at launch.
+`-WarmPipelines` runs the same `warm --used` command after pretranslation.
+When comparing warm-up times, `warm --used --batch-size 80` tests longer batches and
+`warm --used --normal-priority` tests normal worker priority. Change one option
+at a time. The defaults are 40 pipelines per worker process and idle priority.
 
 </details>
 
@@ -209,4 +221,4 @@ Vice-Tay grew out of codec-d's `cool_fox`, which brought NVIDIA work to avatarma
 
 ## License
 
-[GPL-3.0-or-later](LICENSE), inherited from VIctory. The [asset policy](docs/asset-policy.md#the-one-exception) records the separate BCPack format tables. Vice-Tay is independent of the title's developer and publisher.
+[GPL-3.0-or-later](LICENSE), inherited from VIctory. Vice-Tay is independent of the title's developer and publisher.

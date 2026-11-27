@@ -96,7 +96,7 @@ after it was given them as an unordered access view.
 | `VICTORY_BVH_SIZES_WAIT=1` | submissions that ask for structures' sizes are waited for (off: no help, slow) |
 | `VICTORY_BVH_BOUNDS=0` | the builder's accesses are not bounded |
 | `VICTORY_BVH_TRACE=1` | logs what sizes are asked, when they came, and the copies; every 300 frames, how many copies were recorded with the size slot still as before the ask (stale) and whether those sizes were too small (diagnostics) |
-| `VICTORY_SHADER_TRACE_LOOP_LIMIT=<n>` | iterations after which a loop of a program with the node test is left (512; other compute loops 4,096). Part of the translation |
+| `VICTORY_SHADER_TRACE_LOOP_LIMIT=<n>` | iterations after which a loop of a program with the node test is left (4,096 by default; set 512 to test the shorter limit). Part of the translation |
 | `VICTORY_SHADER_COMPUTE_LOOP_LIMIT=<n>` | the same for every compute program (4,096; diagnostics) |
 | `VICTORY_PROBE_ROOT=<hash>,<user data>[,<table byte>]` | logs the first 256 bytes of the constant buffer a program's user data names, every 64th dispatch (diagnostics) |
 | `VICTORY_BVH_QUARANTINE=1` | nothing it stores comes back to title memory |
@@ -126,7 +126,7 @@ dispatches, faults and what came.
   1,364 copies with a size too small in 2.5 min), pages missing (all 620 left
   without a copy were not committed), streaming after the dispatch was
   recorded, or the order of uploads (they go before the lists). Programs with
-  the node test now stop at 512 (`VICTORY_SHADER_TRACE_LOOP_LIMIT`): 12.1 to
+  the node test were tested at 512 (`VICTORY_SHADER_TRACE_LOOP_LIMIT=512`): 12.1 to
   13.9 fps median over the same unattended opening, 11.7 to 15.8 in the dorm
   (GPU 72.8 to 41.5 ms), no difference seen in the light.
 - Dynamic structures overlap each other (8 of 65 good in run light-10, 48 of

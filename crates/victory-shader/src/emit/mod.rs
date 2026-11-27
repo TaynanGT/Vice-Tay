@@ -173,8 +173,8 @@ pub fn compute_loop_limit() -> u32 {
 
 /// The iteration count after which a loop of a program that walks the
 /// title's ray-tracing structures (one with `image_bvh*_intersect_ray`) is
-/// left when [`loop_limit`] is not overridden: 512.
-pub const DEFAULT_TRACE_LOOP_LIMIT: u32 = 1 << 9;
+/// left when [`loop_limit`] is not overridden: 4,096.
+pub const DEFAULT_TRACE_LOOP_LIMIT: u32 = DEFAULT_COMPUTE_LOOP_LIMIT;
 
 /// The loop limit of programs that walk ray-tracing structures:
 /// `VICTORY_SHADER_TRACE_LOOP_LIMIT` (decimal or `0x` hex, at least 1) in any

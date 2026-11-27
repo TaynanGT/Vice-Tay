@@ -43,6 +43,7 @@ Checkpoint retries worked after the boat ran aground. The HUD, minimap, mission 
 
 > [!IMPORTANT]
 > Bring your own copy of the title. Keep the executable, game data and derived cache outside this checkout. See the [asset policy](docs/asset-policy.md).
+> The runtime reports unverified game and package licences as inactive. A title that requires a verified licence may stop at startup.
 
 1. Clone the repository and copy the configuration template.
 

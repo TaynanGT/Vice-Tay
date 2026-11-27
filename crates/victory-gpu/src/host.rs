@@ -1378,6 +1378,14 @@ type States = std::collections::HashMap<
     (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
 >;
 
+/// Objects kept through the retirement lag after a completed command list is reused.
+pub(crate) struct LandedObjects {
+    _deferred: Deferred,
+    _states: States,
+    _twins: std::collections::HashMap<usize, TwinUse>,
+    _coming: Option<(usize, std::sync::Arc<aside::Coming>)>,
+}
+
 /// What a list does with a depth texture that has a colour twin
 /// ([`crate::resource::Twin`]). Lists are recorded on many threads and run
 /// in submission order, so a list cannot know which side an earlier list
@@ -3908,11 +3916,14 @@ pub(crate) fn settle_for_fence() {
     settle_now(WHY_FENCE);
 }
 
-/// Resets the host lists of settled flights and keeps them for reuse, as
-/// a queue does for the lists it ran (`crate::list::recycle`), [`bury_lag`]
-/// flights after they landed. The dynamic descriptor slots of their tables
-/// go back as soon as they land ([`past_lag`]).
+/// Normally resets host lists after the retirement lag. The optional
+/// early-recycling path reuses completed lists while their objects retire
+/// through the same lag. Descriptor slots are returned on landing.
 fn land() {
+    static RECYCLE_EARLY: OnceLock<bool> = OnceLock::new();
+    let recycle_early = *RECYCLE_EARLY.get_or_init(|| {
+        std::env::var_os("VICTORY_RECYCLE_LANDED_EARLY").is_some_and(|v| v == "1")
+    });
     // One at a time, so that the flights kept go back in front of the ones
     // that landed meanwhile. A thread that finds another landing leaves it
     // to that one (the submitting thread lands after every flight it sends).
@@ -3926,14 +3937,20 @@ fn land() {
         // Taken out of the line: giving slots back takes the heap's lock,
         // which recording threads hold while they search.
         let mut landed = std::mem::take(&mut line().landed);
-        let old = past_lag(&mut landed, bury_lag() as usize, |(lists, _)| crate::list::ran(lists));
+        let old = past_lag(&mut landed, if recycle_early { 0 } else { bury_lag() as usize }, |(lists, _)| {
+            crate::list::ran(lists);
+        });
         let mut line = line();
         landed.append(&mut line.landed);
         line.landed = landed;
         old
     };
     for (lists, order) in old {
-        crate::list::recycle(lists, &order);
+        if recycle_early {
+            crate::list::recycle_landed(lists, &order);
+        } else {
+            crate::list::recycle(lists, &order);
+        }
     }
 }
 
@@ -3968,6 +3985,25 @@ mod landed_tests {
         // Fewer than the lag: all kept.
         assert!(past_lag(&mut landed, 64, |_| {}).is_empty());
         assert_eq!(landed.len(), 3);
+    }
+
+    #[test]
+    fn landed_objects_outlive_the_command_list_reset() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let mut list = host.new_list().expect("host list");
+        let (buffer, _) = host.upload_buffer(256).expect("upload buffer");
+        list.keep(&buffer);
+        list.close();
+        host.execute(&[&list]);
+
+        let held = list.take_landed_objects();
+        assert_eq!(held._deferred.kept.len(), 1);
+        assert!(list.deferred().kept.is_empty());
+        list.reset();
+        assert_eq!(held._deferred.kept.len(), 1);
+        assert!(list.deferred().kept.is_empty());
     }
 
     /// The dynamic descriptor slots of lists the card has run are taken
@@ -7245,6 +7281,17 @@ impl HostList {
         deferred
             .copies
             .splice(at..at, found.into_iter().map(|(shadow, from, to)| Step::Refresh(shadow, from as usize, (to - from) as usize)));
+    }
+
+    /// Moves the completed recording's resource references into the
+    /// retirement queue before the list and allocator are reset.
+    pub(crate) fn take_landed_objects(&mut self) -> LandedObjects {
+        LandedObjects {
+            _deferred: std::mem::take(self.deferred.get_mut().unwrap_or_else(|e| e.into_inner())),
+            _states: std::mem::take(self.states.get_mut().unwrap_or_else(|e| e.into_inner())),
+            _twins: std::mem::take(self.twins.get_mut().unwrap_or_else(|e| e.into_inner())),
+            _coming: self.coming.get_mut().unwrap_or_else(|e| e.into_inner()).take(),
+        }
     }
 
     /// Only after the list's last submission finished (every one is waited

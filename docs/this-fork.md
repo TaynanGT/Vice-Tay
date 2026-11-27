@@ -38,6 +38,12 @@ where there is one; the default is the behaviour described.
 
 ## Memory and frame rate
 
+- **Experimental command-list recycling** (`-More @{VICTORY_RECYCLE_LANDED_EARLY='1'}`).
+  After the GPU completes a relay submission, its command lists can return to
+  the pool immediately. Resources referenced by the lists still use the
+  retirement delay. For an A/B, hold the driver, revision, save and relay
+  mode fixed. Record whether the first world load reaches player control.
+
 How each of these was found, with the numbers:
 [findings-rtx4090.md](findings-rtx4090.md).
 

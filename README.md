@@ -168,6 +168,11 @@ Then play on the Series S profile, the one every session above uses:
 scripts\play.ps1 -Exe <path of your copy's executable> -Console series-s
 ```
 
+When the shader cache is still empty, `play.ps1` runs the shader command itself
+before the title starts: a cold cache otherwise drops about half of each frame's
+draws while shaders are translated, a black picture for the first minutes.
+`-SkipShaders` starts without it.
+
 `Play-VIctory.cmd` takes the same options from a Command Prompt; on a double-click
 PowerShell asks for the executable's path.
 

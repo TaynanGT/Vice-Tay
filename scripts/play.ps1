@@ -4,6 +4,7 @@
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
 # -Windowed     a window instead of the whole screen (full screen is the default)
 # -NoPanel      without the performance panel (on by default, F3 hides it while playing)
+# -SkipShaders  start even when the shader cache is cold (otherwise every shader is translated first)
 # -Console      series-x (the default) or series-s: the console the title takes this PC for
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -Machine      auto (the default: by the graphics card), 7900xtx, 4070 or 4090
@@ -18,6 +19,7 @@ param(
     [switch]$RayTracing,
     [switch]$Windowed,
     [switch]$NoPanel,
+    [switch]$SkipShaders,
     [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x',
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [ValidateSet('auto', '7900xtx', '4070', '4090')][string]$Machine = 'auto',
@@ -114,4 +116,22 @@ if ($discarded) {
 }
 $Exe = (Resolve-Path $Exe).Path
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
-try { & $victory run $Exe --console $Console --execute } finally { Pop-Location }
+try {
+    # With a cold shader cache a run translates shaders only as draws ask for them and drops
+    # those draws meanwhile: about half of each frame for the first minutes, a black picture.
+    # So translate every shader first (a few minutes, once; after with the settings above,
+    # which some translations depend on). -SkipShaders starts without.
+    if (-not $SkipShaders) {
+        $line = & $victory config | Select-String '^cache_dir\s*:\s*(.+)$'
+        if ($line) {
+            $shaders = Join-Path $line.Matches[0].Groups[1].Value.Trim() 'shaders'
+            $have = @(Get-ChildItem $shaders -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1000).Count
+            if ($have -lt 1000) {
+                Write-Host "The shader cache ($shaders) holds $have translations: translating every shader first, a few minutes, once. -SkipShaders starts without."
+                & $victory shaders (Split-Path $Exe)
+                if ($LASTEXITCODE) { Write-Host "victory shaders ended with exit code $LASTEXITCODE; starting anyway." }
+            }
+        }
+    }
+    & $victory run $Exe --console $Console --execute
+} finally { Pop-Location }

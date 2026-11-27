@@ -468,6 +468,17 @@ pub(crate) struct Shadow {
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
 }
 
+/// Outcome of comparing one page in [`Shadow::merge_page_under_writes`].
+enum PageMerge {
+    /// Changed runs sent via `card.dirty` (`CopyBufferRegion` / `send::SCATTER`).
+    Dirty(Vec<(usize, usize)>),
+    /// Byte-masked patch words emitted when the page exceeded `runs_left`.
+    Patched {
+        words: Vec<PatchWord>,
+        runs: Vec<(usize, usize)>,
+    },
+}
+
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
 /// shaders see.
 struct Card {
@@ -496,6 +507,15 @@ struct Card {
     /// Lock-free mirror of `!sent.is_empty()` so clean carded copies skip
     /// locking `sent` on every submission and landing.
     has_sent: AtomicBool,
+    /// With [`masked_patch_now`]: changed bytes under flights' shader writes
+    /// that go to the card's side as a byte-masked patch (one dword at a time,
+    /// only the changed bytes stored) rather than settling the flights
+    /// ([`Shadow::merge_under_writes`]). Locked inside `dirty`'s lock, `sent`
+    /// inside it.
+    patch: Mutex<Patch>,
+    /// Lock-free mirror of `!patch.words.is_empty()`; cleared only after
+    /// `sent` and `has_sent` have been updated in [`card_patches`].
+    has_patch: AtomicBool,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
 }
@@ -1075,6 +1095,226 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
         }
         true
     });
+    out
+}
+
+/// One dword of a masked patch ([`masked_patch_now`]): its byte offset in the
+/// copy (a multiple of 4), the mask of whole bytes it sets, and their shifted
+/// values (other bits 0).
+pub(crate) type PatchWord = [u32; 3];
+
+/// A copy's masked patch not yet sent ([`Card::patch`]): its words in the
+/// order they were recorded, and the byte runs they cover.
+#[derive(Default)]
+struct Patch {
+    words: Vec<PatchWord>,
+    ranges: Vec<(usize, usize)>,
+}
+
+/// Pure parser for `VICTORY_MASKED_PATCH`: 0 off (default), 1 on, 2 alternating
+/// 20 s on/off (`alt`). Opt-in by default so baseline behavior stays unchanged
+/// until explicitly enabled for measurement.
+fn masked_patch_mode_for(val: Option<&str>) -> u8 {
+    match val.map(str::trim) {
+        Some("1") => 1,
+        Some("alt") => 2,
+        _ => 0,
+    }
+}
+
+/// `VICTORY_MASKED_PATCH`: 0 off (default; opt-in), 1 on, 2 alternating 20 s
+/// on/off (`alt`), adapted from fxceless/victory-fork commits `3221ac4` and
+/// `0e006f0`.
+pub(crate) fn masked_patch_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| masked_patch_mode_for(std::env::var("VICTORY_MASKED_PATCH").ok().as_deref()))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_MASKED_PATCH: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn with_masked_patch_test<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<bool>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_MASKED_PATCH.with(|cell| cell.set(self.0));
+        }
+    }
+    let prev = TEST_MASKED_PATCH.with(|cell| cell.replace(Some(on)));
+    let _reset = Reset(prev);
+    f()
+}
+
+/// Whether the masked-patch pipeline should be prepared and queried.
+pub(crate) fn masked_patch_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_MASKED_PATCH.with(std::cell::Cell::get) {
+        return on;
+    }
+    #[cfg(feature = "diagnostics")]
+    if crate::ab::bit("VICTORY_MASKED_PATCH").is_some() {
+        return true;
+    }
+    masked_patch_mode() != 0
+}
+
+/// Set by `crate::host` once the masked-patch compute pipeline is compiled:
+/// without it nothing is patched and the merge settles flights as before.
+pub(crate) static PATCH_READY: AtomicBool = AtomicBool::new(false);
+
+/// Whether a carded copy page that exceeds the per-submission run cap under
+/// in-flight shader writes is sent as a byte-masked patch instead of settling
+/// the flights (`VICTORY_MASKED_PATCH=1`, off by default; `alt` alternates
+/// every 20 seconds).
+///
+/// After fxceless/victory-fork `3221ac4` and `0e006f0` (GPL-3.0-or-later):
+/// scattered byte changes under active GPU writes used to exhaust `runs_left`
+/// and trigger a full GPU settle. Encoding changed bytes as `(offset, mask,
+/// value)` dwords lets one compute pass apply `(old & ~mask) | (value & mask)`
+/// on the GPU queue behind in-flight writes, preserving every untouched byte
+/// without settling.
+pub(crate) fn masked_patch_now() -> bool {
+    if !PATCH_READY.load(Ordering::Relaxed) {
+        return false;
+    }
+    #[cfg(test)]
+    if let Some(on) = TEST_MASKED_PATCH.with(std::cell::Cell::get) {
+        return on;
+    }
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_MASKED_PATCH") {
+        return on;
+    }
+    match masked_patch_mode() {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: AtomicU8 = AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "title bytes under flights' shader writes past the merge cap (VICTORY_MASKED_PATCH=alt): {}",
+                    if on { "ON, sent as a masked patch" } else { "off, flights settled" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// Since the last frame line, of masked patches: pages patched instead of
+/// settling, dwords emitted, dispatches recorded, and submissions that sent one.
+pub(crate) static PATCHED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Encodes changed byte `runs` (`(offset_in_title, len)`, in ascending order)
+/// of a page at copy offset `at` into `[dword_offset, byte_mask, value]` words,
+/// coalescing bytes in the same 4-byte dword.
+pub(crate) fn patch_words(at: usize, title: &[u8], runs: &[(usize, usize)], out: &mut Vec<PatchWord>) {
+    for &(r, m) in runs {
+        for k in r..r + m {
+            let offset = at + k;
+            let word = (offset & !3) as u32;
+            let lane = ((offset & 3) * 8) as u32;
+            let (mask, value) = (0xffu32 << lane, u32::from(title[k]) << lane);
+            match out.last_mut() {
+                Some(w) if w[0] == word => {
+                    w[1] |= mask;
+                    w[2] = (w[2] & !mask) | value;
+                }
+                _ => out.push([word, mask, value]),
+            }
+        }
+    }
+}
+
+/// Sorts `words` stably by dword offset and folds entries targeting the same
+/// dword in chronological order (later bytes win), so GPU threads never race
+/// on the same dword.
+pub(crate) fn folded(mut words: Vec<PatchWord>) -> Vec<PatchWord> {
+    // Stable sort preserves chronological order for identical dword offsets.
+    words.sort_by_key(|w| w[0]);
+    let mut out: Vec<PatchWord> = Vec::with_capacity(words.len());
+    for w in words {
+        match out.last_mut() {
+            Some(last) if last[0] == w[0] => {
+                last[2] = (last[2] & !w[1]) | (w[2] & w[1]);
+                last[1] |= w[1];
+            }
+            _ => out.push(w),
+        }
+    }
+    out
+}
+
+/// Collapses sorted non-overlapping `ranges` (copy offsets, copy starting at
+/// `start`) into one span per 64 KiB piece they start in, preserving the exact
+/// set of covered pieces for card-side rehashing (after fxceless `50c79c3`).
+pub(crate) fn piece_spans(start: usize, ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize, usize)> = Vec::new();
+    for &(a, b) in ranges {
+        let piece = (start + a) / PIECE;
+        match out.last_mut() {
+            Some(last) if last.0 == piece => last.2 = last.2.max(b),
+            _ => out.push((piece, a, b)),
+        }
+    }
+    out.into_iter().map(|(_, a, b)| (a, b)).collect()
+}
+
+/// Applies one masked patch word to `old` (the GPU shader's operation, for tests).
+#[cfg(test)]
+pub(crate) fn patched_word(old: u32, w: PatchWord) -> u32 {
+    (old & !w[1]) | (w[2] & w[1])
+}
+
+/// Takes pending masked patches from carded copies for send `sent_as`
+/// (paired with [`card_dirty`]): per copy, its folded [`PatchWord`]s and the
+/// piece-coalesced byte spans to rehash. With [`relay`], records the exact
+/// joined byte runs in `sent` before clearing `has_patch`.
+pub(crate) fn card_patches(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<PatchWord>, Vec<(usize, usize)>)> {
+    let mut out = Vec::new();
+    if !masked_patch_enabled() {
+        return out;
+    }
+    let carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+    let fetched = RELAY_FETCHED.load(Ordering::Acquire);
+    let relay_on = relay();
+    for weak in carded.iter() {
+        let Some(shadow) = weak.upgrade() else {
+            continue;
+        };
+        let Some(c) = shadow.card.as_ref() else {
+            continue;
+        };
+        if !c.has_patch.load(Ordering::Acquire) {
+            continue;
+        }
+        let (words, ranges) = {
+            let _dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            let mut patch = c.patch.lock().unwrap_or_else(|e| e.into_inner());
+            if patch.words.is_empty() {
+                c.has_patch.store(false, Ordering::Release);
+                continue;
+            }
+            let taken = std::mem::take(&mut *patch);
+            let ranges = joined(taken.ranges);
+            if relay_on {
+                let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
+                sent.forget(fetched);
+                sent.note_joined(sent_as, ranges.clone());
+                // Publish sent ranges before clearing `has_patch`.
+                c.has_sent.store(!sent.is_empty(), Ordering::Release);
+            }
+            c.has_patch.store(false, Ordering::Release);
+            (taken.words, ranges)
+        };
+        let spans = piece_spans(shadow.start as usize, &ranges);
+        out.push((shadow, folded(words), spans));
+    }
     out
 }
 
@@ -4638,10 +4878,10 @@ impl Shadow {
                 return true;
             }
             let t = under_ns(2, t);
-            // A page's part in the range, compared and put in: the runs it
-            // changed; none for a page that is not there (left as it is, and
-            // looked at again next time) or that had too many.
-            type Done = Option<Vec<(usize, usize)>>;
+            // A page's part in the range, compared and put in: either dirty
+            // runs copied normally or byte-masked patch words when past the
+            // per-submission run cap; none for an unmapped page.
+            type Done = Option<PageMerge>;
             let left = std::sync::atomic::AtomicI64::new(*runs_left as i64);
             let over = std::sync::atomic::AtomicBool::new(false);
             let done: Vec<Mutex<Done>> = stale.iter().map(|_| Mutex::new(None)).collect();
@@ -4673,24 +4913,41 @@ impl Shadow {
             // The runs of all the pages, noted at once (`card.dirty` is
             // sorted and joined when it is taken).
             let mut changed: Vec<(usize, usize)> = Vec::new();
+            let mut patched_pages = 0u64;
+            let mut patched_words: Vec<PatchWord> = Vec::new();
+            let mut patched_ranges: Vec<(usize, usize)> = Vec::new();
             let (mut runs_in, mut bytes_in) = (0u64, 0u64);
-            for (i, runs) in done.into_iter().enumerate() {
-                let Some(mut runs) = runs.into_inner().unwrap_or_else(|e| e.into_inner()) else {
+            for (i, merge) in done.into_iter().enumerate() {
+                let Some(merge) = merge.into_inner().unwrap_or_else(|e| e.into_inner()) else {
                     continue;
                 };
                 let (lo, hi) = ((stale[i] * PAGE).max(a), ((stale[i] + 1) * PAGE).min(e));
-                runs_in += runs.len() as u64;
-                bytes_in += runs.iter().map(|r| r.1 as u64).sum::<u64>();
-                if self.card.is_some() {
-                    let page_offset = lo - start;
-                    for (from, to) in &mut runs {
-                        *from += page_offset;
-                        *to += *from;
+                match merge {
+                    PageMerge::Dirty(mut runs) => {
+                        runs_in += runs.len() as u64;
+                        bytes_in += runs.iter().map(|r| r.1 as u64).sum::<u64>();
+                        if self.card.is_some() {
+                            let page_offset = lo - start;
+                            for (from, to) in &mut runs {
+                                *from += page_offset;
+                                *to += *from;
+                            }
+                            if changed.is_empty() {
+                                changed = runs;
+                            } else {
+                                changed.append(&mut runs);
+                            }
+                        }
                     }
-                    if changed.is_empty() {
-                        changed = runs;
-                    } else {
-                        changed.append(&mut runs);
+                    PageMerge::Patched { mut words, runs } => {
+                        runs_in += runs.len() as u64;
+                        bytes_in += runs.iter().map(|r| r.1 as u64).sum::<u64>();
+                        if self.card.is_some() && !words.is_empty() {
+                            patched_pages += 1;
+                            let page_offset = lo - start;
+                            patched_words.append(&mut words);
+                            patched_ranges.extend(runs.into_iter().map(|(r, m)| (page_offset + r, page_offset + r + m)));
+                        }
                     }
                 }
                 // Taken, if the range holds all of the page that is in the
@@ -4703,6 +4960,7 @@ impl Shadow {
             MERGED[1].fetch_add(runs_in, Ordering::Relaxed);
             MERGED[2].fetch_add(bytes_in, Ordering::Relaxed);
             self.card_changed_runs(changed.into_iter());
+            self.card_patched_words(patched_pages, patched_words, patched_ranges);
             drop(before);
             drop(merging);
             {
@@ -4722,8 +4980,9 @@ impl Shadow {
 
     /// Of [`Shadow::merge_under_writes`]: title memory `[lo, lo + n)`, in one
     /// page, compared with the reference, which begins at `held`, and put in.
-    /// The runs that changed, none if it cannot be read, and an error if
-    /// there were more to copy one by one than `left`.
+    /// Returns dirty runs or masked-patch words, none if unmapped, and an
+    /// error if there were more runs than `left` and masked patching is
+    /// unavailable.
     ///
     /// # Safety
     /// The reference holds the copy's length, and nothing else writes these
@@ -4734,7 +4993,7 @@ impl Shadow {
         n: usize,
         held: *mut u8,
         left: &std::sync::atomic::AtomicI64,
-    ) -> Result<Option<Vec<(usize, usize)>>, ()> {
+    ) -> Result<Option<PageMerge>, ()> {
         thread_local! {
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
@@ -4786,9 +5045,25 @@ impl Shadow {
                 if fused {
                     debug_assert!(copies <= most);
                     left.fetch_add(most - copies, Ordering::Relaxed);
-                    return Ok(Some(runs));
+                    return Ok(Some(PageMerge::Dirty(runs)));
                 }
                 if copies > 0 && left.fetch_sub(copies, Ordering::Relaxed) < copies {
+                    left.fetch_add(copies, Ordering::Relaxed);
+                    // Past the cap: emit exact byte-masked patch words instead
+                    // of settling the flights (`masked_patch_now`).
+                    if masked_patch_now() && at + n <= (u32::MAX - 3) as usize {
+                        let exact = changed_runs(title, held);
+                        let mut words = Vec::new();
+                        patch_words(at, title, &exact, &mut words);
+                        let was = (!exact.is_empty() && crate::host::upcheck::on()).then(|| held.to_vec());
+                        for &(r, m) in &exact {
+                            held[r..r + m].copy_from_slice(&title[r..r + m]);
+                        }
+                        if let Some(was) = was {
+                            crate::host::upcheck::note(self.id, at, &was, held);
+                        }
+                        return Ok(Some(PageMerge::Patched { words, runs: exact }));
+                    }
                     return Err(());
                 }
                 let was = (!runs.is_empty() && crate::host::upcheck::on()).then(|| held.to_vec());
@@ -4800,7 +5075,7 @@ impl Shadow {
                 if let Some(was) = was {
                     crate::host::upcheck::note(self.id, at, &was, held);
                 }
-                return Ok(Some(runs));
+                return Ok(Some(PageMerge::Dirty(runs)));
             }
             let runs = changed_runs(title, held);
             for &(r, m) in &runs {
@@ -4810,7 +5085,7 @@ impl Shadow {
                 unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m) };
                 held[r..r + m].copy_from_slice(&title[r..r + m]);
             }
-            Ok(Some(runs))
+            Ok(Some(PageMerge::Dirty(runs)))
         })
     }
 
@@ -5247,6 +5522,28 @@ impl Shadow {
         card.has_dirty.store(true, Ordering::Release);
     }
 
+    /// Records masked-patch `words` and their copy-relative byte `ranges` for
+    /// `pages` pages that exceeded the per-submission run cap
+    /// ([`masked_patch_now`]), to be applied on the GPU before the next
+    /// submission ([`card_patches`]).
+    fn card_patched_words(&self, pages: u64, words: Vec<PatchWord>, ranges: Vec<(usize, usize)>) {
+        let Some(card) = &self.card else {
+            return;
+        };
+        if words.is_empty() {
+            return;
+        }
+        PATCHED[0].fetch_add(pages, Ordering::Relaxed);
+        PATCHED[1].fetch_add(words.len() as u64, Ordering::Relaxed);
+        let _dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        let mut patch = card.patch.lock().unwrap_or_else(|e| e.into_inner());
+        patch.words.extend(words);
+        patch.ranges.extend(ranges);
+        // Under the lock: concurrent `card_patches` / `land_card` / `card_merge_relay`
+        // either wait for `_dirty` or observe `has_patch == true`.
+        card.has_patch.store(true, Ordering::Release);
+    }
+
     /// Whether shaders were ever declared to write it.
     pub(crate) fn written(&self) -> bool {
         self.written.load(Ordering::Relaxed)
@@ -5294,13 +5591,20 @@ impl Shadow {
     }
 
     /// Diagnostics: the offsets whose bytes have not gone to the card's side
-    /// yet.
+    /// yet (including pending masked patches).
     pub(crate) fn card_dirty_now(&self) -> Vec<(usize, usize)> {
         self.card.as_ref().map_or_else(Vec::new, |c| {
-            if !c.has_dirty.load(Ordering::Acquire) {
-                return Vec::new();
+            let mut out = if c.has_dirty.load(Ordering::Acquire) {
+                c.dirty.lock().unwrap_or_else(|e| e.into_inner()).clone()
+            } else {
+                Vec::new()
+            };
+            if c.has_patch.load(Ordering::Acquire) {
+                let patch = c.patch.lock().unwrap_or_else(|e| e.into_inner());
+                out.extend(patch.ranges.iter().copied());
+                out = joined(out);
             }
-            c.dirty.lock().unwrap_or_else(|e| e.into_inner()).clone()
+            out
         })
     }
 
@@ -5505,22 +5809,28 @@ impl Shadow {
         let last = last_difference(gpu, held).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
-        // Check `has_dirty` FIRST, then `has_sent`: `card_dirty` publishes
-        // `has_sent` (Release) before clearing `has_dirty` (Release), so
-        // observing `has_dirty == false` guarantees observing `has_sent == true`
-        // for any range transitioning from `dirty` to `sent`.
-        let skip: Vec<(usize, usize)> =
-            if !card.has_dirty.load(Ordering::Acquire) && !card.has_sent.load(Ordering::Acquire) {
-                Vec::new()
-            } else {
-                let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
-                let mut skip: Vec<(usize, usize)> = dirty.iter().copied().filter(|&(a, b)| a < at + n && b > at).collect();
-                if card.has_sent.load(Ordering::Acquire) {
-                    let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
-                    sent.near(fetched_after, at, at + n, &mut skip);
-                }
-                skip
-            };
+        // Check `has_dirty` and `has_patch` FIRST, then `has_sent`: `card_dirty`
+        // and `card_patches` publish `has_sent` (Release) before clearing
+        // `has_dirty`/`has_patch` (Release), so observing both false guarantees
+        // observing `has_sent == true` for any range transitioning into `sent`.
+        let skip: Vec<(usize, usize)> = if !card.has_dirty.load(Ordering::Acquire)
+            && !card.has_patch.load(Ordering::Acquire)
+            && !card.has_sent.load(Ordering::Acquire)
+        {
+            Vec::new()
+        } else {
+            let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            let mut skip: Vec<(usize, usize)> = dirty.iter().copied().filter(|&(a, b)| a < at + n && b > at).collect();
+            if card.has_patch.load(Ordering::Acquire) {
+                let patch = card.patch.lock().unwrap_or_else(|e| e.into_inner());
+                skip.extend(patch.ranges.iter().copied().filter(|&(a, b)| a < at + n && b > at));
+            }
+            if card.has_sent.load(Ordering::Acquire) {
+                let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
+                sent.near(fetched_after, at, at + n, &mut skip);
+            }
+            skip
+        };
         title.clear();
         title.resize(n, 0);
         let mapped = crate::host::read_into((start + at) as *const u8, title);
@@ -5556,6 +5866,8 @@ impl Shadow {
                 has_dirty: AtomicBool::new(false),
                 sent: Mutex::default(),
                 has_sent: AtomicBool::new(false),
+                patch: Mutex::default(),
+                has_patch: AtomicBool::new(false),
                 size: len.next_multiple_of(PIECE as u64),
             });
         }
@@ -5604,6 +5916,41 @@ impl Shadow {
         card.has_dirty.store(false, Ordering::Release);
         ranges
     }
+
+    /// A real D3D12-backed carded copy for host integration tests.
+    pub(crate) fn backed_card_test(
+        start: u64,
+        card_buffer: ID3D12Resource,
+        staging: ID3D12Resource,
+        data: *mut u8,
+        len: u64,
+    ) -> Arc<Shadow> {
+        // SAFETY: a live D3D12 buffer.
+        let gpu = unsafe { card_buffer.GetGPUVirtualAddress() };
+        let mut shadow = Shadow::new(card_buffer, data, gpu, start, len);
+        shadow.card = Some(Card {
+            staging,
+            before: Mutex::default(),
+            dirty: Mutex::default(),
+            has_dirty: AtomicBool::new(false),
+            sent: Mutex::default(),
+            has_sent: AtomicBool::new(false),
+            patch: Mutex::default(),
+            has_patch: AtomicBool::new(false),
+            size: len.next_multiple_of(PIECE as u64),
+        });
+        Arc::new(shadow)
+    }
+
+    /// Appends masked-patch words directly for host integration tests.
+    pub(crate) fn record_masked_patch_test(&self, words: Vec<PatchWord>, ranges: Vec<(usize, usize)>) {
+        self.card_patched_words(1, words, ranges);
+    }
+
+    /// Appends dirty byte ranges directly for host integration tests.
+    pub(crate) fn record_dirty_test(&self, ranges: &[(usize, usize)]) {
+        self.card_changed_runs(ranges.iter().copied());
+    }
 }
 
 impl Shadow {
@@ -5634,18 +5981,24 @@ impl Shadow {
         let _merging = self.merging.read().unwrap_or_else(|e| e.into_inner());
         crate::land::spent(crate::land::stat::LOCK, waiting);
         let (from, to) = pieces.clone().fold((usize::MAX, 0), |(a, b), p| (a.min(p.0), b.max(p.1)));
-        let skip: Vec<(usize, usize)> =
-            if !card.has_dirty.load(Ordering::Acquire) && !card.has_sent.load(Ordering::Acquire) {
-                Vec::new()
-            } else {
-                let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
-                let mut skip: Vec<(usize, usize)> = dirty.iter().copied().filter(|&(a, b)| a < to && b > from).collect();
-                if card.has_sent.load(Ordering::Acquire) {
-                    let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
-                    sent.near(fetched_after, from, to, &mut skip);
-                }
-                skip
-            };
+        let skip: Vec<(usize, usize)> = if !card.has_dirty.load(Ordering::Acquire)
+            && !card.has_patch.load(Ordering::Acquire)
+            && !card.has_sent.load(Ordering::Acquire)
+        {
+            Vec::new()
+        } else {
+            let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            let mut skip: Vec<(usize, usize)> = dirty.iter().copied().filter(|&(a, b)| a < to && b > from).collect();
+            if card.has_patch.load(Ordering::Acquire) {
+                let patch = card.patch.lock().unwrap_or_else(|e| e.into_inner());
+                skip.extend(patch.ranges.iter().copied().filter(|&(a, b)| a < to && b > from));
+            }
+            if card.has_sent.load(Ordering::Acquire) {
+                let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
+                sent.near(fetched_after, from, to, &mut skip);
+            }
+            skip
+        };
         // Both sources of protected bytes can overlap. Join them once so
         // each piece can find its first overlapping range by end address.
         let skip = if skip.len() > 1 { joined(skip) } else { skip };
@@ -5753,6 +6106,8 @@ mod land_tests {
             has_dirty: AtomicBool::new(false),
             sent: Mutex::default(),
             has_sent: AtomicBool::new(false),
+            patch: Mutex::default(),
+            has_patch: AtomicBool::new(false),
             size: len as u64,
         });
         Some(shadow)
@@ -6181,6 +6536,8 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     has_dirty: AtomicBool::new(false),
                     sent: Mutex::default(),
                     has_sent: AtomicBool::new(false),
+                    patch: Mutex::default(),
+                    has_patch: AtomicBool::new(false),
                     size,
                 };
                 (on_card, Some(card))
@@ -6413,6 +6770,8 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         has_dirty: AtomicBool::new(false),
         sent: Mutex::default(),
         has_sent: AtomicBool::new(false),
+        patch: Mutex::default(),
+        has_patch: AtomicBool::new(false),
         size: len,
     });
     let shadow = Arc::new(shadow);
@@ -6491,6 +6850,8 @@ fn build_loose_shadow(start: u64, len: u64, backing: LooseBacking) -> Arc<Shadow
                         has_dirty: AtomicBool::new(false),
                         sent: Mutex::default(),
                         has_sent: AtomicBool::new(false),
+                        patch: Mutex::default(),
+                        has_patch: AtomicBool::new(false),
                         size: len,
                     };
                     (on_card, Some(card))
@@ -7446,6 +7807,277 @@ mod copied_and_take_tests {
             shadow.send_up(31, 30);
             assert!(!card.has_dirty.load(Ordering::Acquire));
             assert!(!card.has_sent.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn masked_patch_stores_only_changed_bytes_and_folds_overlaps() {
+        let n = 4096usize;
+        let at = 3 * 65536 + 4;
+        let old: Vec<u8> = (0..n).map(|i| (i * 7 + 1) as u8).collect();
+        let mut title = old.clone();
+        for i in (0..n).step_by(3) {
+            title[i] ^= 0x5a;
+        }
+        for b in &mut title[1000..1100] {
+            *b = !*b;
+        }
+        let runs = changed_runs(&title, &old);
+        assert!(runs.len() > 1000);
+        // Simulate GPU flight writes to untouched bytes (including sibling bytes
+        // inside the same 32-bit dword as patched title bytes).
+        let mut card = old.clone();
+        let mut flight = vec![false; n];
+        for i in (1..n).step_by(5) {
+            if title[i] == old[i] {
+                card[i] = 0xee;
+                flight[i] = true;
+            }
+        }
+        let mut words: Vec<PatchWord> = Vec::new();
+        patch_words(at, &title, &runs, &mut words);
+        let words = folded(words);
+        for w in &words {
+            assert_eq!(w[0] % 4, 0);
+            let k = w[0] as usize - at;
+            let mut dword = [0u8; 4];
+            dword.copy_from_slice(&card[k..k + 4]);
+            let new = patched_word(u32::from_le_bytes(dword), *w).to_le_bytes();
+            card[k..k + 4].copy_from_slice(&new);
+        }
+        for i in 0..n {
+            let want = if flight[i] { 0xee } else { title[i] };
+            assert_eq!(card[i], want, "byte {i}");
+        }
+
+        // Overlapping words for the same dword fold chronologically (later wins)
+        // and come out in ascending offset order.
+        let overlapped = vec![
+            [8, 0x0000_ffff, 0x0000_2211],
+            [0, 0xff00_0000, 0x9900_0000],
+            [8, 0x00ff_ff00, 0x0044_3300],
+        ];
+        assert_eq!(
+            folded(overlapped),
+            vec![[0, 0xff00_0000, 0x9900_0000], [8, 0x00ff_ffff, 0x0044_3311]]
+        );
+        // Applying that folded word preserves untouched byte 3 (`0xee`).
+        assert_eq!(patched_word(0xee55_6677, [8, 0x00ff_ffff, 0x0044_3311]), 0xee44_3311);
+
+        let mut out = Vec::new();
+        patch_words(0, &[1, 2, 3, 4, 5, 6], &[(1, 2), (5, 1)], &mut out);
+        assert_eq!(out, vec![[0, 0x00ff_ff00, 0x0003_0200], [4, 0x0000_ff00, 0x0000_0600]]);
+    }
+
+    #[test]
+    fn piece_spans_preserve_exact_rehash_piece_set() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |below: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % below as u64) as usize
+        };
+        let pieces = |start: usize, ranges: &[(usize, usize)]| {
+            let mut all: Vec<usize> = ranges.iter().flat_map(|&(a, b)| pieces_of(start, a, b)).collect();
+            all.sort_unstable();
+            all.dedup();
+            all
+        };
+        for start in [0usize, 4, 65532, 0x1234_5678, 0x7fff_0010] {
+            for _ in 0..40 {
+                let len = 40 * PIECE;
+                let mut ranges = Vec::new();
+                let mut at = next(64);
+                while at < len - 64 {
+                    let long = next(10) == 0;
+                    let n = 1 + next(if long { 3 * PIECE } else { 6 });
+                    let end = (at + n).min(len);
+                    ranges.push((at, end));
+                    let far = next(4) == 0;
+                    at = end + 1 + next(if far { 2 * PIECE } else { 12 });
+                }
+                let ranges = joined(ranges);
+                let spans = piece_spans(start, &ranges);
+                assert_eq!(pieces(start, &spans), pieces(start, &ranges), "start {start:#x}");
+                assert!(spans.len() <= ranges.len());
+            }
+        }
+        let crowd: Vec<(usize, usize)> = (0..4000).map(|i| (5 * PIECE + 16 * i, 5 * PIECE + 16 * i + 3)).collect();
+        assert_eq!(piece_spans(0, &crowd), vec![(5 * PIECE, 5 * PIECE + 16 * 3999 + 3)]);
+        assert!(piece_spans(0, &[]).is_empty());
+    }
+
+    #[test]
+    fn masked_patch_defaults_off_and_parses_opt_in_modes() {
+        assert_eq!(masked_patch_mode_for(None), 0);
+        assert_eq!(masked_patch_mode_for(Some("0")), 0);
+        assert_eq!(masked_patch_mode_for(Some("")), 0);
+        assert_eq!(masked_patch_mode_for(Some("off")), 0);
+        assert_eq!(masked_patch_mode_for(Some("1")), 1);
+        assert_eq!(masked_patch_mode_for(Some(" 1 ")), 1);
+        assert_eq!(masked_patch_mode_for(Some("alt")), 2);
+        assert_eq!(masked_patch_mode_for(Some(" alt ")), 2);
+        if std::env::var_os("VICTORY_MASKED_PATCH").is_none() {
+            assert_eq!(masked_patch_mode(), 0, "VICTORY_MASKED_PATCH must default off");
+        }
+    }
+
+    #[test]
+    fn lock_free_card_patch_mirror_protects_relay_and_land_merges() {
+        let mut title = vec![0x20u8; PAGE];
+        let mut side = vec![0x20u8; PAGE];
+        let start = title.as_ptr() as usize;
+        let shadow = Shadow::unbacked(start as u64, side.as_mut_ptr(), side.len() as u64, true);
+        let _tracked = shadow.track_carded_test();
+        let card = shadow.card.as_ref().expect("carded copy");
+
+        assert!(!card.has_patch.load(Ordering::Acquire));
+
+        // Record a masked patch on bytes [64..80) and verify `card_merge_relay`
+        // skips those bytes while merging an unrelated GPU write at [0..16).
+        title[64..80].fill(0x73);
+        side[64..80].fill(0x73);
+        let mut words = Vec::new();
+        patch_words(64, &title[64..80], &[(0, 16)], &mut words);
+        shadow.card_patched_words(1, words, vec![(64, 80)]);
+        assert!(card.has_patch.load(Ordering::Acquire));
+        assert!(!card.has_dirty.load(Ordering::Acquire));
+
+        let mut gpu = vec![0x20u8; 256];
+        gpu[0..16].fill(0xA1);
+        gpu[64..80].fill(0xA2);
+        let mut scratch = Vec::new();
+        let _ = shadow.card_merge_relay(0, &gpu, 5, &mut scratch);
+        assert_eq!(&title[0..16], &[0xA1; 16], "unrelated GPU write must land");
+        assert_eq!(&title[64..80], &[0x73; 16], "pending masked patch must not be overwritten by older GPU bytes");
+
+        // Also check `land_card` skips pending masked-patch ranges.
+        title[0..16].fill(0x20);
+        side[0..16].fill(0x20);
+        let mut notes = crate::land::Notes::default();
+        // SAFETY: `gpu` is live for the call.
+        let _ = unsafe { shadow.land_card(std::iter::once((0, 256, gpu.as_ptr() as usize)), 5, &mut notes) };
+        assert_eq!(&title[0..16], &[0xA1; 16]);
+        assert_eq!(&title[64..80], &[0x73; 16], "land_card must skip pending masked patch");
+
+        // `card_patches(10)` returns nothing while masked patching is off, and
+        // when enabled drains `patch`, clears `has_patch`, and (with relay)
+        // publishes `sent` so a fetch from before send 10 still skips [64..80).
+        assert!(with_masked_patch_test(false, || card_patches(10)).is_empty());
+        assert!(card.has_patch.load(Ordering::Acquire));
+        let taken = with_masked_patch_test(true, || card_patches(10));
+        let mine = taken
+            .into_iter()
+            .find(|(s, _, _)| Arc::ptr_eq(s, &shadow))
+            .expect("tracked shadow patch must be returned");
+        assert_eq!(mine.1.len(), 4);
+        assert_eq!(mine.2, vec![(64, 80)]);
+        assert!(!card.has_patch.load(Ordering::Acquire));
+        assert_eq!(card.has_sent.load(Ordering::Acquire), relay());
+
+        if relay() {
+            title[0..16].fill(0x20);
+            side[0..16].fill(0x20);
+            let _ = shadow.card_merge_relay(0, &gpu, 5, &mut scratch);
+            assert_eq!(&title[0..16], &[0xA1; 16]);
+            assert_eq!(&title[64..80], &[0x73; 16], "sent masked patch must still be protected for older fetches");
+            // Reset `sent` cleanly.
+            shadow.send_up(11, 10);
+            assert!(!card.has_sent.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn merge_under_writes_patches_past_run_cap_without_settling() {
+        // Set up a watched private page so `merge_under_writes` sees a stale
+        // page under pending GPU writes, exhausts `runs_left`, and emits a
+        // masked patch instead of requesting a settle.
+        use windows_sys::Win32::System::Memory as mem;
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let len = PAGE;
+        // SAFETY: private write-watched allocation owned by this test.
+        let ptr = unsafe {
+            mem::VirtualAlloc(
+                std::ptr::null(),
+                len,
+                mem::MEM_RESERVE | mem::MEM_COMMIT | MEM_WRITE_WATCH,
+                mem::PAGE_READWRITE,
+            ) as *mut u8
+        };
+        assert!(!ptr.is_null());
+        let start = ptr as usize;
+        // SAFETY: `len` bytes allocated above.
+        let title = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+        title.fill(0x11);
+        let mut side = vec![0x11u8; len];
+
+        let shadow = Shadow::unbacked(start as u64, side.as_mut_ptr(), len as u64, true);
+        let _tracked = shadow.track_carded_test();
+        // Establish initial write-watch baseline and mark page copied.
+        let (baseline, _) = crate::watch::writes(start, start + len, true).expect("watched");
+        shadow.watched.store(1, Ordering::Relaxed);
+        shadow.copied.lock().unwrap().set(0, baseline);
+        shadow.writing(start, len);
+
+        // Mutate 3 distinct runs > 256 bytes (so even with `words_under` ON
+        // they count as 3 own-copy runs, exceeding `runs_left = 1`!).
+        for run_idx in 0..3 {
+            let off = run_idx * 1024 + 1;
+            for k in 0..300 {
+                title[off + k] = (0x40 + run_idx as u8).wrapping_add(k as u8);
+            }
+        }
+
+        // With masked patching off (default), exceeding `runs_left` settles
+        // flights as baseline without modifying `side` or queuing patches.
+        let prev_ready = PATCH_READY.swap(true, Ordering::Relaxed);
+        let mut baseline_runs_left = 1usize;
+        let baseline_settle = with_masked_patch_test(false, || {
+            shadow.merge_under_writes(start, len, &mut baseline_runs_left)
+        });
+        assert!(baseline_settle, "default off mode must settle flights when runs exceed cap");
+        assert_eq!(side, vec![0x11u8; len], "baseline settle path must not emit partial patches");
+
+        // With opt-in masked patching enabled, exceeding `runs_left` emits
+        // exact byte-masked words instead of settling and restores `runs_left`.
+        let mut runs_left = 1usize;
+        let must_settle = with_masked_patch_test(true, || {
+            shadow.merge_under_writes(start, len, &mut runs_left)
+        });
+        PATCH_READY.store(prev_ready, Ordering::Relaxed);
+
+        assert!(!must_settle, "masked patch must avoid settling when runs exceed cap");
+        assert_eq!(runs_left, 1, "unspent run budget must be restored for other pages");
+        assert_eq!(side, title, "CPU side must be updated with exact changed bytes");
+        let taken = with_masked_patch_test(true, || card_patches(42));
+        let mine = taken
+            .into_iter()
+            .find(|(s, _, _)| Arc::ptr_eq(s, &shadow))
+            .expect("merge_under_writes must emit masked patch words");
+        assert!(!mine.1.is_empty());
+        // Apply emitted words to a simulated card buffer carrying 0x11 + flight
+        // writes (0xee) in untouched bytes, and verify 100% byte-exact parity!
+        let mut card = vec![0x11u8; len];
+        for i in 0..len {
+            if title[i] == 0x11 {
+                card[i] = 0xee;
+            }
+        }
+        for w in &mine.1 {
+            let k = w[0] as usize;
+            let mut dw = [0u8; 4];
+            dw.copy_from_slice(&card[k..k + 4]);
+            card[k..k + 4].copy_from_slice(&patched_word(u32::from_le_bytes(dw), *w).to_le_bytes());
+        }
+        for i in 0..len {
+            let want = if title[i] == 0x11 { 0xee } else { title[i] };
+            assert_eq!(card[i], want, "patched card mismatch at byte {i}");
+        }
+
+        // SAFETY: freeing our test allocation.
+        unsafe {
+            let _ = mem::VirtualFree(ptr.cast(), 0, mem::MEM_RELEASE);
         }
     }
 

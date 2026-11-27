@@ -3878,8 +3878,11 @@ impl State {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     self.mesh_scissor(list, true);
+                    // Query `host_pipeline` AFTER `prepare_direct` so `launch`
+                    // always matches the pipeline `prepare_direct` actually bound.
+                    let pipeline = crate::pipeline::host_pipeline(self.pipeline as This);
                     #[cfg(feature = "diagnostics")]
-                    if let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) {
+                    if let Some(p) = pipeline {
                         list.ran_indirect(p.pso.as_raw() as usize, &p.name, crate::host::indirects::DIRECT, x, &self.user);
                     }
                     // (The host takes 65,535 groups in a dimension: more is
@@ -3887,17 +3890,47 @@ impl State {
                     if x > 65_535 {
                         once!(x, "a mesh dispatch of more groups than the host takes: cut");
                     }
-                    // SAFETY: an open list with everything set.
-                    unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) };
-                    self.drew(
-                        list,
-                        crate::pipeline::host_pipeline(self.pipeline as This),
-                        #[cfg(feature = "diagnostics")]
-                        "DispatchMesh",
-                    );
+                    let launch = pipeline.and_then(|p| p.launch.as_ref());
+                    let dispatch_plain = |this: &mut Self, launch: &crate::pipeline::host::Launch| match launch.plain() {
+                        Some(plain) => {
+                            // SAFETY: open list and live pipeline sharing the root signature.
+                            unsafe {
+                                list.list.SetPipelineState(plain);
+                                l6.DispatchMesh(x.min(65_535), 1, 1);
+                            }
+                            this.host_pipeline = windows::core::Interface::as_raw(plain) as usize;
+                            list.keep(plain);
+                            true
+                        }
+                        None => false,
+                    };
+                    let ok = match launch {
+                        Some(launch) if crate::launch::now() => {
+                            crate::launch::record(list, launch.roots, crate::launch::Launch::Direct(x))
+                                || dispatch_plain(self, launch)
+                        }
+                        // Off phase of `VICTORY_MESH_LAUNCH=alt` / A/B: run the
+                        // same mesh pipeline without its amplification stage.
+                        Some(launch) => dispatch_plain(self, launch),
+                        // SAFETY: an open list with everything set.
+                        None => {
+                            unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) };
+                            true
+                        }
+                    };
+                    if ok {
+                        self.drew(
+                            list,
+                            pipeline,
+                            #[cfg(feature = "diagnostics")]
+                            "DispatchMesh",
+                        );
+                    }
                     self.mesh_scissor(list, false);
-                    DRAWN.fetch_add(1, Ordering::Relaxed);
-                    true
+                    if ok {
+                        DRAWN.fetch_add(1, Ordering::Relaxed);
+                    }
+                    ok
                 }
                 Err(_) => false,
             };
@@ -4700,6 +4733,61 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
+        // Single-record indirect mesh draw without count buffer on a pipeline
+        // carrying the amplification launch stage: read and clamp the record
+        // directly in the amplification stage (`crate::launch`), skipping the
+        // compute clamp pass and barriers.
+        if kind == MESH
+            && max == 1
+            && count.is_none()
+            && let Some(launch) = &p.launch
+            && crate::launch::now()
+        {
+            if args.in_place() {
+                in_place_indirect(arguments, kind);
+            }
+            let offset = args.offset(arguments);
+            if !offset.is_multiple_of(4) {
+                why("a mesh record not 4-byte aligned");
+                return false;
+            }
+            self.window = None;
+            args.refresh(list, arguments, len);
+            if !self.prepare_for(list, false, true) {
+                #[cfg(feature = "diagnostics")]
+                crate::pipeline::note_indirect_prepare(
+                    self.pipeline as This,
+                    std::mem::take(&mut self.prepare_failure),
+                    (kind, stride, max),
+                    (&args, arguments),
+                    None,
+                );
+                why("prepare failed");
+                return false;
+            }
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x} launched"), false));
+            #[cfg(feature = "diagnostics")]
+            list.ran_indirect(p.pso.as_raw() as usize, &p.name, kind, max, &self.user);
+            // SAFETY: a live buffer.
+            let record = unsafe { args.buffer.GetGPUVirtualAddress() } + offset;
+            list.keep(&args.buffer);
+            self.mesh_scissor(list, true);
+            let launched = crate::launch::record(list, launch.roots, crate::launch::Launch::Record(record));
+            self.mesh_scissor(list, false);
+            if !launched {
+                why("no budget for the launch");
+                return false;
+            }
+            self.drew(
+                list,
+                Some(p),
+                #[cfg(feature = "diagnostics")]
+                "ExecuteIndirect(launch)",
+            );
+            DRAWN.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
         // Renderer port 1: arguments (or their count) in the title's memory
         // read in place ([`in_place_order`]): clamped alone, right before
         // their execution, after a wait for every earlier shader write.
@@ -4828,6 +4916,21 @@ impl State {
             );
             why("prepare failed");
             return false;
+        }
+        // An indirect mesh call that the launch stage does not handle (count
+        // buffer, `max > 1`, or off phase of `VICTORY_MESH_LAUNCH=alt`): bind
+        // the same mesh pipeline without the amplification stage.
+        if kind == MESH
+            && let Some(launch) = &p.launch
+        {
+            let Some(plain) = launch.plain() else {
+                why("no host pipeline without the launch stage");
+                return false;
+            };
+            // SAFETY: an open list and a live pipeline sharing the root signature.
+            unsafe { list.list.SetPipelineState(plain) };
+            self.host_pipeline = windows::core::Interface::as_raw(plain) as usize;
+            list.keep(plain);
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {

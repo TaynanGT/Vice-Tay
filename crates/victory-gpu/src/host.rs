@@ -5244,6 +5244,7 @@ fn late_line(frames: f64) {
     crate::watch::port_guard_line(frames);
     crate::port_journal::line(frames);
     crate::picked::log(frames);
+    crate::launch::line(frames);
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
     if late_exact() {

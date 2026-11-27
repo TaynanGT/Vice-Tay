@@ -479,6 +479,20 @@ impl Module {
         let zero = self.i32(0);
         self.push(block, ty, Op::Gep(arr, ptr, vec![zero, index]))
     }
+    /// The address of field `index` of the struct `ptr` points to.
+    pub fn field(&mut self, block: usize, ptr: V, index: u32) -> V {
+        let TypeDef::Ptr(st, space) = self.types[self.type_of(ptr).0 as usize] else {
+            panic!("field of a non-pointer")
+        };
+        let TypeDef::Struct(_, fields) = &self.types[st.0 as usize] else {
+            panic!("field of a non-struct")
+        };
+        let elem = fields[index as usize];
+        let ty = self.ptr_in(elem, space);
+        let zero = self.i32(0);
+        let idx = self.i32(index);
+        self.push(block, ty, Op::Gep(st, ptr, vec![zero, idx]))
+    }
     pub fn load(&mut self, block: usize, ptr: V) -> V {
         let TypeDef::Ptr(ty, _) = self.types[self.type_of(ptr).0 as usize] else {
             panic!("load from a non-pointer")

@@ -179,6 +179,8 @@ pub(crate) struct Psv<'a> {
     pub prims: &'a [SigElement],
     /// Mesh: its state and the group-shared bytes it declares.
     pub mesh: Option<(super::shader::Mesh, u32)>,
+    /// Amplification: payload size in bytes.
+    pub amplification: Option<u32>,
     /// Geometry (triangles in, triangle strips out on stream 0): its
     /// maximum vertex count. `flag`: writes `SV_Position`.
     pub geometry: Option<u32>,
@@ -228,12 +230,19 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     info[31] = in_vectors as u8;
     info[32] = out_vectors as u8;
     if let Some((mesh, shared)) = p.mesh {
+        // MSInfo: group-shared bytes, view-dependent bytes, payload bytes,
+        // maximum vertices, and maximum primitives.
         info[0..4].copy_from_slice(&shared.to_le_bytes());
+        info[8..12].copy_from_slice(&super::shader::mesh_payload_bytes().to_le_bytes());
         info[12..14].copy_from_slice(&(mesh.max_vertices as u16).to_le_bytes());
         info[14..16].copy_from_slice(&(mesh.max_primitives as u16).to_le_bytes());
         info[26] = vectors(p.prims) as u8;
         info[27] = mesh.topology;
         info[30] = p.prims.len() as u8;
+    }
+    if let Some(payload_bytes) = p.amplification {
+        // ASInfo: payload size in bytes.
+        info[0..4].copy_from_slice(&payload_bytes.to_le_bytes());
     }
     if let Some(max_vertices) = p.geometry {
         // Input primitive (3: triangles), output topology (5: triangle
@@ -486,6 +495,7 @@ mod tests {
             outputs: &[outputs[2].clone(), outputs[1].clone(), outputs[0].clone()],
             prims: &[],
             mesh: None,
+            amplification: None,
             geometry: None,
             bindings: &[],
             threads: [0; 3],

@@ -12,6 +12,38 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// Where root CBVs and SRVs are bound: `b<root parameter index>` and
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
+static MESH_LAUNCH_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Overrides whether translated mesh shaders declare the 4-byte amplification
+/// payload (`victory-gpu` syncs this with `launch::on()`, including
+/// `VICTORY_AB` overrides under diagnostics builds).
+pub fn set_mesh_launch_payload(on: bool) {
+    MESH_LAUNCH_OVERRIDE.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Bytes of amplification payload every translated mesh shader declares and
+/// never reads: 4 unless `VICTORY_MESH_LAUNCH=0` (0 then, unless overridden
+/// via [`set_mesh_launch_payload`]). With it, the host can put an
+/// amplification stage (`mesh_launch_as`) in front of mesh shaders to launch
+/// single-record indirect mesh draws directly on the GPU without an
+/// intermediate clamp pass (after fxceless/victory-fork `b1d777a` / `0e006f0`
+/// and kelvaroq patch `0041`). Drivers reject a mesh shader declaring 0 payload
+/// bytes when paired with an amplification shader, while accepting a payload
+/// declaration even when run without an amplification stage.
+pub fn mesh_payload_bytes() -> u32 {
+    let on = match MESH_LAUNCH_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| std::env::var_os("VICTORY_MESH_LAUNCH").is_none_or(|v| v != "0"))
+        }
+    };
+    if on { 4 } else { 0 }
+}
+/// Register space reserved for the host's mesh-launch amplification shader
+/// (`b0`, `t0`, `u0`): no translated shader binds in this space.
+pub const LAUNCH_SPACE: u32 = 9;
 
 /// The root SRV `t<SLOT_STRIDES>` in [`ROOT_CBV_SPACE`] of a shader that
 /// reads buffers through descriptors it picks from the view heap at an
@@ -250,8 +282,18 @@ pub(crate) struct Shader {
     pub prims: Vec<SigElement>,
     /// A mesh shader (`threads` is its thread-group size).
     pub mesh: Option<Mesh>,
+    /// An amplification shader (`threads` is its thread-group size; value is
+    /// the payload size in bytes).
+    pub amplification: Option<u32>,
     /// A geometry shader (the rectangle stage, `rect.rs`); `pixel` is false.
     pub geometry: Option<Geometry>,
+    /// Register space for `root_cbvs`, `root_srvs`, and `root_uavs`
+    /// ([`ROOT_CBV_SPACE`] for translated shaders, [`LAUNCH_SPACE`] for the
+    /// mesh-launch amplification stage).
+    pub root_space: u32,
+    /// Size in bytes declared for each entry in `root_cbvs` (65,536 for
+    /// translated root CBVs, 4 for the mesh-launch root constant cbuffer).
+    pub root_cbv_size: u32,
     /// Dwords of user data the shader reads (0: no user-data buffer).
     pub user_data: u32,
     /// Immediate samplers, bound as `s0..` in [`SAMPLER_SPACE`].
@@ -314,7 +356,10 @@ impl Shader {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh: None,
+            amplification: None,
             geometry: None,
+            root_space: ROOT_CBV_SPACE,
+            root_cbv_size: 65536,
             user_data: 0,
             samplers: 0,
             cmp_samplers: 0,
@@ -396,7 +441,7 @@ impl Shader {
             return h;
         }
         let r = self.m.i32(u32::from(slot));
-        let bind = [r, r, self.m.i32(ROOT_CBV_SPACE), self.m.i8(2)];
+        let bind = [r, r, self.m.i32(self.root_space), self.m.i8(2)];
         let bind = self.m.aggregate(self.t.bind, &bind);
         let f = self.m.bool(false);
         let block = self.entry;
@@ -408,7 +453,7 @@ impl Shader {
             217,
             &[bind, r, f],
         );
-        let h = self.annotate(block, h, 13, 65536);
+        let h = self.annotate(block, h, 13, self.root_cbv_size);
         self.root_cbvs.push((slot, h));
         h
     }
@@ -419,7 +464,7 @@ impl Shader {
             return h;
         }
         let r = self.m.i32(u32::from(slot));
-        let bind = [r, r, self.m.i32(ROOT_CBV_SPACE), self.m.i8(0)];
+        let bind = [r, r, self.m.i32(self.root_space), self.m.i8(0)];
         let bind = self.m.aggregate(self.t.bind, &bind);
         let f = self.m.bool(false);
         let block = self.entry;
@@ -438,13 +483,13 @@ impl Shader {
     }
 
     /// The handle of the root UAV (a raw buffer) of root parameter `slot`:
-    /// `u<slot>` in [`ROOT_CBV_SPACE`].
+    /// `u<slot>` in `self.root_space`.
     pub fn root_uav_handle(&mut self, slot: u8) -> V {
         if let Some(&(_, h)) = self.root_uavs.iter().find(|r| r.0 == slot) {
             return h;
         }
         let r = self.m.i32(u32::from(slot));
-        let bind = [r, r, self.m.i32(ROOT_CBV_SPACE), self.m.i8(1)];
+        let bind = [r, r, self.m.i32(self.root_space), self.m.i8(1)];
         let bind = self.m.aggregate(self.t.bind, &bind);
         let f = self.m.bool(false);
         let block = self.entry;
@@ -623,7 +668,11 @@ impl Shader {
         // The clean-up, before anything is declared about the code: a
         // feature whose last use it removed must not be declared (the
         // validator compares the flags with what the code uses).
-        let passes = super::shader_opt() & super::bitcode::opt::MODULE;
+        let passes = if self.amplification.is_some() {
+            0
+        } else {
+            super::shader_opt() & super::bitcode::opt::MODULE
+        };
         if passes != 0 {
             self.m.optimise(passes);
             let used = self.m.usage();
@@ -644,7 +693,10 @@ impl Shader {
         // Unordered views outside pixel and compute programs (memory by
         // address), as DXC counts them: ranges declared below, not views
         // picked from the heap (VIctory a1a2077a).
-        let compute = self.threads.is_some() && self.mesh.is_none() && self.geometry.is_none();
+        let compute = self.threads.is_some()
+            && self.mesh.is_none()
+            && self.amplification.is_none()
+            && self.geometry.is_none();
         if !self.root_uavs.is_empty() && !self.pixel && !compute {
             self.flags |= flags::UAVS_EVERY_STAGE;
         }
@@ -686,34 +738,43 @@ impl Shader {
                     dxil_kind: 13,
                 });
             }
-            let blob = self.m.array(16384, self.t.i32);
-            let ty = self.m.named_struct("RootCbv", vec![blob]);
-            let p = self.m.ptr(ty);
-            let u = self.m.undef(p);
-            for (slot, _) in self.root_cbvs.clone() {
-                let ops = vec![
-                    Some(i32c(&mut self, cbv_list.len() as u32)),
-                    Some(self.m.md_value(u)),
-                    Some(empty),
-                    Some(i32c(&mut self, ROOT_CBV_SPACE)),
-                    Some(i32c(&mut self, u32::from(slot))),
-                    Some(i32c(&mut self, 1)),
-                    Some(i32c(&mut self, 65536)),
-                    None,
-                ];
-                cbv_list.push(Some(self.m.md_node(ops)));
-                bindings.push(Binding {
-                    kind: 2,
-                    space: ROOT_CBV_SPACE,
-                    register: u32::from(slot),
-                    dxil_kind: 13,
-                });
+            if !self.root_cbvs.is_empty() {
+                let root_space = self.root_space;
+                let cbv_size = self.root_cbv_size;
+                let ty = if cbv_size == 4 {
+                    self.m.named_struct("Launch", vec![self.t.i32])
+                } else {
+                    let blob = self.m.array(cbv_size / 4, self.t.i32);
+                    self.m.named_struct("RootCbv", vec![blob])
+                };
+                let p = self.m.ptr(ty);
+                let u = self.m.undef(p);
+                for (slot, _) in self.root_cbvs.clone() {
+                    let ops = vec![
+                        Some(i32c(&mut self, cbv_list.len() as u32)),
+                        Some(self.m.md_value(u)),
+                        Some(empty),
+                        Some(i32c(&mut self, root_space)),
+                        Some(i32c(&mut self, u32::from(slot))),
+                        Some(i32c(&mut self, 1)),
+                        Some(i32c(&mut self, cbv_size)),
+                        None,
+                    ];
+                    cbv_list.push(Some(self.m.md_node(ops)));
+                    bindings.push(Binding {
+                        kind: 2,
+                        space: root_space,
+                        register: u32::from(slot),
+                        dxil_kind: 13,
+                    });
+                }
             }
             if !cbv_list.is_empty() {
                 cbvs = Some(self.m.md_node(cbv_list));
             }
             let mut srvs = None;
             if !self.root_srvs.is_empty() {
+                let root_space = self.root_space;
                 let ty = self
                     .m
                     .named_struct("struct.ByteAddressBuffer", vec![self.t.i32]);
@@ -725,7 +786,7 @@ impl Shader {
                         Some(i32c(&mut self, n as u32)),
                         Some(self.m.md_value(u)),
                         Some(empty),
-                        Some(i32c(&mut self, ROOT_CBV_SPACE)),
+                        Some(i32c(&mut self, root_space)),
                         Some(i32c(&mut self, u32::from(slot))),
                         Some(i32c(&mut self, 1)),
                         Some(i32c(&mut self, 11)),
@@ -735,7 +796,7 @@ impl Shader {
                     list.push(Some(self.m.md_node(ops)));
                     bindings.push(Binding {
                         kind: 4,
-                        space: ROOT_CBV_SPACE,
+                        space: root_space,
                         register: u32::from(slot),
                         dxil_kind: 11,
                     });
@@ -744,6 +805,7 @@ impl Shader {
             }
             let mut uavs = None;
             if !self.root_uavs.is_empty() {
+                let root_space = self.root_space;
                 let ty = self
                     .m
                     .named_struct("struct.RWByteAddressBuffer", vec![self.t.i32]);
@@ -760,7 +822,7 @@ impl Shader {
                         Some(i32c(&mut self, n as u32)),
                         Some(self.m.md_value(u)),
                         Some(empty),
-                        Some(i32c(&mut self, ROOT_CBV_SPACE)),
+                        Some(i32c(&mut self, root_space)),
                         Some(i32c(&mut self, u32::from(slot))),
                         Some(i32c(&mut self, 1)),
                         Some(i32c(&mut self, 11)),
@@ -772,7 +834,7 @@ impl Shader {
                     list.push(Some(self.m.md_node(ops)));
                     bindings.push(Binding {
                         kind: 7,
-                        space: ROOT_CBV_SPACE,
+                        space: root_space,
                         register: u32::from(slot),
                         dxil_kind: 11,
                     });
@@ -896,23 +958,29 @@ impl Shader {
         if let Some(threads) = self.threads {
             let t = threads.map(|n| Some(i32c(&mut self, n)));
             let t = self.m.md_node(t.to_vec());
-            match self.mesh {
+            match (self.mesh, self.amplification) {
                 // Mesh state (tag 9): threads, maximum vertices and
                 // primitives, topology, payload bytes.
-                Some(mesh) => {
+                (Some(mesh), _) => {
                     props.push(i32c(&mut self, 9));
                     let state = [
                         mesh.max_vertices,
                         mesh.max_primitives,
                         mesh.topology.into(),
-                        0,
+                        mesh_payload_bytes(),
                     ]
                     .map(|n| Some(i32c(&mut self, n)));
                     let mut node = vec![Some(t)];
                     node.extend(state);
                     props.push(self.m.md_node(node));
                 }
-                None => {
+                // Amplification state (tag 10): threads, payload bytes.
+                (None, Some(payload)) => {
+                    props.push(i32c(&mut self, 10));
+                    let payload = Some(i32c(&mut self, payload));
+                    props.push(self.m.md_node(vec![Some(t), payload]));
+                }
+                (None, None) => {
                     props.push(i32c(&mut self, 4));
                     props.push(t);
                 }
@@ -939,9 +1007,10 @@ impl Shader {
         let version = self.m.md_node(vec![Some(one), Some(six)]);
         self.m.named_md("dx.version", vec![version]);
         self.m.named_md("dx.valver", vec![version]);
-        // Program kinds: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
+        // Program kinds: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh, 14 amplification.
         let (name, kind) = match (self.threads, self.pixel) {
             _ if self.mesh.is_some() => ("ms", 13u32),
+            _ if self.amplification.is_some() => ("as", 14u32),
             _ if self.geometry.is_some() => ("gs", 2),
             (Some(_), _) => ("cs", 5u32),
             (None, true) => ("ps", 0),
@@ -1016,6 +1085,7 @@ impl Shader {
             outputs: &self.outputs,
             prims: &self.prims,
             mesh: self.mesh.map(|m| (m, self.lds_dwords * 4)),
+            amplification: self.amplification,
             geometry: self.geometry.map(|g| g.max_vertices),
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),

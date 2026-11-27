@@ -152,6 +152,14 @@ fn build() -> [u8; 32] {
         if victory_shader::emit::constants_raw() {
             bytes.extend_from_slice(b"VICTORY_PORT_CBV=1");
         }
+        // Amplification mesh launch (`VICTORY_MESH_LAUNCH` / `VICTORY_AB`):
+        // sync `victory-shader` with `crate::launch::on()` and hash the
+        // effective payload size (4 vs 0) so unset, "1", "alt", and AB-enabled
+        // runs share one key while payload-0 runs get a distinct key.
+        crate::launch::sync_shader_payload();
+        bytes.extend_from_slice(b"mesh_payload=");
+        bytes.extend_from_slice(&victory_shader::emit::mesh_payload_bytes().to_le_bytes());
+        bytes.push(0);
         bytes
     });
     let mut hash = blake3::Hasher::new();
@@ -189,6 +197,7 @@ pub fn precompile_cache_key() -> Option<[u8; 32]> {
 /// does: what the card can do decides the form of some programs.
 pub fn precompile(container: &[u8]) -> Result<Precompiled, String> {
     let _ = crate::host::host();
+    crate::launch::sync_shader_payload();
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     let Some(cache) = CACHE.get() else {
         translate(container)?;
@@ -200,6 +209,7 @@ pub fn precompile(container: &[u8]) -> Result<Precompiled, String> {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
+    crate::launch::sync_shader_payload();
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate, refresh_in_runs())
@@ -660,5 +670,64 @@ mod tests {
         // (Other tests count too; these at least.)
         let (s, r, c) = stale_counts();
         assert!(s >= stale + 2 && r > refreshed && c > changed, "{s} {r} {c}");
+    }
+
+    #[test]
+    fn mesh_launch_switch_changes_cache_key() {
+        const CHILD: &str = "VICTORY_CACHE_MESH_LAUNCH_KEY_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let key = blake3::Hash::from_bytes(build());
+            let payload = victory_shader::emit::mesh_payload_bytes();
+            println!("mesh-launch-cache-key={key}:{payload}");
+            return;
+        }
+        const { assert!(victory_shader::TRANSLATOR_VERSION >= 10) };
+        let probe = |val: Option<&str>, ab: Option<&str>| -> (String, u32) {
+            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+            cmd.args(["mesh_launch_switch_changes_cache_key", "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1");
+            match val {
+                Some(v) => {
+                    cmd.env("VICTORY_MESH_LAUNCH", v);
+                }
+                None => {
+                    cmd.env_remove("VICTORY_MESH_LAUNCH");
+                }
+            }
+            match ab {
+                Some(v) => {
+                    cmd.env("VICTORY_AB", v);
+                }
+                None => {
+                    cmd.env_remove("VICTORY_AB");
+                }
+            }
+            let output = cmd.output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            let raw = String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .find_map(|line| line.split_once("mesh-launch-cache-key=").map(|(_, v)| v.to_owned()))
+                .expect("child printed its cache key");
+            let (hash, bytes) = raw.split_once(':').expect("key:payload");
+            (hash.to_owned(), bytes.parse().expect("payload u32"))
+        };
+        let (k_unset, p_unset) = probe(None, None);
+        let (k_one, p_one) = probe(Some("1"), None);
+        let (k_alt, p_alt) = probe(Some("alt"), None);
+        let (k_zero, p_zero) = probe(Some("0"), None);
+        assert_eq!(p_unset, 4);
+        assert_eq!(p_one, 4);
+        assert_eq!(p_alt, 4);
+        assert_eq!(p_zero, 0);
+        assert_eq!(k_unset, k_one, "unset and 1 must share cache key");
+        assert_eq!(k_unset, k_alt, "unset and alt must share cache key");
+        assert_ne!(k_unset, k_zero, "payload 4 and payload 0 must differ");
+        #[cfg(feature = "diagnostics")]
+        {
+            let (k_ab, p_ab) = probe(Some("0"), Some("10,VICTORY_MESH_LAUNCH"));
+            assert_eq!(p_ab, 4, "VICTORY_AB must enable payload even with VICTORY_MESH_LAUNCH=0");
+            assert_eq!(k_ab, k_one, "VICTORY_AB override must match payload-4 cache key");
+        }
     }
 }

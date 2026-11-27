@@ -914,17 +914,24 @@ pub fn pending_with(
 ) -> HRESULT {
     type Data = Mutex<(Option<Box<dyn FnOnce() -> Result<Vec<u8>, HRESULT> + Send>>, Vec<u8>)>;
     extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
-        // SAFETY: the runtime passes valid provider data; the context is the
-        // boxed state until cleanup frees it.
+        // SAFETY: the runtime passes valid provider data; the context is an
+        // `Arc<Data>` raw pointer until cleanup drops its reference.
         let data = unsafe { &*data };
         let state = data.context.cast::<Data>();
         match op {
-            // SAFETY: boxed in `pending_with`; nothing runs after cleanup.
-            OP_CLEANUP => drop(unsafe { Box::from_raw(state) }),
+            // SAFETY: created with `Arc::into_raw` in `pending_with`.
+            OP_CLEANUP => drop(unsafe { Arc::from_raw(state) }),
             OP_BEGIN => {
-                // SAFETY: as above; cleanup waits for completion.
-                let work = unsafe { &*state }.lock().unwrap_or_else(|e| e.into_inner()).0.take();
-                let (block, state) = (data.block as usize, state as usize);
+                // SAFETY: cleanup has not run yet; keep our own `Arc` so a
+                // concurrent `XAsyncCancel` + `OP_CLEANUP` cannot free `Data`
+                // while `work` is still running.
+                let shared = unsafe {
+                    Arc::increment_strong_count(state);
+                    Arc::from_raw(state)
+                };
+                let work = shared.lock().unwrap_or_else(|e| e.into_inner()).0.take();
+                let target = call(data.block);
+                let block = data.block as usize;
                 std::thread::spawn(move || {
                     let result = work.map_or(Err(E_ABORT), |work| work());
                     let (hr, len) = match &result {
@@ -932,11 +939,11 @@ pub fn pending_with(
                         Err(hr) => (*hr, 0),
                     };
                     if let Ok(bytes) = result {
-                        // SAFETY: the call is pending, so its state lives.
-                        let state = unsafe { &*(state as *const Data) };
-                        state.lock().unwrap_or_else(|e| e.into_inner()).1 = bytes;
+                        shared.lock().unwrap_or_else(|e| e.into_inner()).1 = bytes;
                     }
-                    XAsyncComplete(block as *mut AsyncBlock, hr, len);
+                    if let Some(target) = target {
+                        complete_call(&target, block as *mut AsyncBlock, hr, len);
+                    }
                 });
             }
             // SAFETY: as above; the runtime checked the buffer's size.
@@ -950,12 +957,12 @@ pub fn pending_with(
         }
         S_OK
     }
-    let state: Box<Data> = Box::new(Mutex::new((Some(Box::new(work)), Vec::new())));
-    let context = Box::into_raw(state);
-    let hr = XAsyncBegin(block, context.cast(), identity, std::ptr::null(), Some(provider));
+    let state: Arc<Data> = Arc::new(Mutex::new((Some(Box::new(work)), Vec::new())));
+    let context = Arc::into_raw(state);
+    let hr = XAsyncBegin(block, context.cast_mut().cast(), identity, std::ptr::null(), Some(provider));
     if hr < 0 {
         // SAFETY: refused before the call existed; still ours.
-        drop(unsafe { Box::from_raw(context) });
+        drop(unsafe { Arc::from_raw(context) });
     }
     hr
 }
@@ -1938,5 +1945,55 @@ mod tests {
         assert_eq!(SEEN.load(Ordering::SeqCst), 1, "cleanup ran under the lock");
         assert_eq!(XAsyncGetStatus(&mut block, true), E_ABORT);
         *CLEANED.lock().unwrap() = None;
+    }
+
+    extern "system" fn idle_provider(_op: u32, _data: *const ProviderData) -> HRESULT {
+        S_OK
+    }
+
+    #[test]
+    fn canceled_pending_with_does_not_complete_reused_block() {
+        let mut block = AsyncBlock {
+            queue: std::ptr::null(),
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        };
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let hr = pending_with(&mut block, std::ptr::null(), move || {
+            let _ = started_tx.send(());
+            let _ = resume_rx.recv();
+            let _ = done_tx.send(());
+            Ok(vec![1, 2, 3, 4])
+        });
+        assert_eq!(hr, S_OK);
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        // Canceling runs OP_CLEANUP while the worker is still blocked.
+        XAsyncCancel(&mut block);
+        assert_eq!(XAsyncGetStatus(&mut block, true), E_ABORT);
+
+        // Reuse the same AsyncBlock for a new pending call before the first
+        // worker returns.
+        let second = XAsyncBegin(
+            &mut block,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+            Some(idle_provider as Provider),
+        );
+        assert_eq!(second, S_OK);
+        assert_eq!(XAsyncGetStatus(&mut block, false), E_PENDING);
+
+        let _ = resume_tx.send(());
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        // The canceled worker must neither UAF its state nor complete the new call.
+        assert_eq!(XAsyncGetStatus(&mut block, false), E_PENDING);
+        XAsyncCancel(&mut block);
+        assert_eq!(XAsyncGetStatus(&mut block, true), E_ABORT);
     }
 }

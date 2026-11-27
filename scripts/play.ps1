@@ -110,6 +110,10 @@ if ($Machine -eq '4060') {
     if (-not $Safe) {
         $settings.VICTORY_CARD_RESERVE_BUDGETS = '1'
         $settings.VICTORY_CARD_BUFFERS_MIN_KB = '64'
+        $settings.VICTORY_PORT_GUARD = '1'
+        $settings.VICTORY_PORT_JOURNAL = '1'
+        $settings.VICTORY_ASK_SPREAD = '1'
+        $settings.VICTORY_SYNC_FINE = '1'
     }
     if ($ram) {
         $settings.VICTORY_WORKING_SET_MB = [string][math]::Max(3072, [int64]($ram / 1MB) - 11624)

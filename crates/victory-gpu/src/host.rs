@@ -8645,7 +8645,7 @@ struct Batch {
     index: ByCopy<usize>,
     /// Staging buffers (by address) refreshed since the last title write,
     /// or due to be.
-    textures: std::collections::HashSet<usize>,
+    textures: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Those due ([`Batch::refresh_textures`]).
     due: Vec<std::sync::Arc<crate::texture::Staging>>,
     /// What copies at their place in the submission's lists put into title
@@ -8656,6 +8656,9 @@ struct Batch {
     /// Copies (by address) brought up to date ahead of the steps, and the
     /// range (from, to) ([`Batch::refresh_ahead`]).
     ahead: ByCopy<(usize, usize)>,
+    /// Single-entry cache for the most recent `ahead` hit (`(key, from, to)`),
+    /// skipping hash lookups on consecutive `Step::Refresh` entries for the same buffer.
+    last_ahead: (usize, usize, usize),
     /// `ahead` holds everything the submission refreshes
     /// ([`Batch::refresh_front`]).
     front: bool,
@@ -8741,7 +8744,7 @@ fn front_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize)>
 
 /// Steps of a submission's lists from which [`Batch::refresh_front`] makes
 /// each list's part beside the submitting thread (renderer port #6).
-const WIDE_PLAN_STEPS: usize = 4096;
+const WIDE_PLAN_STEPS: usize = 1024;
 
 /// One list's part of [`front_spans`] (renderer port #6, [`list_front`]).
 #[derive(Default)]
@@ -9053,8 +9056,14 @@ impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
-        if self.ahead.get(&key).is_some_and(|&(from, to)| from <= address && end <= to) {
+        if self.last_ahead.0 == key && self.last_ahead.1 <= address && end <= self.last_ahead.2 {
             return;
+        }
+        if let Some(&(from, to)) = self.ahead.get(&key) {
+            self.last_ahead = (key, from, to);
+            if from <= address && end <= to {
+                return;
+            }
         }
         match self.index.get(&key) {
             Some(&at) => {
@@ -9073,10 +9082,14 @@ impl Batch {
     fn flush_one(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>) {
         // From here on it is refreshed around what the shaders write. (What
         // is in front of all the steps was, up to here.)
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
         if !self.front {
-            self.ahead.remove(&(std::sync::Arc::as_ptr(shadow) as usize));
+            self.ahead.remove(&key);
+            if self.last_ahead.0 == key {
+                self.last_ahead = (0, 0, 0);
+            }
         }
-        let Some(at) = self.index.remove(&(std::sync::Arc::as_ptr(shadow) as usize)) else {
+        let Some(at) = self.index.remove(&key) else {
             return;
         };
         let (shadow, from, to) = self.refreshes.swap_remove(at);
@@ -9121,6 +9134,7 @@ impl Batch {
     fn title_written(&mut self, write: TitleWrite) {
         self.flush(Some(write));
         self.ahead.clear();
+        self.last_ahead = (0, 0, 0);
         self.textures.clear();
     }
 
@@ -9169,7 +9183,7 @@ impl Batch {
             return;
         }
         let mut copies: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
-        let mut touches = Vec::new();
+        let mut touches = Vec::with_capacity(steps);
         for (n, list) in runs.iter().enumerate() {
             if parts.contains(&n) {
                 touches.push(Touch::Part);

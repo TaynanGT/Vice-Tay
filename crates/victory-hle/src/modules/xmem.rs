@@ -706,66 +706,129 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     }
     // SAFETY: checked non-null.
     let n = unsafe { *count };
-    let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
+    if n.checked_mul(PAGE).filter(|&s| s > 0).is_none() {
         return 0;
-    };
-    // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): the title asks for 6.1
-    // GiB at once, which a busy host often cannot commit (error 1450).
-    // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
-    };
-    if handle.is_null() {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
+    }
+    let Some(allocated) = allocate_physical_pages(flags, n, section_pages()) else {
         // SAFETY: checked non-null.
         unsafe { count.write(0) };
         return 0;
+    };
+    // Title memory is touched without our locks: a fault there may wait for
+    // a mapping call, which takes them.
+    for (index, number) in allocated.into_iter().enumerate() {
+        // SAFETY: the title passes room for `n` page numbers.
+        unsafe { pages.add(index).write(number) };
+    }
+    1
+}
+
+/// Allocates `n` physical pages split into pagefile-backed sections of at most
+/// `per` pages each (`usize::MAX` keeps the entire request in one section).
+fn allocate_physical_pages(flags: u64, n: usize, per: usize) -> Option<Vec<usize>> {
+    n.checked_mul(PAGE).filter(|&s| s > 0)?;
+    let per = per.max(1);
+    let mut sections: Vec<Arc<Section>> = Vec::with_capacity(n.div_ceil(per));
+    for start in (0..n).step_by(per) {
+        let pages = (n - start).min(per);
+        let size = pages * PAGE;
+        // A pagefile-backed section of `size` bytes, its pages committed when
+        // first mapped or written (`commit`): large requests cannot always be
+        // committed up front on a busy host (error 1450).
+        // SAFETY: plain section creation.
+        let handle = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                // Under Wine a committed section is a sparse file, free until
+                // touched, and committing a reserved one page by page costs a
+                // wineserver request each that scans every range committed so
+                // far: commit it whole there.
+                PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
+                (size as u64 >> 32) as u32,
+                size as u32,
+                std::ptr::null(),
+            )
+        };
+        if handle.is_null() {
+            let error = std::io::Error::last_os_error();
+            tracing::warn!(n, sections = sections.len(), %error, "XMemAllocatePhysicalPages failed");
+            // Any sections created so far close and unregister as `sections` drops.
+            return None;
+        }
+        // For the GPU side's in-place census: only a committed section can be
+        // opened as a host heap.
+        victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
+        sections.push(Arc::new(Section {
+            handle,
+            pages,
+            window: std::sync::OnceLock::new(),
+            committed: (0..pages.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+        }));
     }
     tracing::debug!(
         n,
+        sections = sections.len(),
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    // For the GPU side's in-place census: only a committed section can be
-    // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
-    let section = Arc::new(Section {
-        handle,
-        pages: n,
-        window: std::sync::OnceLock::new(),
-        committed: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
-    });
     let mut table = page_table_mut();
     let first = table.next_page;
     table.next_page += n * FRAMES;
+    let mut out = Vec::with_capacity(n);
     for index in 0..n {
+        let number = first + index * FRAMES;
         let slice = Slice {
-            section: section.clone(),
-            index,
+            section: sections[index / per].clone(),
+            index: index % per,
         };
-        table.pages.insert(first + index * FRAMES, slice);
+        table.pages.insert(number, slice);
+        out.push(number);
     }
-    // Title memory is touched without our locks: a fault there may wait for
-    // a mapping call, which takes them.
     drop(table);
-    for index in 0..n {
-        // SAFETY: the title passes room for `n` page numbers.
-        unsafe { pages.add(index).write(first + index * FRAMES) };
+    Some(out)
+}
+
+/// How many 64 KiB pages one physical section holds at most:
+/// `VICTORY_SECTION_MB` MiB (opt-in, default `0` = single section per
+/// allocation on both Windows and Wine; set `VICTORY_SECTION_MB=2` on Windows
+/// for 2 MiB = 32-page sections; under Wine this always falls back to a single
+/// section to match Wine's `SEC_COMMIT` sparse-section path).
+///
+/// Upstream credit: voidopcode/vilocity (`0f44a17`), building on the root-cause
+/// findings of RyanCase94, CuteBooty, and KainanP. When a multi-gigabyte
+/// allocation lives in a single Windows section mapped one 64 KiB view at a
+/// time, large-page coalescing walks tens of thousands of views under the
+/// section lock, stalling every map/unmap. Splitting into 2 MiB sections (32
+/// pages each) bounds per-section view walks while preserving contiguous
+/// multi-page mappings and section windows within each 2 MiB block.
+///
+/// Callers that operate per section (mappings via `runs`, `page_window`, and
+/// `write_physical`) split naturally at section boundaries. Leaving
+/// `VICTORY_SECTION_MB` unset (or `0`) keeps baseline single-section behavior
+/// (including single-section layouts such as `VICTORY_PORT_CONSTANTS=1`).
+fn section_pages() -> usize {
+    static PAGES: LazyLock<usize> = LazyLock::new(|| {
+        let raw = std::env::var("VICTORY_SECTION_MB").ok();
+        parse_section_mb(raw.as_deref(), on_wine())
+    });
+    *PAGES
+}
+
+fn parse_section_mb(raw: Option<&str>, wine: bool) -> usize {
+    if wine {
+        return usize::MAX;
     }
-    1
+    let mb = raw.and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(0);
+    pages_per_section(mb)
+}
+
+/// `mb` MiB in 64 KiB pages; `0` means no split (`usize::MAX`).
+fn pages_per_section(mb: usize) -> usize {
+    match mb.saturating_mul(MIB / PAGE) {
+        0 => usize::MAX,
+        pages => pages,
+    }
 }
 
 /// Page numbers count 4 KiB frames, so a 64 KiB page's is a multiple of
@@ -1766,11 +1829,26 @@ mod pool {
 }
 
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
-/// must lie in one placeholder.
+/// must lie in one placeholder (or adjacent placeholders that can be coalesced).
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     let own = physical.holes.remove(&base) == Some(len) && lean();
-    if !show(base, len, &slice, own) {
+    if len > PAGE {
+        for at in (base + PAGE..base + len).step_by(PAGE) {
+            physical.holes.remove(&at);
+        }
+    }
+    let mut coalesced = None;
+    if !show_with_coalesce(base, len, &slice, own, &mut coalesced) {
         return false;
+    }
+    if let Some((r_base, r_end)) = coalesced {
+        if (r_end - r_base) / PAGE <= physical.holes.len() {
+            for at in (r_base..r_end).step_by(PAGE) {
+                physical.holes.remove(&at);
+            }
+        } else {
+            physical.holes.retain(|&at, _| at < r_base || at >= r_end);
+        }
     }
     // Noted before the GPU side is told: bytes DirectStorage put in earlier,
     // without notice at these addresses ([`pages_written`]), are there by
@@ -1797,9 +1875,80 @@ fn split(base: usize, len: usize) {
     });
 }
 
+/// Coalesces the contiguous `MEM_RESERVE` placeholder span surrounding
+/// `[base, base + len)` into a single placeholder, then splits `[base, base + len)`
+/// out of it if the span extends past either end.
+///
+/// `VirtualQueryEx` merges adjacent `MEM_RESERVE` placeholders into a single
+/// reported region, hiding internal placeholder boundaries left behind when an
+/// unmap splits two neighboring views (such as across a 2 MiB section seam) or
+/// scatter-unmaps individual 64 KiB pages. Coalescing the whole outer reserved
+/// span `[r_base, r_end)` guarantees its endpoints align with real placeholder
+/// boundaries, after which `split(base, len)` isolates the exact target range.
+fn coalesce(base: usize, len: usize) -> Option<(usize, usize)> {
+    const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
+    if len <= PAGE {
+        return None;
+    }
+    let end = base.checked_add(len)?;
+    // SAFETY: pseudo-handle for our own process.
+    let process = unsafe { GetCurrentProcess() };
+    // SAFETY: plain zeroed query struct.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: valid out pointer of exact size.
+    if unsafe { VirtualQueryEx(process, base as *const c_void, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
+        return None;
+    }
+    if info.State != MEM_RESERVE || info.RegionSize == 0 {
+        return None;
+    }
+    // `VirtualQueryEx` reports `BaseAddress = page_align_down(query)` and
+    // `AllocationBase = start of this placeholder VAD`.
+    let r_base = (info.AllocationBase as usize).min(info.BaseAddress as usize);
+    let mut r_end = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+    while r_end < end {
+        // SAFETY: valid out pointer of exact size.
+        if unsafe { VirtualQueryEx(process, r_end as *const c_void, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
+            return None;
+        }
+        // Each split placeholder carries its own `AllocationBase == BaseAddress`;
+        // Windows itself rejects coalescing across unrelated reservations.
+        if info.State != MEM_RESERVE || info.RegionSize == 0 {
+            return None;
+        }
+        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        if next <= r_end {
+            return None;
+        }
+        r_end = next;
+    }
+    // SAFETY: `[r_base, r_end)` is a contiguous reserved placeholder span
+    // bounded by mapped views or the reservation edges.
+    let merged = counted(Call::Split, || unsafe {
+        VirtualFree(r_base as *mut c_void, r_end - r_base, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) != 0
+    });
+    if !merged {
+        return None;
+    }
+    if r_base < base || r_end > end {
+        split(base, len);
+    }
+    Some((r_base, r_end))
+}
+
 /// The system calls of [`map`]; `own`: the placeholder at `base` is `len`
 /// long already.
 fn show(base: usize, len: usize, slice: &Slice, own: bool) -> bool {
+    show_with_coalesce(base, len, slice, own, &mut None)
+}
+
+fn show_with_coalesce(
+    base: usize,
+    len: usize,
+    slice: &Slice,
+    own: bool,
+    coalesced: &mut Option<(usize, usize)>,
+) -> bool {
     let map_view = || {
         // SAFETY: maps the section over a placeholder; acts only on one.
         counted(Call::Map, || unsafe {
@@ -1819,6 +1968,12 @@ fn show(base: usize, len: usize, slice: &Slice, own: bool) -> bool {
     let mut view = if own { map_view() } else { MEMORY_MAPPED_VIEW_ADDRESS { Value: std::ptr::null_mut() } };
     if view.Value as usize != base {
         split(base, len);
+        view = map_view();
+    }
+    if view.Value as usize != base
+        && let Some(span) = coalesce(base, len)
+    {
+        *coalesced = Some(span);
         view = map_view();
     }
     if view.Value as usize != base {
@@ -2779,5 +2934,293 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn section_size_parsing_and_fallback() {
+        assert_eq!(pages_per_section(2), 32);
+        assert_eq!(pages_per_section(1), 16);
+        assert_eq!(pages_per_section(0), usize::MAX);
+        // Opt-in default: single section on both Windows and Wine when unset or 0.
+        assert_eq!(parse_section_mb(None, false), usize::MAX);
+        assert_eq!(parse_section_mb(None, true), usize::MAX);
+        assert_eq!(parse_section_mb(Some("0"), false), usize::MAX);
+        assert_eq!(parse_section_mb(Some("2"), false), 32);
+        assert_eq!(parse_section_mb(Some(" 4 "), false), 64);
+        // Wine always stays on the single-section fallback.
+        assert_eq!(parse_section_mb(Some("2"), true), usize::MAX);
+        assert_eq!(parse_section_mb(Some("not-a-number"), false), usize::MAX);
+        assert_eq!(parse_section_mb(Some(""), true), usize::MAX);
+        assert_eq!(pages_per_section(usize::MAX), usize::MAX);
+    }
+
+    /// 2 MiB section splitting, sub-section offsets, cross-section writes,
+    /// page-window fallback, and single-section fallback (`per = usize::MAX`).
+    #[test]
+    fn physical_allocations_split_into_two_mebibyte_sections_with_fallback() {
+        // 70 pages at 32 pages/section (2 MiB): sections of 32, 32, and 6.
+        let pages = allocate_physical_pages(0, 70, 32).expect("2 MiB split allocation");
+        let slices: Vec<Slice> = {
+            let table = page_table();
+            pages.iter().map(|p| table.pages[p].clone()).collect()
+        };
+        assert_eq!(slices.len(), 70);
+        assert!(slices.iter().enumerate().all(|(i, s)| {
+            s.index == i % 32 && s.section.pages == if i < 64 { 32 } else { 6 }
+        }));
+        assert!(Arc::ptr_eq(&slices[0].section, &slices[31].section));
+        assert!(!Arc::ptr_eq(&slices[31].section, &slices[32].section));
+        assert!(Arc::ptr_eq(&slices[32].section, &slices[63].section));
+        assert!(!Arc::ptr_eq(&slices[63].section, &slices[64].section));
+        assert!(Arc::ptr_eq(&slices[64].section, &slices[69].section));
+
+        // Sub-section window inside one 2 MiB section succeeds in place.
+        {
+            let mut win = page_window(&pages, 3 * PAGE + 19, 2 * PAGE + 13).expect("intra-section window");
+            for (i, b) in win.bytes().iter_mut().enumerate() {
+                *b = ((i * 13 + 5) & 0xff) as u8;
+            }
+        }
+        let check_sub: Vec<u8> = pages[3..6].iter().flat_map(|&p| page_bytes(p)).collect();
+        assert!(check_sub[..19].iter().all(|&b| b == 0));
+        for (i, &b) in check_sub[19..19 + 2 * PAGE + 13].iter().enumerate() {
+            assert_eq!(b, ((i * 13 + 5) & 0xff) as u8);
+        }
+        assert!(check_sub[19 + 2 * PAGE + 13..].iter().all(|&b| b == 0));
+
+        // Cross-section range returns None for page_window and succeeds via write_physical.
+        let cross: Vec<u8> = (0..3 * PAGE + 71).map(|i| ((i * 29 + 3) % 251) as u8).collect();
+        assert!(page_window(&pages, 30 * PAGE + 7, cross.len()).is_none());
+        assert!(write_physical(&pages, 30 * PAGE + 7, &cross));
+        let read: Vec<u8> = pages[30..35].iter().flat_map(|&p| page_bytes(p)).collect();
+        assert!(read[..7].iter().all(|&b| b == 0));
+        assert_eq!(&read[7..7 + cross.len()], &cross[..]);
+        assert!(read[7 + cross.len()..].iter().all(|&b| b == 0));
+
+        // Partial free keeps remaining pages of the same 2 MiB section alive and readable.
+        assert_eq!(XMemFreePhysicalPages(31, pages[..31].as_ptr()), 1);
+        assert_eq!(&page_bytes(pages[31])[..16], &read[PAGE..PAGE + 16]);
+        assert_eq!(XMemFreePhysicalPages(39, pages[31..].as_ptr()), 1);
+
+        // Single-section fallback (`per = usize::MAX`): all 70 pages share one section.
+        let single = allocate_physical_pages(0, 70, usize::MAX).expect("single-section fallback");
+        let single_slices: Vec<Slice> = {
+            let table = page_table();
+            single.iter().map(|p| table.pages[p].clone()).collect()
+        };
+        assert!(single_slices.iter().enumerate().all(|(i, s)| {
+            s.index == i && s.section.pages == 70 && Arc::ptr_eq(&s.section, &single_slices[0].section)
+        }));
+        assert!(page_window(&single, 30 * PAGE + 7, 3 * PAGE).is_some());
+        assert_eq!(XMemFreePhysicalPages(70, single.as_ptr()), 1);
+    }
+
+    /// Stress test covering OS map/unmap/remap, sub-section partial unmaps,
+    /// scatter remaps, alias views, commit/decommit state queries, and cleanup
+    /// across 2 MiB section boundaries.
+    #[test]
+    fn os_map_unmap_remap_stress_across_two_mebibyte_sections() {
+        const TOTAL_PAGES: usize = 96; // 3 x 2 MiB sections (6 MiB total)
+        let pages = allocate_physical_pages(0, TOTAL_PAGES, 32).expect("allocate 96 pages");
+        let reserve = |n: usize| -> *mut c_void {
+            let at = XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                n * PAGE,
+                MEM_RESERVE | PAGES_64K,
+                0,
+                PAGE_READWRITE,
+            );
+            assert!(!at.is_null(), "placeholder reservation failed");
+            at
+        };
+        let view_a = reserve(TOTAL_PAGES);
+        let view_b = reserve(TOTAL_PAGES);
+
+        // 1. Map all 96 pages across 3 x 2 MiB sections in a single call.
+        assert_eq!(XMemMapPhysicalPages(view_a, TOTAL_PAGES, pages.as_ptr()), view_a);
+        for p in [0, 31, 32, 63, 64, 95] {
+            let ptr = view_a.wrapping_byte_add(p * PAGE);
+            assert_eq!(query(ptr).host.State, MEM_COMMIT, "page {p} committed");
+            // SAFETY: page `p` is mapped and committed read-write.
+            unsafe {
+                ptr.cast::<u64>().write(0xA500_0000_0000_0000 | p as u64);
+                ptr.wrapping_byte_add(PAGE - 8).cast::<u64>().write(0x5A00_0000_0000_0000 | p as u64);
+            }
+        }
+
+        // 2. Alias across a 2 MiB boundary via map_alias and verify byte identity.
+        let alias_src = view_a.wrapping_byte_add(30 * PAGE) as u64;
+        let alias_dst = view_b.wrapping_byte_add(10 * PAGE) as u64;
+        assert!(map_alias(alias_dst, alias_src, 4 * PAGE as u64));
+        for k in 0..4usize {
+            let p = 30 + k;
+            let aliased = view_b.wrapping_byte_add((10 + k) * PAGE);
+            assert_eq!(query(aliased).host.State, MEM_COMMIT);
+            // SAFETY: aliased page is mapped read-write.
+            unsafe {
+                if p == 31 || p == 32 {
+                    assert_eq!(aliased.cast::<u64>().read(), 0xA500_0000_0000_0000 | p as u64);
+                }
+                aliased.wrapping_byte_add(128).cast::<u32>().write(0xBEEF_0000 | p as u32);
+                assert_eq!(
+                    view_a.wrapping_byte_add(p * PAGE + 128).cast::<u32>().read(),
+                    0xBEEF_0000 | p as u32
+                );
+            }
+        }
+
+        // 3. Partial unmap straddling a 2 MiB section boundary (pages 31..33),
+        //    leaving pages 30 and 33 mapped, then remap swapped pages in place.
+        let split_at = view_a.wrapping_byte_add(31 * PAGE);
+        assert_eq!(XMemMapPhysicalPages(split_at, 2, std::ptr::null()), split_at);
+        assert_eq!(query(view_a.wrapping_byte_add(30 * PAGE)).host.State, MEM_COMMIT);
+        assert_eq!(query(view_a.wrapping_byte_add(31 * PAGE)).host.State, MEM_RESERVE);
+        assert_eq!(query(view_a.wrapping_byte_add(32 * PAGE)).host.State, MEM_RESERVE);
+        assert_eq!(query(view_a.wrapping_byte_add(33 * PAGE)).host.State, MEM_COMMIT);
+        // Alias in view_b stays valid while view_a unmapped pages 31..33.
+        // SAFETY: view_b still maps pages 31 and 32.
+        unsafe {
+            assert_eq!(view_b.wrapping_byte_add(11 * PAGE).cast::<u64>().read(), 0xA500_0000_0000_0000 | 31);
+            assert_eq!(view_b.wrapping_byte_add(12 * PAGE).cast::<u64>().read(), 0xA500_0000_0000_0000 | 32);
+        }
+        // Remap pages 64 and 65 into slots 31..33 (crossing a 2 MiB section seam
+        // made of two adjacent 1-page placeholders -> exercises placeholder coalescing).
+        let swapped = [pages[64], pages[65]];
+        assert_eq!(XMemMapPhysicalPages(split_at, 2, swapped.as_ptr()), split_at);
+        assert_eq!(query(split_at).host.State, MEM_COMMIT);
+        // SAFETY: slot 31 now shows page 64.
+        assert_eq!(unsafe { split_at.cast::<u64>().read() }, 0xA500_0000_0000_0000 | 64);
+
+        // Also test coalescing when boundary placeholders extend past both ends:
+        // unmap [62..66) across the second 2 MiB seam -> leaves [62..64) + [64..66),
+        // then remap just [63..65) in one contiguous 2-page run.
+        let wide_unmap = view_a.wrapping_byte_add(62 * PAGE);
+        assert_eq!(XMemMapPhysicalPages(wide_unmap, 4, std::ptr::null()), wide_unmap);
+        let mid_seam = view_a.wrapping_byte_add(63 * PAGE);
+        assert_eq!(XMemMapPhysicalPages(mid_seam, 2, pages[0..2].as_ptr()), mid_seam);
+        assert_eq!(query(view_a.wrapping_byte_add(62 * PAGE)).host.State, MEM_RESERVE);
+        assert_eq!(query(mid_seam).host.State, MEM_COMMIT);
+        assert_eq!(query(view_a.wrapping_byte_add(65 * PAGE)).host.State, MEM_RESERVE);
+        // SAFETY: slot 63 now shows page 0.
+        assert_eq!(unsafe { mid_seam.cast::<u64>().read() }, 0xA500_0000_0000_0000);
+
+        // 4. Repeated scatter map/unmap/remap cycles across sections with pseudo-random permutation.
+        let mut addrs: Vec<*mut c_void> = (0..64).map(|i| view_b.wrapping_byte_add(i * PAGE)).collect();
+        let mut perm: Vec<usize> = Vec::with_capacity(64);
+        for round in 0..8usize {
+            perm.clear();
+            for i in 0..64usize {
+                let idx = (i * 17 + round * 13) % TOTAL_PAGES;
+                perm.push(pages[idx]);
+            }
+            assert_eq!(XMemMapPhysicalPagesScatter(addrs.as_ptr(), addrs.len(), perm.as_ptr()), 1);
+            for (slot, &page_no) in perm.iter().enumerate() {
+                let tag = ((round as u32) << 16) | (slot as u32);
+                // SAFETY: scatter mapped `addrs[slot]` read-write.
+                unsafe { addrs[slot].wrapping_byte_add(256).cast::<u32>().write(tag) };
+                if slot % 16 == 0 {
+                    let raw = page_bytes(page_no);
+                    assert_eq!(u32::from_le_bytes(raw[256..260].try_into().unwrap()), tag);
+                }
+            }
+            // Unmap half via 0-page entries, then unmap the rest via null pages pointer.
+            let half_clear: Vec<usize> = (0..64).map(|i| if i % 2 == 0 { 0 } else { perm[i] }).collect();
+            assert_eq!(XMemMapPhysicalPagesScatter(addrs.as_ptr(), addrs.len(), half_clear.as_ptr()), 1);
+            assert_eq!(query(addrs[0]).host.State, MEM_RESERVE);
+            assert_eq!(query(addrs[1]).host.State, MEM_COMMIT);
+            assert_eq!(XMemMapPhysicalPagesScatter(addrs.as_ptr(), addrs.len(), std::ptr::null()), 1);
+            assert_eq!(query(addrs[1]).host.State, MEM_RESERVE);
+            addrs.rotate_left(7);
+        }
+
+        // 5. Full cleanup: unmap views, verify MEM_RESERVE, free physical pages, release placeholders.
+        assert_eq!(XMemMapPhysicalPages(view_a, TOTAL_PAGES, std::ptr::null()), view_a);
+        assert_eq!(XMemMapPhysicalPages(view_b, TOTAL_PAGES, std::ptr::null()), view_b);
+        assert_eq!(query(view_a).host.State, MEM_RESERVE);
+        assert_eq!(query(view_b).host.State, MEM_RESERVE);
+        assert_eq!(XMemFreePhysicalPages(TOTAL_PAGES, pages.as_ptr()), 1);
+        assert!(!pages_known(&pages, 0, PAGE));
+        // SAFETY: coalesce any split placeholders before releasing the whole
+        // test-owned reservations.
+        unsafe {
+            const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
+            let _ = VirtualFree(view_a, TOTAL_PAGES * PAGE, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
+            let _ = VirtualFree(view_b, TOTAL_PAGES * PAGE, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
+            assert_ne!(VirtualFree(view_a, 0, MEM_RELEASE), 0);
+            assert_ne!(VirtualFree(view_b, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    /// Timed OS microbenchmark proving 2 MiB section pooling speedup over 64 KiB
+    /// sections across allocation/free and multi-page contiguous map/unmap cycles.
+    /// `cargo test --release -p victory-hle --lib xmem_section_2m_vs_64k_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore = "a benchmark"]
+    fn xmem_section_2m_vs_64k_bench() {
+        use std::time::Instant;
+        const PAGES: usize = 2048; // 128 MiB
+        const RUN_PAGES: usize = 32; // 2 MiB per contiguous map/unmap
+        const ROUNDS: usize = 64;
+
+        let measure = |per: usize| -> (f64, f64, usize) {
+            let t_alloc = Instant::now();
+            let pages = allocate_physical_pages(0, PAGES, per).expect("allocate");
+            let alloc_us = t_alloc.elapsed().as_secs_f64() * 1e6;
+
+            let view = XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                PAGES * PAGE,
+                MEM_RESERVE | PAGES_64K,
+                0,
+                PAGE_READWRITE,
+            );
+            assert!(!view.is_null());
+
+            // Warm commit once across all pages, then time contiguous map+touch+unmap cycles.
+            assert_eq!(XMemMapPhysicalPages(view, PAGES, pages.as_ptr()), view);
+            assert_eq!(XMemMapPhysicalPages(view, PAGES, std::ptr::null()), view);
+
+            let t_map = Instant::now();
+            let mut ops = 0usize;
+            for round in 0..ROUNDS {
+                let start = (round * RUN_PAGES) % PAGES;
+                let base = view.wrapping_byte_add(start * PAGE);
+                assert_eq!(XMemMapPhysicalPages(base, RUN_PAGES, pages[start..].as_ptr()), base);
+                // SAFETY: mapped read-write.
+                unsafe { base.cast::<u32>().write(round as u32) };
+                assert_eq!(XMemMapPhysicalPages(base, RUN_PAGES, std::ptr::null()), base);
+                ops += 1;
+            }
+            let map_us = t_map.elapsed().as_secs_f64() * 1e6;
+
+            let t_free = Instant::now();
+            assert_eq!(XMemFreePhysicalPages(PAGES, pages.as_ptr()), 1);
+            let free_us = t_free.elapsed().as_secs_f64() * 1e6;
+            // SAFETY: test-owned reservation.
+            unsafe { assert_ne!(VirtualFree(view, 0, MEM_RELEASE), 0) };
+            (alloc_us + free_us, map_us, ops)
+        };
+
+        let (alloc_64k, map_64k, ops) = measure(1);
+        let (alloc_2m, map_2m, _) = measure(32);
+        println!(
+            "xmem 64 KiB sections (2048 sections): alloc+free {:.1} ms, {ops} x 2 MiB map+unmap {:.2} ms ({:.1} us/op)",
+            alloc_64k / 1e3,
+            map_64k / 1e3,
+            map_64k / ops as f64,
+        );
+        println!(
+            "xmem 2 MiB sections  (  64 sections): alloc+free {:.1} ms, {ops} x 2 MiB map+unmap {:.2} ms ({:.1} us/op)",
+            alloc_2m / 1e3,
+            map_2m / 1e3,
+            map_2m / ops as f64,
+        );
+        println!(
+            "speedup (2 MiB vs 64 KiB): alloc+free {:.2}x, map+unmap {:.2}x",
+            alloc_64k / alloc_2m.max(1.0),
+            map_64k / map_2m.max(1.0),
+        );
+        assert!(alloc_2m < alloc_64k, "expected 2 MiB alloc+free faster than 64 KiB");
+        assert!(map_2m < map_64k, "expected 2 MiB map+unmap faster than 64 KiB");
     }
 }

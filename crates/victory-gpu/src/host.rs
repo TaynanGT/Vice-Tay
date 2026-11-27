@@ -621,7 +621,157 @@ fn bury(finished: u64) {
             }
             retired.drain(..n).collect()
         };
-        drop(done);
+        reap(done, reaper_on());
+    }
+}
+
+/// Whether what [`bury`] drops is dropped by a thread of its own
+/// (`VICTORY_REAPER=1`, off by default; `VICTORY_AB=<s>,VICTORY_REAPER` does
+/// each in turn in one run). After fxceless/victory-fork's switch of the
+/// same name.
+///
+/// Why: dropping a host texture or buffer is a call into Direct3D and the
+/// driver (the allocation destroyed, its card address freed), and it ran on
+/// the thread that had just landed a flight. While a world streams in, the
+/// title lets go of thousands of objects a second: in a profile of the first
+/// minutes of the world on an RTX 5070 Ti the landing thread was 79 % of its
+/// time in these drops (102 ms of landing a frame, against 25 ms later in
+/// the same run), the flights behind it were not landed, and the submitting
+/// thread waited 54 ms a frame for them: 8-9 frames a second where the same
+/// run then ran 17-20.
+///
+/// With the switch the objects go to a list and a thread of ours drops
+/// them. Nothing else changes: an object is handed over at the moment it was
+/// dropped before, never earlier. The card's memory comes back some
+/// milliseconds later than before.
+fn reaper_on() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_REAPER") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_REAPER").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// What waits for [`reaper`], and whether its thread was started (once: if
+/// it cannot be, the drops stay where they were).
+static REAP: (Mutex<Vec<Vec<(u64, Retired)>>>, std::sync::Condvar) = (Mutex::new(Vec::new()), std::sync::Condvar::new());
+static REAPER: OnceLock<bool> = OnceLock::new();
+
+/// Limit objects waiting for the worker, including the batch it is dropping.
+const REAP_LIMIT: u64 = 16_384;
+
+/// Objects [`reaper`] dropped since the start, the microseconds that took,
+/// and the objects handed to it and not dropped yet.
+static REAPED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Drops `objects`: here, or with `aside` ([`reaper_on`]) on the thread of
+/// that name.
+fn reap(objects: Vec<(u64, Retired)>, aside: bool) {
+    if objects.is_empty() {
+        return;
+    }
+    let started =
+        aside && *REAPER.get_or_init(|| std::thread::Builder::new().name("victory-reaper".into()).spawn(reaper).is_ok());
+    let count = objects.len() as u64;
+    // Keep the original synchronous release when the worker has no room.
+    if !started
+        || REAPED[2]
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
+                pending.checked_add(count).filter(|&next| next <= REAP_LIMIT)
+            })
+            .is_err()
+    {
+        drop(objects);
+        return;
+    }
+    REAP.0.lock().unwrap_or_else(|e| e.into_inner()).push(objects);
+    REAP.1.notify_one();
+}
+
+/// The thread of [`reaper_on`]: drops what [`reap`] hands it, with no lock
+/// of ours held, and says every 16,384 objects how long the drops took and
+/// how many wait.
+fn reaper() {
+    loop {
+        let batches = {
+            let mut waiting = REAP.0.lock().unwrap_or_else(|e| e.into_inner());
+            while waiting.is_empty() {
+                waiting = REAP.1.wait(waiting).unwrap_or_else(|e| e.into_inner());
+            }
+            std::mem::take(&mut *waiting)
+        };
+        let began = std::time::Instant::now();
+        let count = batches.iter().map(Vec::len).sum::<usize>() as u64;
+        drop(batches);
+        let us = began.elapsed().as_micros() as u64;
+        let before = REAPED[0].fetch_add(count, Ordering::Relaxed);
+        let spent = REAPED[1].fetch_add(us, Ordering::Relaxed) + us;
+        let waiting = REAPED[2].fetch_sub(count, Ordering::Relaxed) - count;
+        if (before + count) >> 14 != before >> 14 {
+            tracing::info!(
+                "host objects dropped by a thread of their own (VICTORY_REAPER=1): {} so far in {:.1} ms of that thread ({:.0} us each); the last batch {count} in {:.1} ms; {waiting} wait",
+                before + count,
+                spent as f64 / 1e3,
+                spent as f64 / (before + count) as f64,
+                us as f64 / 1e3
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod reaper_tests {
+    use super::{REAP_LIMIT, Retired, reap};
+    use std::sync::mpsc;
+
+    /// Says on which thread it was dropped.
+    struct Told(mpsc::Sender<Option<String>>);
+    impl Drop for Told {
+        fn drop(&mut self) {
+            let _ = self.0.send(std::thread::current().name().map(str::to_string));
+        }
+    }
+
+    fn objects(n: usize, tell: &mpsc::Sender<Option<String>>) -> Vec<(u64, Retired)> {
+        (0..n).map(|i| (i as u64, Retired::Any(Box::new(Told(tell.clone()))))).collect()
+    }
+
+    /// Without the switch the objects are dropped before `reap` returns, by
+    /// the thread that called it.
+    #[test]
+    fn objects_are_dropped_here_without_the_switch() {
+        let (tell, told) = mpsc::channel();
+        let here = std::thread::current().name().map(str::to_string);
+        reap(objects(5, &tell), false);
+        let dropped: Vec<Option<String>> = told.try_iter().collect();
+        assert_eq!(dropped, vec![here; 5]);
+    }
+
+    #[test]
+    fn batches_larger_than_the_backlog_limit_release_on_the_caller() {
+        let (tell, told) = mpsc::channel();
+        let here = std::thread::current().name().map(str::to_string);
+        let count = REAP_LIMIT as usize + 1;
+        reap(objects(count, &tell), true);
+        let dropped: Vec<_> = told.try_iter().collect();
+        assert_eq!(dropped.len(), count);
+        assert!(dropped.iter().all(|name| name == &here));
+    }
+
+    /// With it every object is dropped, once, by the thread of that name,
+    /// batch after batch.
+    #[test]
+    fn objects_are_dropped_by_the_reaper_with_the_switch() {
+        let (tell, told) = mpsc::channel();
+        for _ in 0..3 {
+            reap(objects(7, &tell), true);
+        }
+        reap(Vec::new(), true);
+        let wait = std::time::Duration::from_secs(10);
+        let dropped: Vec<Option<String>> = (0..21).map(|_| told.recv_timeout(wait).expect("dropped")).collect();
+        assert!(dropped.iter().all(|by| by.as_deref() == Some("victory-reaper")), "{dropped:?}");
+        assert!(told.recv_timeout(std::time::Duration::from_millis(100)).is_err(), "dropped once");
     }
 }
 

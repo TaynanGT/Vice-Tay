@@ -56,11 +56,14 @@ if ($Machine -eq 'auto') {
     if ($autoNvidia) {
         # The card's memory as its driver records it (Win32_VideoController's AdapterRAM stops at
         # 4 GB). Under 20 GiB those defaults leave title buffers under 4 MiB in the PC's memory.
+        # From 10 GB up the explicit presets were measured (10, 12 and 16 GB cards); smaller
+        # cards have the laptop preset's own trade-offs and get no suggestion here.
         $cardBytes = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}\0*' -ErrorAction SilentlyContinue |
             Where-Object { $_.MatchingDeviceId -match 'ven_10de' } |
             ForEach-Object { $_.'HardwareInformation.qwMemorySize' -as [uint64] } |
             Sort-Object -Descending | Select-Object -First 1
-        if ($cardBytes -and $cardBytes -lt 20GB) { $smallerNvidiaGb = [int][math]::Round($cardBytes / 1GB) }
+        $cardGb = [int][math]::Round($cardBytes / 1GB)
+        if ($cardGb -ge 10 -and $cardGb -lt 20) { $smallerNvidiaGb = $cardGb }
     }
 }
 if ($Machine -eq '7900xtx') {

@@ -522,6 +522,7 @@ fn twin_texture(
         return None;
     };
     let _ = crate::host::resident(&host.device, &texture);
+    let _ = crate::residency_wddm::set_committed_texture_priority(&host.device, &texture, true);
     crate::host::name(&texture, || {
         format!("depth twin {}x{} f{}", d.width, d.height, d.format)
     });
@@ -583,6 +584,7 @@ fn twin_texture(
         }
         texture.map(|texture| {
             let _ = crate::host::resident(&host.device, &texture);
+            let _ = crate::residency_wddm::set_committed_texture_priority(&host.device, &texture, true);
             crate::host::name(&texture, || {
                 format!("depth plane twin {}x{} f{}", d.width, d.height, d.format)
             });
@@ -1849,7 +1851,6 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
 /// loads and gets it back as the targets are made.
 #[cfg(windows)]
 pub(crate) fn targets_room_kept() -> u64 {
-    use std::sync::atomic::Ordering::Relaxed;
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let most = *MOST.get_or_init(|| {
         std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
@@ -1858,8 +1859,16 @@ pub(crate) fn targets_room_kept() -> u64 {
             .map_or(3072 << 20, |mb| mb.min(8192) << 20)
     });
     // Every host texture's bytes less those of the copies the title fills.
-    let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
+    let targets = targets_working_bytes();
     most.saturating_sub(targets)
+}
+
+/// Live committed bytes held by render targets, depth-stencil surfaces, and
+/// host-written textures (used by WDDM video memory reservation sizing).
+#[cfg(windows)]
+pub(crate) fn targets_working_bytes() -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed))
 }
 
 /// [`room`] as it was at most a tenth of a second ago, for a question
@@ -2684,11 +2693,16 @@ fn host_texture_as(
         return Err(e);
     }
     let texture = texture.ok_or_else(unavailable)?;
-    if !reserved
-        && let Err(e) = crate::host::resident(&host.device, &texture).and_then(|()| crate::host::mapped(&host.device))
-    {
-        tracing::warn!(error = %e, desc = ?d, "a host texture is not resident");
-        return Err(e);
+    if !reserved {
+        if let Err(e) = crate::host::resident(&host.device, &texture).and_then(|()| crate::host::mapped(&host.device)) {
+            tracing::warn!(error = %e, desc = ?d, "a host texture is not resident");
+            return Err(e);
+        }
+        let _ = crate::residency_wddm::set_committed_texture_priority(
+            &host.device,
+            &texture,
+            d.flags & (TARGET | DEPTH) != 0,
+        );
     }
     crate::host::name(&texture, || {
         format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)

@@ -40,26 +40,104 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 
 /// Sets how many empty blocks stay, by the card's memory (budget and use):
 /// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
-/// Asked once a second.
+/// Also demotes idle texture spare blocks and performs fence-safe WDDM
+/// `Evict()` on aged idle heaps outside the pool lock. Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
     let pressure = crate::residency::pressured();
     let limit = spares(memory, crate::host::keep_freed() && !pressure);
     SPARES.store(limit, Ordering::Relaxed);
     let tick = now();
+    if !crate::residency_wddm::enabled() {
+        // Strict default-0 baseline: untouched reclaim behavior and zero WDDM bookkeeping.
+        if let Ok(mut pool) = TEXTURES.try_lock() {
+            pool.reclaim(tick, limit, true);
+        }
+        if let Ok(mut pool) = STAGING.try_lock() {
+            let staging_limit = if crate::residency::critical_commit() {
+                0
+            } else if pressure {
+                1
+            } else {
+                limit
+            };
+            pool.reclaim(tick, staging_limit, true);
+        }
+        return;
+    }
+
+    let critical = crate::residency::critical_commit();
+    let (started, finished) = crate::host::submissions();
+    let idle_fence = started.saturating_add(crate::queue::queued());
+    let host = crate::host::made_host();
+
+    let mut priority_updates: Vec<(ID3D12Heap, crate::residency_wddm::ResidencyTier)> = Vec::new();
+    let mut evict_candidates: Vec<(usize, ID3D12Heap)> = Vec::new();
+    let mut dropped_evicted = 0usize;
     // A full pool can become idle while another subsystem needs the VRAM.
     // A busy allocator observes the new limit on its next allocation or tick.
     if let Ok(mut pool) = TEXTURES.try_lock() {
-        pool.reclaim(tick, limit, true);
+        dropped_evicted = pool.reclaim_with_fence(tick, limit, true, idle_fence);
+        if host.is_some() {
+            let vram_used_pct = memory.and_then(|[budget, used, ..]| {
+                (budget > 0).then(|| ((u128::from(used) * 100) / u128::from(budget)) as u64)
+            });
+            let normal_hot_spares = ahead().min(limit).max(SPARE);
+            pool.plan_idle_residency(
+                IdleResidencyCtx {
+                    now: tick,
+                    completed_submission: finished,
+                    vram_used_pct,
+                    pressured: pressure,
+                    critical,
+                    normal_hot_spares,
+                },
+                &mut priority_updates,
+                &mut evict_candidates,
+            );
+        }
     }
+    for _ in 0..dropped_evicted {
+        crate::residency_wddm::note_evicted_block_dropped();
+    }
+
+    if let Some(host) = host {
+        for (heap, tier) in priority_updates {
+            let _ = crate::residency_wddm::set_heap_priority(&host.device, &heap, tier);
+        }
+        if !evict_candidates.is_empty() {
+            let mut outcomes = Vec::with_capacity(evict_candidates.len());
+            for (idx, heap) in evict_candidates {
+                let evicted = crate::residency_wddm::evict_heap(&host.device, &heap).is_ok();
+                outcomes.push((idx, evicted));
+            }
+            let mut pool = lock(&TEXTURES);
+            for (idx, evicted) in outcomes {
+                if let Some(Some(block)) = pool.blocks.get_mut(idx)
+                    && block.residency == BlockResidency::Evicting
+                {
+                    if evicted {
+                        block.residency = BlockResidency::Evicted;
+                        block.priority = crate::residency_wddm::ResidencyTier::Minimum;
+                    } else {
+                        block.residency = BlockResidency::Resident;
+                        // `evict_heap` lowers priority to `Minimum` before attempting `Evict`;
+                        // mirror that floor here so the next allocation always re-promotes to `Normal`.
+                        block.priority = crate::residency_wddm::ResidencyTier::Minimum;
+                    }
+                }
+            }
+        }
+    }
+
     if let Ok(mut pool) = STAGING.try_lock() {
-        let staging_limit = if crate::residency::critical_commit() {
+        let staging_limit = if critical {
             0
         } else if pressure {
             1
         } else {
             limit
         };
-        pool.reclaim(tick, staging_limit, true);
+        pool.reclaim_with_fence(tick, staging_limit, true, idle_fence);
     }
 }
 
@@ -181,6 +259,57 @@ pub(crate) struct Piece {
     len: u64,
 }
 
+/// WDDM residency lifecycle state of a pooled block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockResidency {
+    /// Currently resident (D3D12 residency refcount 1) and eligible for allocation.
+    Resident,
+    /// Reserved by the sweep thread for lock-free `Evict()`; excluded from allocation/reclaim.
+    Evicting,
+    /// Explicitly evicted via `ID3D12Device::Evict` (refcount 0); must `MakeResident` before use.
+    Evicted,
+    /// Reserved by an allocator thread for lock-free `MakeResident()`; excluded from others.
+    Restoring,
+}
+
+#[derive(Clone, Copy)]
+struct TakeReq {
+    len: u64,
+    align: u64,
+    now: u64,
+    ripe: Ripe,
+    idle_fence: u64,
+    allow_restore: bool,
+}
+
+#[derive(Clone, Copy)]
+struct IdleResidencyCtx {
+    now: u64,
+    completed_submission: u64,
+    vram_used_pct: Option<u64>,
+    pressured: bool,
+    critical: bool,
+    normal_hot_spares: usize,
+}
+
+enum TakeOutcome<B> {
+    Taken {
+        piece: Piece,
+        memory: B,
+        again: bool,
+        promote_normal: bool,
+        dropped_evicted: usize,
+    },
+    Restore {
+        block: usize,
+        memory: B,
+        dropped_evicted: usize,
+    },
+    None {
+        dropped_evicted: usize,
+    },
+}
+
 struct Block<B> {
     memory: B,
     free: Ranges,
@@ -192,6 +321,14 @@ struct Block<B> {
     /// When that was (ms).
     #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     since: u64,
+    /// Explicit WDDM residency state for fence-safe `Evict()` / `MakeResident()`.
+    residency: BlockResidency,
+    /// Last applied WDDM residency priority tier.
+    priority: crate::residency_wddm::ResidencyTier,
+    /// Millisecond timestamp when this block last became completely empty (`whole(BLOCK)`).
+    idle_since_ms: Option<u64>,
+    /// Submission fence number that must complete before `Evict()` is legal.
+    idle_fence: u64,
 }
 
 struct Pool<B> {
@@ -217,7 +354,7 @@ impl<B: Clone> Pool<B> {
     }
 
     /// The same from a block that is ripe, if one has room; `make` makes one
-    /// ahead too, when few are empty.
+    /// ahead too, when few are empty. Baseline default path (no WDDM residency).
     fn take_ripe(
         &mut self,
         len: u64,
@@ -231,7 +368,7 @@ impl<B: Clone> Pool<B> {
         if len == 0 || len > if ripe.ahead > 0 { BLOCK } else { BLOCK / 2 } {
             return None;
         }
-        self.rested(now);
+        self.reclaim(now, SPARES.load(Ordering::Relaxed), false);
         let mut found = None;
         for (i, block) in self.blocks.iter_mut().enumerate() {
             if let Some(block) = block
@@ -255,7 +392,7 @@ impl<B: Clone> Pool<B> {
             Some(found) => found,
             None => {
                 let memory = self.grow(now, &mut make)?;
-                let i = self.add(memory, ripe.started);
+                let i = self.add_at(memory, ripe.started, ripe.started, now);
                 (i, self.blocks[i].as_mut()?.free.take(len, align)?)
             }
         };
@@ -270,13 +407,179 @@ impl<B: Clone> Pool<B> {
             if empty < ripe.ahead
                 && let Some(memory) = self.grow(now, &mut make)
             {
-                self.add(memory, ripe.started);
+                self.add_at(memory, ripe.started, ripe.started, now);
             }
         }
         let block = self.blocks[i].as_mut()?;
         let again = start < block.used_to;
         block.used_to = block.used_to.max(start + len);
         Some((Piece { block: i, start, len }, block.memory.clone(), again))
+    }
+
+    /// Like [`take_ripe`], skipping non-resident blocks and optionally yielding an
+    /// `Evicted` block reserved in [`BlockResidency::Restoring`] so the caller can
+    /// invoke `MakeResident` outside the pool lock before growing a brand-new heap.
+    fn take_ripe_or_restore(
+        &mut self,
+        req: TakeReq,
+        mut make: impl FnMut() -> Option<B>,
+    ) -> TakeOutcome<B> {
+        let TakeReq { len, align, now, ripe, idle_fence, allow_restore } = req;
+        // With blocks made ahead, what would be an allocation of its own (and
+        // new when the card first reads it) lies in one of those too.
+        if len == 0 || len > if ripe.ahead > 0 { BLOCK } else { BLOCK / 2 } {
+            return TakeOutcome::None { dropped_evicted: 0 };
+        }
+        let dropped_evicted = self.reclaim_with_fence(now, SPARES.load(Ordering::Relaxed), false, idle_fence);
+        let mut found = None;
+        for (i, block) in self.blocks.iter_mut().enumerate() {
+            if let Some(block) = block
+                && block.residency == BlockResidency::Resident
+                && ripe.is(block)
+                && let Some(start) = block.free.take(len, align)
+            {
+                found = Some((i, start));
+                break;
+            }
+        }
+        if found.is_none() && ripe.ahead > 0 {
+            // The resident block that has been there the longest.
+            let mut unripe: Vec<(u64, usize)> = self
+                .blocks
+                .iter()
+                .enumerate()
+                .filter_map(|(i, b)| {
+                    let b = b.as_ref()?;
+                    (b.residency == BlockResidency::Resident).then_some((b.made, i))
+                })
+                .collect();
+            unripe.sort_unstable();
+            found = unripe.into_iter().find_map(|(_, i)| {
+                let b = self.blocks[i].as_mut()?;
+                (b.residency == BlockResidency::Resident)
+                    .then(|| b.free.take(len, align).map(|start| (i, start)))
+                    .flatten()
+            });
+        }
+        if found.is_none()
+            && allow_restore
+            && let Some((idx, block)) = self.blocks.iter_mut().enumerate().find(|(_, b)| {
+                b.as_ref().is_some_and(|b| b.residency == BlockResidency::Evicted && b.free.whole(BLOCK))
+            })
+        {
+            let block = block.as_mut().unwrap();
+            block.residency = BlockResidency::Restoring;
+            return TakeOutcome::Restore {
+                block: idx,
+                memory: block.memory.clone(),
+                dropped_evicted,
+            };
+        }
+        // A failed 64 MiB block must not trigger another driver call for each
+        // small texture. Existing free ranges remain usable during backoff.
+        let (i, start) = match found {
+            Some(found) => found,
+            None => {
+                let Some(memory) = self.grow(now, &mut make) else {
+                    return TakeOutcome::None { dropped_evicted };
+                };
+                let i = self.add_at(memory, ripe.started, idle_fence, now);
+                let Some(start) = self.blocks[i].as_mut().and_then(|b| b.free.take(len, align)) else {
+                    return TakeOutcome::None { dropped_evicted };
+                };
+                (i, start)
+            }
+        };
+        if ripe.ahead > 0 {
+            if self.blocks[i].as_ref().is_some_and(|b| !ripe.is(b)) {
+                let n = UNRIPE.fetch_add(1, Ordering::Relaxed) + 1;
+                if n.is_power_of_two() {
+                    tracing::info!("textures cut from blocks made while lists ran that still run: {n}");
+                }
+            }
+            // Count both resident and evicted empty blocks so evicting aged idle
+            // spares does not trigger unbounded replacement `CreateHeap` churn;
+            // evicted spares are restored via `MakeResident` on demand instead.
+            let empty = self
+                .blocks
+                .iter()
+                .flatten()
+                .filter(|b| {
+                    matches!(b.residency, BlockResidency::Resident | BlockResidency::Evicted)
+                        && b.free.whole(BLOCK)
+                })
+                .count();
+            if empty < ripe.ahead
+                && let Some(memory) = self.grow(now, &mut make)
+            {
+                self.add_at(memory, ripe.started, idle_fence, now);
+            }
+        }
+        let Some(block) = self.blocks[i].as_mut() else {
+            return TakeOutcome::None { dropped_evicted };
+        };
+        block.idle_since_ms = None;
+        let promote_normal = block.priority < crate::residency_wddm::ResidencyTier::Normal;
+        block.priority = crate::residency_wddm::ResidencyTier::Normal;
+        let again = start < block.used_to;
+        block.used_to = block.used_to.max(start + len);
+        TakeOutcome::Taken {
+            piece: Piece { block: i, start, len },
+            memory: block.memory.clone(),
+            again,
+            promote_normal,
+            dropped_evicted,
+        }
+    }
+
+    /// Complete a lock-free `MakeResident` on block `idx` and immediately carve
+    /// `(len, align)` from it while holding the pool lock.
+    fn finish_restore_and_take(
+        &mut self,
+        idx: usize,
+        req: TakeReq,
+        mut make: impl FnMut() -> Option<B>,
+    ) -> Option<(Piece, B, bool)> {
+        let TakeReq { len, align, now, ripe, idle_fence, .. } = req;
+        let block = self.blocks.get_mut(idx)?.as_mut()?;
+        if block.residency != BlockResidency::Restoring {
+            return None;
+        }
+        block.residency = BlockResidency::Resident;
+        block.priority = crate::residency_wddm::ResidencyTier::Normal;
+        block.made = ripe.started;
+        block.idle_since_ms = Some(now);
+        block.idle_fence = idle_fence.max(ripe.started);
+        let start = block.free.take(len, align)?;
+        block.idle_since_ms = None;
+        let again = start < block.used_to;
+        block.used_to = block.used_to.max(start + len);
+        let memory = block.memory.clone();
+        if ripe.ahead > 0 {
+            let empty = self
+                .blocks
+                .iter()
+                .flatten()
+                .filter(|b| {
+                    matches!(b.residency, BlockResidency::Resident | BlockResidency::Evicted)
+                        && b.free.whole(BLOCK)
+                })
+                .count();
+            if empty < ripe.ahead
+                && let Some(extra) = self.grow(now, &mut make)
+            {
+                self.add_at(extra, ripe.started, idle_fence, now);
+            }
+        }
+        Some((Piece { block: idx, start, len }, memory, again))
+    }
+
+    fn cancel_restore(&mut self, idx: usize) {
+        if let Some(Some(block)) = self.blocks.get_mut(idx)
+            && block.residency == BlockResidency::Restoring
+        {
+            block.residency = BlockResidency::Evicted;
+        }
     }
 
     fn grow(&mut self, now: u64, make: &mut impl FnMut() -> Option<B>) -> Option<B> {
@@ -290,7 +593,12 @@ impl<B: Clone> Pool<B> {
         block
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn add(&mut self, memory: B, made: u64) -> usize {
+        self.add_at(memory, made, made, 0)
+    }
+
+    fn add_at(&mut self, memory: B, made: u64, idle_fence: u64, now: u64) -> usize {
         let i = match self.blocks.iter().position(Option::is_none) {
             Some(i) => i,
             None => {
@@ -298,7 +606,17 @@ impl<B: Clone> Pool<B> {
                 self.blocks.len() - 1
             }
         };
-        self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made, since: crate::host::now_ms() });
+        self.blocks[i] = Some(Block {
+            memory,
+            free: Ranges::new(BLOCK),
+            used_to: 0,
+            made,
+            since: crate::host::now_ms(),
+            residency: BlockResidency::Resident,
+            priority: crate::residency_wddm::ResidencyTier::Normal,
+            idle_since_ms: Some(now),
+            idle_fence: idle_fence.max(made),
+        });
         i
     }
 
@@ -308,10 +626,13 @@ impl<B: Clone> Pool<B> {
 
     /// Makes the pieces that rested long enough free, and lets go of empty
     /// blocks past [`SPARE`].
+    #[cfg_attr(not(test), allow(dead_code))]
     fn rested(&mut self, now: u64) {
         self.reclaim(now, SPARES.load(Ordering::Relaxed), false);
     }
 
+    /// Baseline reclaim: makes rested pieces free and drops excess empty blocks
+    /// past `limit` in ascending block order with no residency/fence bookkeeping.
     fn reclaim(&mut self, now: u64, limit: usize, sweep: bool) {
         let mut any = false;
         while let Some(&(ready, piece)) = self.resting.front()
@@ -339,8 +660,152 @@ impl<B: Clone> Pool<B> {
         }
     }
 
+    /// Reclaim rested pieces and trim excess empty blocks past `limit`.
+    /// Never drops blocks mid-transition (`Evicting`/`Restoring`), and prefers
+    /// dropping already-`Evicted` empty blocks before hot `Resident` spares.
+    /// Returns the number of `Evicted` blocks dropped.
+    fn reclaim_with_fence(&mut self, now: u64, limit: usize, sweep: bool, idle_fence: u64) -> usize {
+        let mut any = false;
+        while let Some(&(ready, piece)) = self.resting.front()
+            && ready <= now
+        {
+            self.resting.pop_front();
+            if let Some(block) = self.blocks[piece.block].as_mut() {
+                block.free.give(piece.start, piece.len);
+                if block.free.whole(BLOCK) {
+                    if block.idle_since_ms.is_none() {
+                        block.idle_since_ms = Some(now);
+                        block.idle_fence = idle_fence.max(block.made);
+                    }
+                    any = true;
+                }
+            }
+        }
+        // (Without a piece given back too, once there is less room.)
+        let most = limit.min(self.most);
+        let previous = std::mem::replace(&mut self.spare, most);
+        let mut dropped_evicted = 0usize;
+        if sweep || any || most < previous {
+            let mut evicted_empty = Vec::new();
+            let mut resident_empty = Vec::new();
+            for (i, block) in self.blocks.iter().enumerate() {
+                if let Some(b) = block
+                    && b.free.whole(BLOCK)
+                {
+                    match b.residency {
+                        BlockResidency::Evicted => evicted_empty.push(i),
+                        BlockResidency::Resident => resident_empty.push(i),
+                        BlockResidency::Evicting | BlockResidency::Restoring => {}
+                    }
+                }
+            }
+            let total_empty = evicted_empty.len() + resident_empty.len();
+            if total_empty > most {
+                let mut to_drop = total_empty - most;
+                for i in evicted_empty {
+                    if to_drop == 0 {
+                        break;
+                    }
+                    self.blocks[i] = None;
+                    dropped_evicted += 1;
+                    to_drop -= 1;
+                }
+                for i in resident_empty {
+                    if to_drop == 0 {
+                        break;
+                    }
+                    self.blocks[i] = None;
+                    to_drop -= 1;
+                }
+            }
+        }
+        dropped_evicted
+    }
+
+    /// Plan WDDM priority demotions (`LOW`/`MINIMUM`) and fence-safe `Evict()`
+    /// transitions for resident empty blocks. Transitions eviction targets to
+    /// [`BlockResidency::Evicting`] so the caller can invoke D3D12 outside the lock.
+    fn plan_idle_residency(
+        &mut self,
+        ctx: IdleResidencyCtx,
+        priority_updates: &mut Vec<(B, crate::residency_wddm::ResidencyTier)>,
+        evict_candidates: &mut Vec<(usize, B)>,
+    ) {
+        let IdleResidencyCtx {
+            now,
+            completed_submission,
+            vram_used_pct,
+            pressured,
+            critical,
+            normal_hot_spares,
+        } = ctx;
+        let mut resident_idle: Vec<(u64, usize)> = self
+            .blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| {
+                let b = b.as_ref()?;
+                (b.residency == BlockResidency::Resident && b.free.whole(BLOCK))
+                    .then_some((b.idle_since_ms.unwrap_or(now), i))
+            })
+            .collect();
+        // Newest-idle first so hot spares receive ranks 0..hot_spares_to_keep
+        // and the oldest idle blocks are evicted first.
+        resident_idle.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+
+        for (rank, (idle_since, idx)) in resident_idle.into_iter().enumerate() {
+            let Some(block) = self.blocks[idx].as_mut() else {
+                continue;
+            };
+            let age_ms = now.saturating_sub(idle_since);
+            let eff_fence = block.idle_fence.max(block.made);
+            match crate::residency_wddm::classify_idle_block(crate::residency_wddm::IdleBlockQuery {
+                age_ms,
+                idle_fence: eff_fence,
+                completed_submission,
+                vram_used_pct,
+                pressured,
+                critical,
+                normal_hot_spares,
+                resident_spare_rank: rank,
+            }) {
+                crate::residency_wddm::IdleBlockAction::KeepResidentLow => {
+                    if block.priority != crate::residency_wddm::ResidencyTier::Low {
+                        block.priority = crate::residency_wddm::ResidencyTier::Low;
+                        priority_updates.push((
+                            block.memory.clone(),
+                            crate::residency_wddm::ResidencyTier::Low,
+                        ));
+                    }
+                }
+                crate::residency_wddm::IdleBlockAction::DemoteMinimum => {
+                    if block.priority != crate::residency_wddm::ResidencyTier::Minimum {
+                        block.priority = crate::residency_wddm::ResidencyTier::Minimum;
+                        priority_updates.push((
+                            block.memory.clone(),
+                            crate::residency_wddm::ResidencyTier::Minimum,
+                        ));
+                    }
+                }
+                crate::residency_wddm::IdleBlockAction::Evict => {
+                    block.residency = BlockResidency::Evicting;
+                    evict_candidates.push((idx, block.memory.clone()));
+                }
+            }
+        }
+    }
+
+    #[cfg(any(test, feature = "diagnostics"))]
     fn blocks(&self) -> usize {
         self.blocks.iter().flatten().count()
+    }
+
+    fn resident_blocks(&self) -> usize {
+        self.blocks
+            .iter()
+            .flatten()
+            .filter(|b| b.residency == BlockResidency::Resident)
+            .count()
     }
 }
 
@@ -360,10 +825,11 @@ fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
 /// Bytes of the pieces textures hold now.
 static HELD: AtomicU64 = AtomicU64::new(0);
 
-/// Bytes of the texture blocks no texture holds: the card's memory in use
-/// by us that new textures take first.
+/// Bytes of the resident texture blocks no texture holds: the card's memory in
+/// use by us that new textures take first (evicted heaps are excluded so VRAM
+/// budget math does not double-subtract them).
 pub(crate) fn texture_room() -> u64 {
-    (lock(&TEXTURES).blocks() as u64 * BLOCK).saturating_sub(HELD.load(Ordering::Relaxed))
+    (lock(&TEXTURES).resident_blocks() as u64 * BLOCK).saturating_sub(HELD.load(Ordering::Relaxed))
 }
 
 /// For the memory line: blocks of textures and of staging buffers, in MiB.
@@ -672,8 +1138,15 @@ pub(crate) unsafe fn texture(
     if info.SizeInBytes == u64::MAX {
         return None;
     }
-    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
-    let (piece, heap, again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
+    let tick = now();
+    let ripe = Ripe::now();
+    let wddm_residency = crate::residency_wddm::enabled();
+    let idle_fence = if wddm_residency {
+        ripe.started.saturating_add(crate::queue::queued())
+    } else {
+        0
+    };
+    let mut make_heap = || {
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: BLOCK,
             Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
@@ -690,14 +1163,119 @@ pub(crate) unsafe fn texture(
             }
             tracing::warn!(error = %e, "no block of texture memory");
         }
-        if let Some(h) = &heap
-            && let Err(e) = crate::host::resident(device, h).and_then(|()| crate::host::mapped(device))
-        {
-            tracing::warn!(error = %e, "a block of texture memory is not resident");
-            return None;
+        if let Some(h) = &heap {
+            if let Err(e) = crate::host::resident(device, h).and_then(|()| crate::host::mapped(device)) {
+                tracing::warn!(error = %e, "a block of texture memory is not resident");
+                return None;
+            }
+            if wddm_residency {
+                let _ = crate::residency_wddm::set_heap_priority(
+                    device,
+                    h,
+                    crate::residency_wddm::ResidencyTier::Normal,
+                );
+            }
         }
         heap
-    })?;
+    };
+
+    let align = info.Alignment.max(1);
+    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+    let (piece, heap, again) = if !wddm_residency {
+        lock(&TEXTURES).take_ripe(info.SizeInBytes, align, tick, ripe, &mut make_heap)?
+    } else {
+        let outcome = lock(&TEXTURES).take_ripe_or_restore(
+            TakeReq { len: info.SizeInBytes, align, now: tick, ripe, idle_fence, allow_restore: true },
+            &mut make_heap,
+        );
+        match outcome {
+            TakeOutcome::Taken { piece, memory, again, promote_normal, dropped_evicted } => {
+                for _ in 0..dropped_evicted {
+                    crate::residency_wddm::note_evicted_block_dropped();
+                }
+                if promote_normal {
+                    let _ = crate::residency_wddm::set_heap_priority(
+                        device,
+                        &memory,
+                        crate::residency_wddm::ResidencyTier::Normal,
+                    );
+                }
+                (piece, memory, again)
+            }
+            TakeOutcome::Restore { block: idx, memory: evicted_heap, dropped_evicted } => {
+                for _ in 0..dropped_evicted {
+                    crate::residency_wddm::note_evicted_block_dropped();
+                }
+                // Restore the evicted heap OUTSIDE the TEXTURES lock so concurrent
+                // returns and queries never stall behind MakeResident / mapped().
+                match crate::residency_wddm::make_heap_resident(device, &evicted_heap) {
+                    Ok(()) => {
+                        let ripe_now = Ripe::now();
+                        let restore_fence = ripe_now.started.saturating_add(crate::queue::queued());
+                        lock(&TEXTURES).finish_restore_and_take(
+                            idx,
+                            TakeReq {
+                                len: info.SizeInBytes,
+                                align,
+                                now: now(),
+                                ripe: ripe_now,
+                                idle_fence: restore_fence,
+                                allow_restore: false,
+                            },
+                            &mut make_heap,
+                        )?
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, block = idx, "could not make evicted texture pool block resident");
+                        let fallback_ripe = Ripe::now();
+                        let fallback_fence = fallback_ripe.started.saturating_add(crate::queue::queued());
+                        let mut pool = lock(&TEXTURES);
+                        pool.cancel_restore(idx);
+                        match pool.take_ripe_or_restore(
+                            TakeReq {
+                                len: info.SizeInBytes,
+                                align,
+                                now: now(),
+                                ripe: fallback_ripe,
+                                idle_fence: fallback_fence,
+                                allow_restore: false,
+                            },
+                            &mut make_heap,
+                        ) {
+                            TakeOutcome::Taken { piece, memory, again, promote_normal, dropped_evicted } => {
+                                drop(pool);
+                                for _ in 0..dropped_evicted {
+                                    crate::residency_wddm::note_evicted_block_dropped();
+                                }
+                                if promote_normal {
+                                    let _ = crate::residency_wddm::set_heap_priority(
+                                        device,
+                                        &memory,
+                                        crate::residency_wddm::ResidencyTier::Normal,
+                                    );
+                                }
+                                (piece, memory, again)
+                            }
+                            TakeOutcome::Restore { dropped_evicted, .. }
+                            | TakeOutcome::None { dropped_evicted } => {
+                                drop(pool);
+                                for _ in 0..dropped_evicted {
+                                    crate::residency_wddm::note_evicted_block_dropped();
+                                }
+                                return None;
+                            }
+                        }
+                    }
+                }
+            }
+            TakeOutcome::None { dropped_evicted } => {
+                for _ in 0..dropped_evicted {
+                    crate::residency_wddm::note_evicted_block_dropped();
+                }
+                return None;
+            }
+        }
+    };
     let mut made: Option<ID3D12Resource> = None;
     // SAFETY: the piece is no one else's; the heap lives while a piece of
     // it is taken.
@@ -951,5 +1529,192 @@ mod tests {
         assert_eq!(spares_for(Some([100 * gib, 74 * gib, 0, 0]), true, 75), SPARE_KEPT);
         assert_eq!(spares_for(Some([100 * gib, 75 * gib, 0, 0]), true, 75), SPARE);
         assert_eq!(spares_for(Some([100 * gib, 10 * gib, 0, 0]), false, 85), SPARE);
+    }
+
+    #[test]
+    fn default_disabled_wddm_take_ripe_and_reclaim_preserve_baseline_order() {
+        assert!(!crate::residency_wddm::parse_wddm_residency_env(None));
+        let mut pool: Pool<u32> = Pool::new(8);
+        let b0 = pool.add(10, 0);
+        let b1 = pool.add(11, 0);
+        let b2 = pool.add(12, 0);
+        pool.blocks[b0].as_mut().unwrap().residency = BlockResidency::Evicted;
+        // Baseline `reclaim` trims empty blocks strictly past `limit` in ascending block order
+        // without residency-based reordering or WDDM evict accounting.
+        pool.reclaim(1_000, 1, true);
+        assert!(pool.blocks[b0].is_some());
+        assert!(pool.blocks[b1].is_none());
+        assert!(pool.blocks[b2].is_none());
+        // Baseline `take_ripe` does not enter `take_ripe_or_restore`.
+        let mut next = 100u32;
+        let (_piece, mem, again) = pool
+            .take_ripe(BLOCK / 4, 65536, 2_000, Ripe::ALL, || {
+                next += 1;
+                Some(next)
+            })
+            .unwrap();
+        assert_eq!(mem, 10);
+        assert!(!again);
+    }
+
+    #[test]
+    fn idle_blocks_demote_evict_fence_safely_and_restore_without_races() {
+        let mut pool: Pool<u32> = Pool::new(8);
+        // Three idle blocks aged differently, all carrying idle_fence = 10.
+        let b0 = pool.add_at(100, 10, 10, 1_000); // oldest idle
+        let b1 = pool.add_at(101, 10, 10, 18_000);
+        let b2 = pool.add_at(102, 10, 10, 20_000); // newest idle
+        assert_eq!(pool.resident_blocks(), 3);
+
+        // Before GPU fence reaches 10: oldest aged block demotes to MINIMUM, NEVER Evict.
+        let mut prios = Vec::new();
+        let mut evicts = Vec::new();
+        pool.plan_idle_residency(
+            IdleResidencyCtx {
+                now: 21_000,
+                completed_submission: 9,
+                vram_used_pct: Some(50),
+                pressured: false,
+                critical: false,
+                normal_hot_spares: 2,
+            },
+            &mut prios,
+            &mut evicts,
+        );
+        assert!(evicts.is_empty(), "must never evict while GPU fence < idle_fence");
+        assert_eq!(pool.blocks[b0].as_ref().unwrap().priority, crate::residency_wddm::ResidencyTier::Minimum);
+        assert_eq!(pool.blocks[b1].as_ref().unwrap().priority, crate::residency_wddm::ResidencyTier::Low);
+        assert_eq!(pool.blocks[b2].as_ref().unwrap().priority, crate::residency_wddm::ResidencyTier::Low);
+
+        // With normal_hot_spares = 12 (full ripe window), all 3 stay resident under normal VRAM.
+        let mut prios_wide = Vec::new();
+        let mut evicts_wide = Vec::new();
+        pool.plan_idle_residency(
+            IdleResidencyCtx {
+                now: 21_000,
+                completed_submission: 10,
+                vram_used_pct: Some(50),
+                pressured: false,
+                critical: false,
+                normal_hot_spares: 12,
+            },
+            &mut prios_wide,
+            &mut evicts_wide,
+        );
+        assert!(evicts_wide.is_empty(), "normal headroom preserves the ripe ahead window");
+        assert_eq!(pool.blocks[b0].as_ref().unwrap().priority, crate::residency_wddm::ResidencyTier::Low);
+
+        // Once GPU fence reaches 10 and aged block exceeds normal_hot_spares: transitions to Evicting.
+        prios.clear();
+        pool.plan_idle_residency(
+            IdleResidencyCtx {
+                now: 21_000,
+                completed_submission: 10,
+                vram_used_pct: Some(50),
+                pressured: false,
+                critical: false,
+                normal_hot_spares: 2,
+            },
+            &mut prios,
+            &mut evicts,
+        );
+        assert_eq!(evicts, vec![(b0, 100)]);
+        assert_eq!(pool.blocks[b0].as_ref().unwrap().residency, BlockResidency::Evicting);
+        // Reclaim MUST NOT drop a block currently in Evicting state.
+        assert_eq!(pool.reclaim_with_fence(21_000, 0, true, 10), 0);
+        assert!(pool.blocks[b0].is_some());
+        assert_eq!(pool.resident_blocks(), 0); // b1 & b2 dropped when limit = 0; b0 is Evicting.
+
+        // Finalize eviction of b0.
+        pool.blocks[b0].as_mut().unwrap().residency = BlockResidency::Evicted;
+        assert_eq!(pool.resident_blocks(), 0);
+        assert_eq!(pool.blocks(), 1);
+
+        // Allocating with allow_restore reserves b0 in Restoring instead of growing a new block.
+        let mut grew = 0;
+        let outcome = pool.take_ripe_or_restore(
+            TakeReq {
+                len: BLOCK / 4,
+                align: 65536,
+                now: 22_000,
+                ripe: Ripe::ALL,
+                idle_fence: 12,
+                allow_restore: true,
+            },
+            || {
+                grew += 1;
+                Some(999)
+            },
+        );
+        assert_eq!(grew, 0);
+        assert!(matches!(outcome, TakeOutcome::Restore { block, memory: 100, .. } if block == b0));
+        assert_eq!(pool.blocks[b0].as_ref().unwrap().residency, BlockResidency::Restoring);
+
+        // Finishing restore makes b0 resident, promotes priority to Normal, and hands out the piece.
+        // Taking BLOCK fills b0 completely so the next allocation tests b4 + evicted b3.
+        let (piece, mem, _) = pool
+            .finish_restore_and_take(
+                b0,
+                TakeReq {
+                    len: BLOCK,
+                    align: 65536,
+                    now: 22_000,
+                    ripe: Ripe::ALL,
+                    idle_fence: 12,
+                    allow_restore: false,
+                },
+                || None,
+            )
+            .unwrap();
+        assert_eq!((piece.block, mem), (b0, 100));
+        assert_eq!(pool.blocks[b0].as_ref().unwrap().residency, BlockResidency::Resident);
+        assert_eq!(pool.blocks[b0].as_ref().unwrap().priority, crate::residency_wddm::ResidencyTier::Normal);
+        assert_eq!(pool.resident_blocks(), 1);
+
+        // Dropping excess empty blocks prefers Evicted blocks first and returns dropped_evicted count.
+        let b3 = pool.add_at(103, 12, 12, 22_000);
+        let b4 = pool.add_at(104, 12, 12, 22_000);
+        pool.blocks[b3].as_mut().unwrap().residency = BlockResidency::Evicted;
+        // Evicted spare b3 counts toward ahead reserve so taking from b4 (leaving only b3 empty)
+        // does not churn-grow a brand new heap.
+        let mut churn_grew = 0;
+        let take_res = pool.take_ripe_or_restore(
+            TakeReq {
+                len: BLOCK / 4,
+                align: 65536,
+                now: 22_000,
+                ripe: Ripe { started: 13, finished: 12, ahead: 1 },
+                idle_fence: 13,
+                allow_restore: true,
+            },
+            || {
+                churn_grew += 1;
+                Some(888)
+            },
+        );
+        assert_eq!(churn_grew, 0, "evicted spare satisfies ahead count without CreateHeap churn");
+        assert!(matches!(take_res, TakeOutcome::Taken { piece, .. } if piece.block == b4));
+        // Return the piece and verify reclaim drops Evicted b3 before Resident hot spare b4.
+        pool.give(Piece { block: b4, start: 0, len: BLOCK / 4 }, 22_000);
+        assert_eq!(pool.reclaim_with_fence(22_000 + REST, 1, true, 14), 1);
+        assert!(pool.blocks[b3].is_none(), "evicted empty block dropped before hot resident spare");
+        // Failed Evict() rollback mirrors Minimum priority so next allocation promotes back to Normal.
+        pool.blocks[b4].as_mut().unwrap().priority = crate::residency_wddm::ResidencyTier::Minimum;
+        let promote_res = pool.take_ripe_or_restore(
+            TakeReq {
+                len: BLOCK / 4,
+                align: 65536,
+                now: 22_000 + REST,
+                ripe: Ripe::ALL,
+                idle_fence: 15,
+                allow_restore: false,
+            },
+            || None,
+        );
+        assert!(matches!(
+            promote_res,
+            TakeOutcome::Taken { piece, promote_normal: true, .. } if piece.block == b4
+        ));
+        assert_eq!(pool.blocks[b4].as_ref().unwrap().priority, crate::residency_wddm::ResidencyTier::Normal);
     }
 }

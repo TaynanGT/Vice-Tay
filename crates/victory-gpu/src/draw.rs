@@ -242,6 +242,54 @@ fn bake_exact() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_EXACT").is_none_or(|v| v != "0"))
 }
 
+/// Whether a texture picked by index that keeps changing with nothing to tell
+/// of it is looked at every frame (`VICTORY_HOT_RECHECK=1`; off by default).
+/// The textures left unnoticed are a few the title repaints through another
+/// view of their pages, all session: on an RTX 5080, 32 slots in a 3-minute
+/// run, three of them 117 of the first 200 changes, found 12, 40 and more
+/// frames late as the looks spread out again after each change. In a
+/// diagnostics build `VICTORY_AB` can flip it.
+fn hot_recheck() -> bool {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if let Some(on) = crate::ab::pick("VICTORY_HOT_RECHECK") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HOT_RECHECK").is_some_and(|v| v == "1"))
+}
+
+/// Changes found per slot and texture address ([`hot_recheck`]); a slot is
+/// hot from its second change on. At most `HOT_MOST` are kept.
+static HOT: std::sync::Mutex<Option<std::collections::HashMap<(u32, u64), u32>>> = std::sync::Mutex::new(None);
+const HOT_MOST: usize = 1024;
+/// Looks at hot slots, and of them the ones that found a change, since the start.
+pub(crate) static HOT_LOOKS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Counts a change at `index` showing the texture at `at`; whether the slot is hot now.
+fn hot_changed(index: u32, at: u64) -> bool {
+    let mut hot = HOT.lock().unwrap_or_else(|e| e.into_inner());
+    let hot = hot.get_or_insert_with(Default::default);
+    if hot.len() >= HOT_MOST && !hot.contains_key(&(index, at)) {
+        return false;
+    }
+    let kept = hot.len();
+    let n = hot.entry((index, at)).or_insert(0);
+    *n += 1;
+    let n = *n;
+    if n == 2 && kept <= 64 {
+        tracing::info!(slot = index, address = format_args!("{at:#x}"), "a texture picked by index is looked at every frame from now on (VICTORY_HOT_RECHECK)");
+    }
+    n >= 2
+}
+
+fn is_hot(index: u32, at: u64) -> bool {
+    HOT.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|hot| hot.get(&(index, at)))
+        .is_some_and(|&n| n >= 2)
+}
+
 /// Whether a texture found changed with nothing to tell of it is looked at
 /// again in the next frame (`VICTORY_RECHECK_SOON=0`: after four, as
 /// before).
@@ -2889,6 +2937,11 @@ impl State {
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
                 if crate::texture::fingerprint(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
+                    if hot_recheck() && is_hot(index, at) {
+                        HOT_LOOKS[0].fetch_add(1, Ordering::Relaxed);
+                        host.texture_slot_recheck(index, write, frame + 1, (at, len), print, looks, uploaded);
+                        continue;
+                    }
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
                         Some(wait) => {
                             host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
@@ -2900,7 +2953,21 @@ impl State {
                 if recheck_soon() {
                     again_in = 1;
                 }
+                if hot_recheck() && hot_changed(index, at) {
+                    HOT_LOOKS[0].fetch_add(1, Ordering::Relaxed);
+                    HOT_LOOKS[1].fetch_add(1, Ordering::Relaxed);
+                    again_in = 1;
+                }
                 let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
+                if (n + 1).is_multiple_of(250) {
+                    tracing::info!(
+                        unchanged = HEAP_TEXTURES_RECHECKED[0].load(Ordering::Relaxed),
+                        changed = n + 1,
+                        hot_looks = HOT_LOOKS[0].load(Ordering::Relaxed),
+                        hot_changed = HOT_LOOKS[1].load(Ordering::Relaxed),
+                        "looks at uploaded textures picked by index since the start"
+                    );
+                }
                 if n < 200 || n.is_multiple_of(1000) {
                     // Whether its pages are the title's at other addresses
                     // too: what is written there is told of there alone.

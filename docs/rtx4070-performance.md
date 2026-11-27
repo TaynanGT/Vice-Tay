@@ -146,3 +146,34 @@ output, about 4 min standing and walking):
 - Peak VRAM 6.8 GB of 10. No device lost.
 - The texture queue held 4,000 to 29,000 slots. Most of them waited for their
   memory (21,264 of 27,116 at the peak), with no pass short of room.
+
+## Renderer ports 6 and 7 on a 12-core CPU (2026-11-27)
+
+An RTX 4070 Ti 12 GB (Windows 11 26200), Ryzen 9 7900X (12 cores), and 63 GB
+of RAM ran the Series S profile from `aa917f3`, diagnostics build, windowed
+1920×1080, `-Machine 4070`, through the opening to the prison cell, unattended.
+Measured from 170 to 270 s after input began: the character at the window,
+4,400 to 4,600 draws a frame, no pipelines being made.
+
+**Inside one run.** `VICTORY_AB=5,VICTORY_PORT_GUARD,VICTORY_PORT_JOURNAL`
+switches both every 5 s; the table is the mean of the phases' median frame
+times in the window (5 or 6 phases each).
+
+| Switches on | Run 1 | Run 2 |
+|---|---:|---:|
+| neither | 44.9 ms (22.3 fps) | 44.1 ms (22.7 fps) |
+| `VICTORY_PORT_GUARD=1` | 43.3 ms | 42.9 ms |
+| `VICTORY_PORT_JOURNAL=1` | 43.3 ms | 42.9 ms |
+| both | **43.0 ms (23.3 fps)** | **42.1 ms (23.7 fps)** |
+
+**Separate runs** (same build and warmed cache, order alternated):
+`VICTORY_PORT_GUARD=1` ran 23.1 and 22.6 fps median against 21.8 and 22.0
+without it. CPU preparation fell from 35-38 ms to 33-34 ms a frame, and the
+write-watch askings from 20-22 ms to 8 ms a frame (218 refused askings a frame
+to 2). The first run with the switch made about 400 pipelines again and is
+left out.
+
+The launcher now turns both on for NVIDIA cards on CPUs with ten or more
+physical cores (not under `-Safe`; `-More` can turn either off). On an
+eight-core Ryzen 7 9800X3D port 6 measured slower (issue #364), so fewer
+cores keep the defaults.

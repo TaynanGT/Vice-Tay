@@ -203,11 +203,19 @@ pub(super) struct Placed {
     pub(super) len: usize,
     /// The destination's host copy.
     pub(super) shadow: std::sync::Arc<Shadow>,
+    /// The exact source bound to the GPU copy, when it does not read upload memory.
+    pub(super) source: Option<std::sync::Arc<Shadow>>,
     /// Upload memory the list copies from, to be given the source's bytes.
     from: Option<usize>,
 }
 
 impl Placed {
+    /// Whether this placed copy reads from CPU upload memory instead of a
+    /// source host copy on the card.
+    pub(super) fn reads_upload(&self) -> bool {
+        self.from.is_some()
+    }
+
     /// Whether flights that write `written` are waited for.
     pub(super) fn waits(&self, written: &[(usize, usize)]) -> Waits {
         let source = touches(written, self.src, self.src + self.len);
@@ -255,14 +263,16 @@ pub(super) enum Waits {
     Yes,
 }
 
-/// Whether a step of `runs` reads on the CPU what one of their copies at its
-/// place, ahead of it, waits for its readers ([`Waits::ForReaders`]) with. (A
-/// reader ahead of the copy wants what was there before it, and the steps are
-/// done in this order: `VICTORY_PLACED_READERS=0` counts those as well, as
-/// before.)
-pub(super) fn read_by(runs: &[&HostList], written: &[(usize, usize)]) -> bool {
+/// Whether `VICTORY_PLACED_READERS=0` also counts readers ahead of a copy.
+pub(super) fn readers_before_copy() -> bool {
     static ALL: OnceLock<bool> = OnceLock::new();
-    let all = *ALL.get_or_init(|| std::env::var_os("VICTORY_PLACED_READERS").is_some_and(|v| v == "0"));
+    *ALL.get_or_init(|| std::env::var_os("VICTORY_PLACED_READERS").is_some_and(|v| v == "0"))
+}
+
+/// Whether a CPU step reads the destination of a placed copy which still
+/// depends on a flight. CPU readers ahead of the copy can use the old bytes.
+pub(super) fn read_by(runs: &[&HostList], written: &[(usize, usize)]) -> bool {
+    let all = readers_before_copy();
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     let waits = |p: &Placed| matches!(p.waits(written), Waits::ForReaders);
     if all {
@@ -447,6 +457,7 @@ impl HostList {
             src,
             len,
             shadow: to,
+            source: own,
             from: scratch.map(|s| s.2 as usize),
         }));
         true

@@ -63,6 +63,11 @@ How each of these was found, with the numbers:
   `VICTORY_PLACED_CONSTANTS=1`, a draw can bind a GPU snapshot of the bytes an
   earlier placed copy wrote. The command list can reuse that snapshot across
   draws until a write overlaps the same bytes. The option is off by default.
+- **GPU fills behind placed copies.** Set `VICTORY_PLACED_FILL_REDIRECT=1`
+  with `VICTORY_PLACED_ORDER=1` to let compatible fills read the recorded
+  source of an earlier placed copy. The copy must cover the entire fill.
+  If a CPU reader still depends on a pending copy, submission waits for the
+  bytes to become available. This path is off by default.
 - **Reuse lazy state preludes** with `VICTORY_PRELUDE_POOL=1`. The pool
   takes the allocator and command list back after the owning list resets,
   once its prior submission has finished. It holds up to 128 idle pairs.

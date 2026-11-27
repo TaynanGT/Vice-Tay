@@ -58,6 +58,8 @@ pub(crate) struct Host {
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
     adapter: Option<IDXGIAdapter3>,
+    /// Whether `D3D12_FEATURE_DATA_ARCHITECTURE1::UMA` is set (for WDDM reservation caps).
+    is_uma: bool,
     /// 1-descriptor shader-visible fallback heaps bound when a command list
     /// omits a view or sampler heap while using directly-indexed root signatures.
     fallback_view: OnceLock<Option<ID3D12DescriptorHeap>>,
@@ -561,7 +563,10 @@ fn sweep() {
     }
     let host = host();
     let memory = host.and_then(|h| h.video_memory());
-    if let Some(host) = host { host.trim_title_stock(memory); }
+    if let Some(host) = host {
+        crate::residency::refresh_wddm(host);
+        host.trim_title_stock(memory);
+    }
     crate::pool::room(memory);
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
@@ -1527,6 +1532,7 @@ fn create() -> windows::core::Result<Host> {
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
+        let is_uma = crate::residency_wddm::probe_uma(&device);
         if let Some(desc) = adapter.as_ref().and_then(|a| a.GetDesc1().ok()) {
             let name = String::from_utf16_lossy(&desc.Description);
             tracing::info!(
@@ -1534,8 +1540,13 @@ fn create() -> windows::core::Result<Host> {
                 vendor = format_args!("{:#06x}", desc.VendorId),
                 device = format_args!("{:#06x}", desc.DeviceId),
                 vram_mb = desc.DedicatedVideoMemory >> 20,
+                uma = is_uma,
+                wddm_residency = crate::residency_wddm::enabled(),
                 "host D3D12 adapter"
             );
+        }
+        if let Some(adapter_ref) = adapter.as_ref() {
+            let _ = crate::residency_wddm::update_video_memory_reservation(adapter_ref, 0, is_uma);
         }
         tracing::info!("host D3D12 device ready");
         Ok(Host {
@@ -1554,6 +1565,7 @@ fn create() -> windows::core::Result<Host> {
             presenter: Mutex::new(None),
             title_stock: Default::default(),
             adapter,
+            is_uma,
             fallback_view: OnceLock::new(),
             fallback_sampler: OnceLock::new(),
             texture_readbacks: ReadbackPool::new(),
@@ -1567,6 +1579,16 @@ impl Host {
         let adapter = self.adapter.as_ref();
         // SAFETY: a plain query.
         adapter.map_or(0, |a| unsafe { a.CheckInterfaceSupport(&IDXGIDevice::IID) }.unwrap_or(0))
+    }
+
+    /// The DXGI adapter backing this device, if known.
+    pub(crate) fn adapter_ref(&self) -> Option<&IDXGIAdapter3> {
+        self.adapter.as_ref()
+    }
+
+    /// Whether `D3D12_FEATURE_DATA_ARCHITECTURE1::UMA` is set for this device.
+    pub(crate) fn is_uma(&self) -> bool {
+        self.is_uma
     }
 }
 
@@ -12037,7 +12059,7 @@ impl Host {
             return;
         };
         tracing::info!(
-            "video memory as the system counts it, {}: the card's own: budget {} MB, in use {} MB, {} MB could still be reserved, {} MB reserved; the PC's shared with the card: budget {} MB, in use {} MB, {} MB could still be reserved, {} MB reserved (the layer reserves none)",
+            "video memory as the system counts it, {}: the card's own: budget {} MB, in use {} MB, {} MB could still be reserved, {} MB reserved; the PC's shared with the card: budget {} MB, in use {} MB, {} MB could still be reserved, {} MB reserved{}",
             when,
             own[0] >> 20,
             own[1] >> 20,
@@ -12046,7 +12068,8 @@ impl Host {
             shared[0] >> 20,
             shared[1] >> 20,
             shared[2] >> 20,
-            shared[3] >> 20
+            shared[3] >> 20,
+            if crate::residency_wddm::enabled() { "" } else { " (the layer reserves none)" }
         );
     }
 
@@ -12192,7 +12215,11 @@ impl Host {
                 })
         };
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(()) => {
+                let buffer = buffer?;
+                let _ = crate::residency_wddm::set_hot_buffer_priority(&self.device, &buffer);
+                Some((buffer, data.cast()))
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no buffer in card memory the CPU maps");
                 None
@@ -12241,7 +12268,12 @@ impl Host {
         }
         let made = made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b))).and_then(|()| mapped(&self.device));
         match made {
-            Ok(()) => buffer,
+            Ok(()) => {
+                if let Some(b) = &buffer {
+                    let _ = crate::residency_wddm::set_hot_buffer_priority(&self.device, b);
+                }
+                buffer
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no unordered-access buffer");
                 None

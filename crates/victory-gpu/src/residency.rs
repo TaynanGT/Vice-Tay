@@ -150,6 +150,24 @@ pub(crate) fn refresh() {
     }
 }
 
+/// Refresh WDDM local video memory reservation against the live RT/depth working set.
+pub(crate) fn refresh_wddm(host: &crate::host::Host) {
+    if let Some(adapter) = host.adapter_ref() {
+        let working = crate::resource::targets_working_bytes();
+        let _ = crate::residency_wddm::update_video_memory_reservation(
+            adapter,
+            working,
+            host.is_uma(),
+        );
+    }
+}
+
+/// Snapshot of WDDM tiered residency telemetry.
+#[allow(dead_code)]
+pub(crate) fn wddm_stats() -> crate::residency_wddm::WddmResidencyStats {
+    crate::residency_wddm::stats()
+}
+
 pub(crate) fn headroom() -> Option<u64> {
     let bytes = HEADROOM.load(Ordering::Relaxed);
     (bytes != u64::MAX).then_some(bytes)

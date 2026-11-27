@@ -32,7 +32,11 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use windows::Win32::Graphics::Direct3D12::*;
 
 /// Whether it is on now (`VICTORY_UP_QUEUE=1`, or its phase of `VICTORY_AB`).
+/// Suppressed automatically on UMA fast path to avoid redundant RAM-to-RAM bounce copies.
 pub(super) fn on() -> bool {
+    if crate::adapter::uma_disables_bounce_copy_queue() {
+        return false;
+    }
     #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_UP_QUEUE") {
         return on;

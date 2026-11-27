@@ -91,6 +91,11 @@ How each of these was found, with the numbers:
 
 ## Loading and the runtime
 
+- Set `VICTORY_MAPPING_WAIT_MS` to a positive number of milliseconds to limit
+  the wait for the GPU memory-mapping fence. After a timeout, the runtime
+  checks that same fence before reusing its command list or submitting a
+  new mapping marker.
+
 - **DirectStorage**: a queue submits itself when it holds half its capacity, unless
   the title created it with automatic submission off (`DSTORAGE_QUEUE_OPTIONS`).
 - **Shader cache**: a shader that translated is used even when its entry cannot

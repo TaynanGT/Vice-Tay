@@ -4496,7 +4496,7 @@ mod late_tests {
         producer.defer_read_back(readback, title.as_mut_ptr(), [16, 2, 32]);
         producer.close();
 
-        let (submitted, sent) = host.submit(&[&producer], &[], true).ahead.unwrap();
+        let (submitted, sent) = host.submit(&[&producer], &[], true, None).ahead.unwrap();
         // SAFETY: the submission lock is held and the event and fence are
         // ours. The test keeps the producer, upload and destination alive.
         unsafe {
@@ -5700,6 +5700,20 @@ impl Host {
         crate::shadow::relay_fetched(after);
     }
 
+    /// Whether any GPU write copied back to title memory by `flights` overlaps
+    /// a placed shader-visible descriptor heap, so subsequent stamped
+    /// submissions wait for a heap-sync round begun after the landing completes.
+    fn landed_touches_shader_heap(flights: &[&Flight]) -> bool {
+        crate::descriptor::any_in_shader_heap(flights.iter().flat_map(|flight| {
+            let back = flight.back.iter().flat_map(|(_, ranges)| ranges.iter().copied());
+            let card = flight
+                .card
+                .iter()
+                .flat_map(|card| card.ranges.iter().filter(|r| !r.picked).map(|r| r.declared));
+            back.chain(card)
+        }))
+    }
+
     /// [`relay`], on the thread that lands flights: `items` are the first
     /// things of the line, flights the card has run and what follows them.
     /// What their shaders wrote goes into title memory (copies in the
@@ -5753,6 +5767,9 @@ impl Host {
                 });
                 stage.next("landing: copies in the PC's memory");
                 hand_back.merge();
+                if Self::landed_touches_shader_heap(&flights) {
+                    crate::port_journal::prep_wrote();
+                }
                 stage.next("landing: ranges done with");
                 let finishing = std::time::Instant::now();
                 // Only now, and flight by flight: a range another flight
@@ -5989,7 +6006,7 @@ impl Host {
     pub(crate) fn execute(&self, runs: &[&HostList]) -> u64 {
         // Behind what the title's queues were given before it.
         crate::queue::before_sync();
-        self.submit(runs, &[], false).fence
+        self.submit(runs, &[], false, None).fence
     }
 
     /// Runs a closed internal upload-only host list synchronously without
@@ -5997,7 +6014,7 @@ impl Host {
     /// when invoked from `VICTORY_THIN=1` worker threads. Settles in-flight
     /// GPU work and waits for the upload list's fence before returning.
     pub(crate) fn execute_sync_internal(&self, list: &HostList) {
-        let _ = self.submit(&[list], &[], false);
+        let _ = self.submit(&[list], &[], false, None);
     }
 
     /// A queue's submission with [`late`]: the host lists `lists`, taken
@@ -6007,12 +6024,20 @@ impl Host {
     /// ([`late`] lists those points); their host lists are reset and kept
     /// for reuse then, as a queue does for the lists it ran.
     pub(crate) fn execute_late(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>) {
-        self.execute_parts(lists, order, &[]);
+        self.execute_parts_stamped(lists, order, &[], None);
     }
 
     /// [`Host::execute_late`] of parts of submissions in one: another begins
-    /// at each place of `order` in `parts` ([`joins`]).
-    pub(crate) fn execute_parts(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>, parts: &[usize]) {
+    /// at each place of `order` in `parts` ([`joins`]). `heap_sync` is an
+    /// optional enqueue-time heap-sync stamp (`descriptor::heap_sync_stamp`)
+    /// so back-to-back queued submissions share a single sync round.
+    pub(crate) fn execute_parts_stamped(
+        &self,
+        lists: Vec<crate::list::Detached>,
+        order: Vec<usize>,
+        parts: &[usize],
+        heap_sync: Option<u64>,
+    ) {
         if order.is_empty() {
             crate::list::recycle(lists, &order);
             return;
@@ -6026,20 +6051,26 @@ impl Host {
                 Ok([(lists, order), (more, behind)]) => {
                     let first: Vec<usize> = parts.iter().copied().filter(|&p| p < cut).collect();
                     let second: Vec<usize> = parts.iter().filter(|&&p| p > cut).map(|p| p - cut).collect();
-                    self.execute_parts(lists, order, &first);
-                    self.execute_parts(more, behind, &second);
+                    self.execute_parts_stamped(lists, order, &first, heap_sync);
+                    self.execute_parts_stamped(more, behind, &second, heap_sync);
                 }
-                Err((lists, order)) => self.send_late(lists, order, parts),
+                Err((lists, order)) => self.send_late(lists, order, parts, heap_sync),
             }
             return;
         }
-        self.send_late(lists, order, parts);
+        self.send_late(lists, order, parts, heap_sync);
     }
 
-    fn send_late(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>, parts: &[usize]) {
+    fn send_late(
+        &self,
+        lists: Vec<crate::list::Detached>,
+        order: Vec<usize>,
+        parts: &[usize],
+        heap_sync: Option<u64>,
+    ) {
         let sent = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
-            self.submit(&runs, parts, true).ahead
+            self.submit(&runs, parts, true, heap_sync).ahead
         };
         let Some((mut submitted, sent)) = sent else {
             // (Not reached: a submission sent ahead always comes back.)
@@ -6100,7 +6131,7 @@ impl Host {
     /// fence covering the list in either case.
     fn execute_own(&self, list: &HostList) -> (u64, u64) {
         late_threads();
-        let Submission { fence, ahead: flight } = self.submit(&[list], &[], true);
+        let Submission { fence, ahead: flight } = self.submit(&[list], &[], true, None);
         let Some((submitted, sent)) = flight else {
             return (0, fence);
         };
@@ -6255,6 +6286,16 @@ impl Host {
                     }
                 }
                 hand_back(&back);
+                let flights_ref: Vec<&Flight> = items
+                    .iter()
+                    .filter_map(|i| match i {
+                        Late::Run(f) => Some(f),
+                        _ => None,
+                    })
+                    .collect();
+                if Self::landed_touches_shader_heap(&flights_ref) {
+                    crate::port_journal::prep_wrote();
+                }
                 COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
             // In the order given: what tells the title the card is done.
@@ -6340,7 +6381,13 @@ impl Host {
     /// `parts`: the lists of `runs` at which another part begins
     /// ([`joins`]): those go to the queue in calls of their own, one after the
     /// other, as they would have.
-    fn submit<'a>(&'a self, runs: &[&HostList], parts: &[usize], late: bool) -> Submission<'a> {
+    fn submit<'a>(
+        &'a self,
+        runs: &[&HostList],
+        parts: &[usize],
+        late: bool,
+        heap_sync: Option<u64>,
+    ) -> Submission<'a> {
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -6384,10 +6431,11 @@ impl Host {
         // Descriptors the title copied into placed heaps directly, before
         // command lists that index those slots are submitted.
         // Renderer port #7 (from renderer patch #4): the round asked for when
-        // the title submitted it, if that is known (`crate::port_journal`).
+        // the title submitted it, if that is known (`crate::port_journal`),
+        // otherwise the enqueue-time `heap_sync` stamp (`SyncRounds`).
         let heaps_on = crate::port_journal::on();
         let heaps_synced = match crate::port_journal::needed() {
-            0 => crate::descriptor::begin_sync_heaps(),
+            0 => crate::descriptor::begin_sync_heaps_for(heap_sync),
             mark => crate::descriptor::begin_sync_heaps_after(mark),
         };
         // That list runs first, and is one of the submission's from here on.
@@ -8309,12 +8357,12 @@ impl HostList {
                     batch.fill();
                     batch.title_written(TitleWrite::Copy);
                     crate::port::copied(dst, src, len);
-                    // Renderer port #7: into a heap's records, the rounds
-                    // asked earlier did not see it.
+                    copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    // Raise the heap-sync floor *after* the copy lands in
+                    // title memory so any round satisfying it sees the bytes.
                     if crate::descriptor::in_shader_heap(dst, len) {
                         crate::port_journal::prep_wrote();
                     }
-                    copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
                     // What the card holds there may be another value although
@@ -8341,9 +8389,6 @@ impl HostList {
                 }
                 Step::Placed(p) => {
                     let started = std::time::Instant::now();
-                    if crate::descriptor::in_shader_heap(p.dst, p.len) {
-                        crate::port_journal::prep_wrote();
-                    }
                     let free = !touches(air, p.src, p.src + p.len) && !touches(air, p.dst, p.dst + p.len);
                     batch.fill();
                     if free {
@@ -8351,6 +8396,11 @@ impl HostList {
                     }
                     if let Some(bytes) = p.prepare(free) {
                         batch.placed.push((p.shadow.clone(), p.dst, bytes));
+                    }
+                    // Raise the floor after `prepare` wrote title memory (non-free
+                    // placed copies land via GPU copy-back and raise the floor there).
+                    if free && crate::descriptor::in_shader_heap(p.dst, p.len) {
+                        crate::port_journal::prep_wrote();
                     }
                     (started, p.len)
                 }
@@ -8368,10 +8418,11 @@ impl HostList {
                     #[cfg(feature = "diagnostics")]
                     let started = std::time::Instant::now();
                     batch.title_written(TitleWrite::Deferred);
-                    // The destination can alias a heap's descriptor records.
-                    crate::port_journal::prep_wrote();
                     let _step = crate::timeline::span("a step of ours");
                     copy_raw_title(dst, src, len);
+                    // The destination can alias a heap's descriptor records;
+                    // raise the floor after the bytes are in title memory.
+                    crate::port_journal::prep_wrote();
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Runs, 1);

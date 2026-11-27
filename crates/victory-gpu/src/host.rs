@@ -158,29 +158,39 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
 
 /// How long host copies of textures the title fills must have been idle to
 /// be let go, in milliseconds, and how many bytes of them go at most (the
-/// longest idle first): none but those of ten minutes while what is in use
-/// of the card (`used`: without what our own blocks have free, with what is
-/// kept free for others) is under 88 % of its budget, else enough to come
-/// down to 85 %. `VICTORY_TEXTURE_KEEP=0`: [`vram_idle_ms`]' older rule,
+/// longest idle first): derived from [`crate::resource::room_percent`] so
+/// eviction always begins just below the upload cutoff (2 points below,
+/// trimming down to 5 points below; urgent eviction at 5 points above),
+/// avoiding any dead zone when `VICTORY_TEXTURE_ROOM_PERCENT` is lowered.
+/// At the default 90 %, eviction starts at 88 %, trims to 85 %, and turns
+/// urgent at 95 %. `VICTORY_TEXTURE_KEEP=0`: [`vram_idle_ms`]' older rule,
 /// all that are idle; `=1`: that rule with its two longer times.
 ///
 /// (By those times everything idle for 2.5 s went from 75 % of the budget
 /// on: 61,000 of them in the first 300 s of session play-1125-0203, at 78 to
 /// 80 %, of which 13,000 were made and uploaded again.)
 pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
+    vram_keep_for(budget, used, crate::resource::room_percent())
+}
+
+pub(crate) fn vram_keep_for(budget: u64, used: u64, room_pct: u64) -> (u64, u64) {
     const KEPT_MS: u64 = 600_000;
     const IDLE_MS: u64 = 5_000;
     const SHORT_MS: u64 = 1_500;
     if budget == 0 {
         return (IDLE_MS, u64::MAX);
     }
+    let room = room_pct.clamp(50, 97);
+    let start = room.saturating_sub(2);
+    let target = room.saturating_sub(5);
+    let urgent = (room + 5).min(98);
     let share = |percent: u64| budget / 100 * percent;
-    if used < share(88) {
+    if used < share(start) {
         (KEPT_MS, u64::MAX)
-    } else if used < share(95) {
-        (IDLE_MS, used - share(85))
+    } else if used < share(urgent) {
+        (IDLE_MS, used.saturating_sub(share(target)))
     } else {
-        (SHORT_MS, used - share(85))
+        (SHORT_MS, used.saturating_sub(share(target)))
     }
 }
 
@@ -315,7 +325,7 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
         let Some(a) = aside.as_mut() else { return Ok(()) };
         a.progress.run(
             || a.queue.ExecuteCommandLists(&[Some(a.list.clone())]),
-            |value, recovering| mapping_fence::confirm(device, &a.queue, &a.fence, a.event, value, recovering),
+            |value, attempt| mapping_fence::confirm(device, &a.queue, &a.fence, a.event, value, attempt),
         )?;
     }
     let us = started.elapsed().as_micros() as u64;
@@ -3741,13 +3751,27 @@ fn joins_asked() -> (usize, usize) {
     (parts, lists)
 }
 
-/// Whether the part `next` can be prepared together with `ahead`, which goes
+#[derive(Clone, Copy)]
+pub(crate) enum JoinStop {
+    QueueBoundary,
+    FoldedWait,
+    Disabled,
+    BoundaryJob,
+    ValueWait,
+    FenceWait,
+    PartLimit,
+    ListLimit,
+    CpuCopy,
+    EarlierWrite,
+}
+
+/// Why the part `next` cannot be prepared together with `ahead`, which goes
 /// before it and has not been sent: nothing done on the CPU for it reads what
 /// those give their shaders, write back or write when they are done, and it
 /// changes no title memory that they read ([`Step::Copy`], [`Step::RawCopy`]).
-pub(crate) fn joinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&HostList]) -> bool {
+pub(crate) fn join_blocked<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&HostList]) -> Option<JoinStop> {
     if next.iter().any(|l| l.deferred().copies.iter().any(|s| matches!(s, Step::Copy(..) | Step::RawCopy { .. }))) {
-        return false;
+        return Some(JoinStop::CpuCopy);
     }
     let ahead: Vec<&HostList> = ahead.collect();
     let mut written: Vec<(usize, usize)> = declared_writes(&ahead).into_iter().flat_map(|(_, ranges)| ranges).collect();
@@ -3758,7 +3782,7 @@ pub(crate) fn joinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&H
     }
     let mut joined = Vec::new();
     join_ranges(&mut joined, written);
-    blocked_by(&joined, next, false).is_none()
+    blocked_by(&joined, next, false).map(|_| JoinStop::EarlierWrite)
 }
 
 /// Whether a bottom-of-pipe write of `list` meets `wait`.
@@ -12401,7 +12425,7 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 
     #[test]
     fn textures_are_kept_while_the_card_has_room() {
-        use super::vram_keep;
+        use super::{vram_keep, vram_keep_for};
         let gib = 1 << 30;
         assert_eq!(vram_keep(100 * gib, 87 * gib).0, 600_000);
         // Past it: the longest idle ones, enough to come down to 85 %.
@@ -12409,6 +12433,15 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!((ms, bytes), (5_000, 5 * gib));
         assert_eq!(vram_keep(100 * gib, 120 * gib), (1_500, 35 * gib));
         assert_eq!(vram_keep(0, 7).0, 5_000);
+        // Lower room_percent (e.g. 80 %) must evict before the upload cutoff
+        // instead of stalling in a dead zone between 80 % and 88 %.
+        assert_eq!(vram_keep_for(100 * gib, 77 * gib, 80).0, 600_000);
+        assert_eq!(vram_keep_for(100 * gib, 78 * gib, 80), (5_000, 3 * gib));
+        assert_eq!(vram_keep_for(100 * gib, 80 * gib, 80), (5_000, 5 * gib));
+        assert_eq!(vram_keep_for(100 * gib, 85 * gib, 80), (1_500, 10 * gib));
+        // Higher room_percent (e.g. 94 %) scales cleanly too.
+        assert_eq!(vram_keep_for(100 * gib, 91 * gib, 94).0, 600_000);
+        assert_eq!(vram_keep_for(100 * gib, 92 * gib, 94), (5_000, 3 * gib));
     }
 
     #[test]

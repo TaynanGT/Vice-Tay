@@ -109,8 +109,11 @@ How each of these was found, with the numbers:
   checks that same fence before reusing its command list or submitting a
   new mapping marker.
 
-- **DirectStorage**: a queue submits itself when it holds half its capacity, unless
-  the title created it with automatic submission off (`DSTORAGE_QUEUE_OPTIONS`).
+- **DirectStorage**: a queue starts its requests at the title's own submit, where
+  the title's page lists become valid. A queue full of commands nobody submitted
+  submits itself, since nothing else could make room. `VICTORY_DSTORAGE_HALF=1`
+  brings back the submit at half its capacity, which ran requests on page lists
+  the title had not filled in yet.
 - **Shader cache**: a shader that translated is used even when its entry cannot
   be written. `VICTORY_WAVE_WIDE=0` turns the wave-wide form off for the listed
   shaders too, and `victory warm` makes a pipeline again when the wave-wide list

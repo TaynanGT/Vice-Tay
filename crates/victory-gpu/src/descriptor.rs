@@ -13,6 +13,9 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 #[cfg(windows)]
 pub(crate) mod host;
 
+#[cfg(test)]
+mod views_tests;
+
 const HEAP_IIDS: [Iid; 4] = [
     guid(
         0x8efb471d,
@@ -1079,7 +1082,7 @@ const DSV_TAG: u32 = u32::from_le_bytes(*b"vDSV");
 
 /// A shader view or sampler as the title described it (descriptions in the
 /// host's layout, kept as words), for the host to build its own from.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum View {
     /// Constant buffer: GPU address and size.
     Constant(u64, u32),
@@ -1148,7 +1151,284 @@ impl View {
 /// without the address: as many as the title has kinds of textures and
 /// buffers, however often it moves them).
 /// `VICTORY_VIEW_INLINE=0`: every view is an entry, as before.
-#[cfg_attr(test, derive(Default))]
+const HASH_K0: u64 = 0xa076_1d64_78bd_642f;
+const HASH_K1: u64 = 0xe703_7ed1_a0b4_28db;
+const HASH_K2: u64 = 0x8ebc_6af0_9c88_c6e3;
+const HASH_K3: u64 = 0x5899_65cc_7537_4cc3;
+
+/// 128-bit widening multiply folded back to 64 bits via XOR.
+#[inline]
+fn fold_mul(a: u64, b: u64) -> u64 {
+    let wide = u128::from(a) * u128::from(b);
+    (wide as u64) ^ ((wide >> 64) as u64)
+}
+
+/// Precomputed 64-bit word-level hash of a placed view's [`Shape`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ShapeKey(u64);
+
+impl ShapeKey {
+    /// Hashes `shape` field-by-field (`shape.0`, `shape.1[0..14]`,
+    /// `shape.2[0..14]`) without reading struct padding bytes.
+    #[inline]
+    fn of(shape: &Shape) -> Self {
+        let mut acc = fold_mul(u64::from(shape.0) ^ HASH_K0, HASH_K1);
+        for pair in shape.1.chunks_exact(2) {
+            let word = u64::from(pair[0]) | (u64::from(pair[1]) << 32);
+            acc = fold_mul(acc ^ word, HASH_K2);
+        }
+        for pair in shape.2.chunks_exact(2) {
+            let word = u64::from(pair[0]) | (u64::from(pair[1]) << 32);
+            acc = fold_mul(acc ^ word, HASH_K3);
+        }
+        Self(fold_mul(acc ^ HASH_K0, HASH_K1))
+    }
+}
+
+/// Pass-through hasher for already-mixed 64-bit keys ([`ShapeKey`]).
+#[derive(Default)]
+struct IdentityHash(u64);
+
+impl std::hash::Hasher for IdentityHash {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = ViewHash(self.0);
+        h.write(bytes);
+        self.0 = h.finish();
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = i;
+    }
+}
+
+/// Fast word-level hasher for [`View`] and resource-pointer keys.
+#[derive(Default)]
+struct ViewHash(u64);
+
+impl ViewHash {
+    #[inline]
+    fn mix(&mut self, word: u64) {
+        self.0 = fold_mul(self.0 ^ word ^ HASH_K1, HASH_K2);
+    }
+}
+
+impl std::hash::Hasher for ViewHash {
+    #[inline]
+    fn finish(&self) -> u64 {
+        fold_mul(self.0 ^ HASH_K0, HASH_K3)
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut state = self.0;
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in &mut chunks {
+            let word = u64::from_le_bytes([
+                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+            ]);
+            state = fold_mul(state ^ word ^ HASH_K1, HASH_K2);
+        }
+        let rem = chunks.remainder();
+        if !rem.is_empty() {
+            let mut tail = 0u64;
+            for (shift, &byte) in rem.iter().enumerate() {
+                tail |= u64::from(byte) << (shift * 8);
+            }
+            state = fold_mul(state ^ tail ^ HASH_K1, HASH_K3);
+        }
+        self.0 = fold_mul(state ^ (bytes.len() as u64).wrapping_add(HASH_K1), HASH_K0);
+    }
+
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        self.mix(u64::from(i));
+    }
+
+    #[inline]
+    fn write_u16(&mut self, i: u16) {
+        self.mix(u64::from(i));
+    }
+
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.mix(u64::from(i));
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.mix(i);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.mix(i as u64);
+    }
+}
+
+type ShapeMap<V> =
+    std::collections::HashMap<ShapeKey, V, std::hash::BuildHasherDefault<IdentityHash>>;
+type ViewMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<ViewHash>>;
+
+#[repr(align(64))]
+struct CacheAlignedU32(std::sync::atomic::AtomicU32);
+
+type ShapeSlab<const SLAB_LEN: usize> =
+    [std::cell::UnsafeCell<std::mem::MaybeUninit<Shape>>; SLAB_LEN];
+
+/// Allocates an uninitialized shape slab directly on the heap (avoids placing
+/// a ~232 KiB array on the thread stack).
+fn alloc_slab<const SLAB_LEN: usize>() -> *mut ShapeSlab<SLAB_LEN> {
+    let mut vec = Vec::with_capacity(SLAB_LEN);
+    vec.resize_with(SLAB_LEN, || {
+        std::cell::UnsafeCell::new(std::mem::MaybeUninit::uninit())
+    });
+    let boxed: Box<ShapeSlab<SLAB_LEN>> = vec
+        .into_boxed_slice()
+        .try_into()
+        .expect("slab length matches SLAB_LEN");
+    Box::into_raw(boxed)
+}
+
+/// Wait-free append-only segmented arena of placed-view [`Shape`]s.
+///
+/// Readers load `published` with `Acquire` and index directly into the
+/// fixed-size heap slabs without taking any lock or performing atomic writes.
+/// Each slot is wrapped in `UnsafeCell<MaybeUninit<Shape>>` and accessed via
+/// raw pointer arithmetic + `UnsafeCell::raw_get` so a concurrent writer
+/// initializing slot `== published` never aliases readers reading slots
+/// `< published` in the same slab.
+struct ShapeArenaCore<const SLAB_BITS: u32, const SLAB_LEN: usize, const MAX_SLABS: usize> {
+    published: CacheAlignedU32,
+    slabs: [std::sync::atomic::AtomicPtr<ShapeSlab<SLAB_LEN>>; MAX_SLABS],
+}
+
+impl<const SLAB_BITS: u32, const SLAB_LEN: usize, const MAX_SLABS: usize>
+    ShapeArenaCore<SLAB_BITS, SLAB_LEN, MAX_SLABS>
+{
+    const CAPACITY: usize = SLAB_LEN * MAX_SLABS;
+    const SLAB_MASK: usize = SLAB_LEN - 1;
+
+    const fn new() -> Self {
+        assert!(SLAB_BITS < usize::BITS);
+        assert!(SLAB_LEN > 0 && SLAB_LEN == (1usize << SLAB_BITS));
+        assert!(MAX_SLABS > 0);
+        assert!(matches!(
+            SLAB_LEN.checked_mul(MAX_SLABS),
+            Some(c) if c <= u32::MAX as usize
+        ));
+        Self {
+            published: CacheAlignedU32(std::sync::atomic::AtomicU32::new(0)),
+            slabs: [const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; MAX_SLABS],
+        }
+    }
+
+    #[cfg(any(feature = "diagnostics", test))]
+    #[inline]
+    fn len(&self) -> usize {
+        self.published.0.load(std::sync::atomic::Ordering::Acquire) as usize
+    }
+
+    #[cfg(any(all(windows, feature = "diagnostics"), test))]
+    fn allocated_slots(&self) -> usize {
+        self.len().div_ceil(SLAB_LEN) * SLAB_LEN
+    }
+
+    #[inline]
+    fn get(&self, idx: u32) -> Option<Shape> {
+        let published = self.published.0.load(std::sync::atomic::Ordering::Acquire);
+        if idx >= published {
+            return None;
+        }
+        let slab_idx = (idx as usize) >> SLAB_BITS;
+        let slot_idx = (idx as usize) & Self::SLAB_MASK;
+        let ptr = self.slabs[slab_idx].load(std::sync::atomic::Ordering::Acquire);
+        debug_assert!(!ptr.is_null());
+        // SAFETY: `idx < published` (loaded with `Acquire`, paired with
+        // `Release` in `push_exclusive`) guarantees `slabs[slab_idx]` was
+        // allocated and stored before `published` advanced, and `slot_idx` was
+        // initialized and is immutable for the lifetime of `self`. Projecting
+        // directly to the single slot via raw pointer arithmetic +
+        // `UnsafeCell::raw_get` + `ptr::read` avoids materializing any slab or
+        // element reference that could alias concurrent writes to slots
+        // `>= published`.
+        Some(unsafe {
+            let cell = ptr
+                .cast::<std::cell::UnsafeCell<std::mem::MaybeUninit<Shape>>>()
+                .add(slot_idx);
+            std::cell::UnsafeCell::raw_get(cell).read().assume_init()
+        })
+    }
+
+    /// Appends `shape` and publishes it to wait-free readers.
+    ///
+    /// # Safety
+    /// The caller must hold exclusive writer access (no other thread may call
+    /// `push_exclusive` concurrently on this arena).
+    unsafe fn push_exclusive(&self, shape: Shape) -> Option<u32> {
+        // Sole writer: Relaxed observes our own previous store.
+        let at = self.published.0.load(std::sync::atomic::Ordering::Relaxed);
+        if at as usize >= Self::CAPACITY {
+            return None;
+        }
+        let slab_idx = (at as usize) >> SLAB_BITS;
+        let slot_idx = (at as usize) & Self::SLAB_MASK;
+        let mut ptr = self.slabs[slab_idx].load(std::sync::atomic::Ordering::Relaxed);
+        if ptr.is_null() {
+            ptr = alloc_slab::<SLAB_LEN>();
+            self.slabs[slab_idx].store(ptr, std::sync::atomic::Ordering::Release);
+        }
+        // SAFETY: `ptr` points to a live heap `ShapeSlab<SLAB_LEN>` and
+        // `slot_idx < SLAB_LEN`. By the safety contract we are the sole writer,
+        // and readers only ever access slots `< published` (`< at`), so slot
+        // `slot_idx` is unaliased while we project directly to it and write
+        // via `UnsafeCell::raw_get` + `ptr::write` without materializing any
+        // slab reference or `&mut MaybeUninit<Shape>`.
+        unsafe {
+            let cell = ptr
+                .cast::<std::cell::UnsafeCell<std::mem::MaybeUninit<Shape>>>()
+                .add(slot_idx);
+            std::cell::UnsafeCell::raw_get(cell).write(std::mem::MaybeUninit::new(shape));
+        }
+        self.published
+            .0
+            .store(at + 1, std::sync::atomic::Ordering::Release);
+        Some(at)
+    }
+
+    #[cfg(any(feature = "diagnostics", test))]
+    fn iter(&self) -> impl Iterator<Item = Shape> + '_ {
+        let len = self.len() as u32;
+        (0..len).filter_map(|i| self.get(i))
+    }
+}
+
+impl<const SLAB_BITS: u32, const SLAB_LEN: usize, const MAX_SLABS: usize> Drop
+    for ShapeArenaCore<SLAB_BITS, SLAB_LEN, MAX_SLABS>
+{
+    fn drop(&mut self) {
+        // `Shape` is `Copy` (no drop glue); free only the allocated slab boxes.
+        for slab in &mut self.slabs {
+            let ptr = *slab.get_mut();
+            if !ptr.is_null() {
+                // SAFETY: every non-null slab pointer came from `Box::into_raw`
+                // in `alloc_slab`, and `&mut self` guarantees no readers or
+                // writers remain.
+                drop(unsafe { Box::from_raw(ptr) });
+            }
+        }
+    }
+}
+
+type ShapeArena = ShapeArenaCore<11, 2048, 2048>;
+const _: () = assert!(ShapeArena::CAPACITY == SHAPES);
+
 struct Views {
     /// Each entry's view and generation.
     list: Vec<(View, u32)>,
@@ -1156,21 +1436,51 @@ struct Views {
     /// A free slot counts toward the kind it last held until it is reused.
     #[cfg(all(windows, feature = "diagnostics"))]
     kind_usage: [ViewKindUsage; 6],
-    index: std::collections::BTreeMap<View, u32>,
+    index: ViewMap<View, u32>,
     /// Entries naming each resource.
-    by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
+    by_resource: ViewMap<usize, Vec<u32>>,
     free: Vec<u32>,
-    /// The shapes of views of placed memory, and where each is by its
-    /// hash ([`shape_key`]): keyed by the shape itself the index held a
-    /// second copy of each, 2.4 million of them (some 900 MB with the list)
-    /// 18 minutes into the world.
-    shapes: Vec<Shape>,
-    shape_index: std::collections::BTreeMap<u64, u32>,
+    /// Primary arena index by 64-bit [`ShapeKey`]; shapes themselves live in
+    /// the wait-free [`ShapeArenaCore`] so the map never stores a second copy
+    /// of each 116-byte `Shape`.
+    shape_index: ShapeMap<u32>,
+    /// Overflow chain for distinct shapes sharing a 64-bit [`ShapeKey`]; zero
+    /// heap bytes unless a collision actually occurs.
+    shape_collisions: ShapeMap<Vec<u32>>,
     /// Entries of views that no resource releases (constant buffer views
     /// and views of placed memory that did not fit a record), oldest first,
     /// with the generation each was made at: past [`ownerless_cap`] the
     /// oldest is freed, so they cannot grow for the whole run.
     ownerless: std::collections::VecDeque<(u32, u32)>,
+}
+
+impl Views {
+    const fn new() -> Self {
+        Self {
+            list: Vec::new(),
+            #[cfg(all(windows, feature = "diagnostics"))]
+            kind_usage: [ViewKindUsage { occupied: 0, free: 0 }; 6],
+            index: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+            by_resource: std::collections::HashMap::with_hasher(
+                std::hash::BuildHasherDefault::new(),
+            ),
+            free: Vec::new(),
+            shape_index: std::collections::HashMap::with_hasher(
+                std::hash::BuildHasherDefault::new(),
+            ),
+            shape_collisions: std::collections::HashMap::with_hasher(
+                std::hash::BuildHasherDefault::new(),
+            ),
+            ownerless: std::collections::VecDeque::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Default for Views {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -1188,21 +1498,37 @@ impl ViewKindUsage {
     }
 }
 
-/// Read far more often than written: every slot a draw reads through a
-/// table is looked up here, on several recording threads at once in the
-/// world. Readers share it; only a view not seen before (a new table entry
-/// or shape) and a released resource take it alone.
-static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
-    list: Vec::new(),
-    #[cfg(all(windows, feature = "diagnostics"))]
-    kind_usage: [ViewKindUsage { occupied: 0, free: 0 }; 6],
-    index: std::collections::BTreeMap::new(),
-    by_resource: std::collections::BTreeMap::new(),
-    free: Vec::new(),
-    shapes: Vec::new(),
-    shape_index: std::collections::BTreeMap::new(),
-    ownerless: std::collections::VecDeque::new(),
-});
+/// View registry pairing a wait-free placed-shape slab arena with an `RwLock`
+/// protecting the mutable view table and shape hash index.
+///
+/// Placed-view lookups (`PLACED`) read straight from `shapes` without ever
+/// touching `state`. Only new views, new shapes, and released resources take
+/// `state` exclusively.
+struct ViewRegistryCore<const SLAB_BITS: u32, const SLAB_LEN: usize, const MAX_SLABS: usize> {
+    shapes: ShapeArenaCore<SLAB_BITS, SLAB_LEN, MAX_SLABS>,
+    state: std::sync::RwLock<Views>,
+}
+
+#[cfg(test)]
+struct ViewsReadGuard<'a, const SLAB_BITS: u32, const SLAB_LEN: usize, const MAX_SLABS: usize> {
+    guard: std::sync::RwLockReadGuard<'a, Views>,
+    shapes: &'a ShapeArenaCore<SLAB_BITS, SLAB_LEN, MAX_SLABS>,
+}
+
+#[cfg(test)]
+impl<const SLAB_BITS: u32, const SLAB_LEN: usize, const MAX_SLABS: usize> std::ops::Deref
+    for ViewsReadGuard<'_, SLAB_BITS, SLAB_LEN, MAX_SLABS>
+{
+    type Target = Views;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+type ViewRegistry = ViewRegistryCore<11, 2048, 2048>;
+
+static VIEWS: ViewRegistry = ViewRegistry::new();
 
 /// How many table entries of views without a resource are kept
 /// ([`Views::ownerless`]). Once the shapes of placed views are full (the
@@ -1307,75 +1633,48 @@ fn shape_of(unordered: bool, resource: &[u32; 14], desc: &[u32; 16]) -> (Shape, 
     )
 }
 
-fn shape_key(shape: &Shape) -> u64 {
-    use std::hash::BuildHasher;
-    std::hash::BuildHasherDefault::<std::hash::DefaultHasher>::default().hash_one(shape)
-}
-
 /// The record words that name the view of placed memory at `address` with
 /// shape number `shape`.
 fn placed_words(shape: u32, address: u64) -> [u32; 2] {
     kind_words(PLACED, u64::from(shape) << PLACED_ADDRESS_BITS | address)
 }
 
+/// How many distinct values each word of the shapes kept takes: the
+/// words that tell shapes apart. Logged as the count of shapes passes a
+/// few marks, to see which fields make shapes many.
+#[cfg(feature = "diagnostics")]
+fn log_shape_words<const SLAB_BITS: u32, const SLAB_LEN: usize, const MAX_SLABS: usize>(
+    shapes: &ShapeArenaCore<SLAB_BITS, SLAB_LEN, MAX_SLABS>,
+) {
+    let distinct = |word: &dyn Fn(&Shape) -> u32| {
+        shapes.iter().map(|s| word(&s)).collect::<std::collections::BTreeSet<_>>().len()
+    };
+    let resource: Vec<usize> = (0..14).map(|w| distinct(&|s: &Shape| s.1[w])).collect();
+    let view: Vec<usize> = (0..14).map(|w| distinct(&|s: &Shape| s.2[w])).collect();
+    let unordered = distinct(&|s: &Shape| u32::from(s.0));
+    tracing::info!(
+        shapes = shapes.len(),
+        unordered,
+        ?resource,
+        ?view,
+        "shapes of placed views: distinct values of each word (resource description words 0-13; view description words 0-9 and 12-15)"
+    );
+}
+
 impl Views {
-    /// The number of `shape`, a new one if it is not there yet; `None` when
-    /// the shapes are full (the view is then a table entry).
-    fn shape(&mut self, shape: Shape) -> Option<u32> {
-        let key = shape_key(&shape);
-        if let Some(&at) = self.shape_index.get(&key) {
-            // shortcut: of two shapes with one hash the second is a table entry, as when the shapes are full.
-            return (self.shapes[at as usize] == shape).then_some(at);
+    /// The number of `shape` (with precomputed `key`) if it is there already.
+    fn known_shape<const SLAB_BITS: u32, const SLAB_LEN: usize, const MAX_SLABS: usize>(
+        &self,
+        shapes: &ShapeArenaCore<SLAB_BITS, SLAB_LEN, MAX_SLABS>,
+        key: ShapeKey,
+        shape: &Shape,
+    ) -> Option<u32> {
+        let &first = self.shape_index.get(&key)?;
+        if shapes.get(first).as_ref() == Some(shape) {
+            return Some(first);
         }
-        if self.shapes.len() >= SHAPES {
-            return None;
-        }
-        let at = self.shapes.len() as u32;
-        self.shapes.push(shape);
-        self.shape_index.insert(key, at);
-        #[cfg(feature = "diagnostics")]
-        if matches!(at + 1, 1024 | 16384 | 131_072 | 1_048_576) {
-            self.log_shape_words();
-        }
-        Some(at)
-    }
-
-    /// The number of `shape` if it is there already.
-    fn known_shape(&self, shape: &Shape) -> Option<u32> {
-        let &at = self.shape_index.get(&shape_key(shape))?;
-        (self.shapes[at as usize] == *shape).then_some(at)
-    }
-
-    /// How many distinct values each word of the shapes kept takes: the
-    /// words that tell shapes apart. Logged as the count of shapes passes a
-    /// few marks, to see which fields make shapes many.
-    #[cfg(feature = "diagnostics")]
-    fn log_shape_words(&self) {
-        let distinct = |word: &dyn Fn(&Shape) -> u32| {
-            self.shapes.iter().map(word).collect::<std::collections::BTreeSet<_>>().len()
-        };
-        let resource: Vec<usize> = (0..14).map(|w| distinct(&|s: &Shape| s.1[w])).collect();
-        let view: Vec<usize> = (0..14).map(|w| distinct(&|s: &Shape| s.2[w])).collect();
-        let unordered = distinct(&|s: &Shape| u32::from(s.0));
-        tracing::info!(
-            shapes = self.shapes.len(),
-            unordered,
-            ?resource,
-            ?view,
-            "shapes of placed views: distinct values of each word (resource description words 0-13; view description words 0-9 and 12-15)"
-        );
-    }
-
-    /// The view of placed memory [`placed_words`] named.
-    fn placed_of(&self, i: u32, generation: u32) -> Option<View> {
-        let payload = payload(i, generation);
-        let address = payload & ((1 << PLACED_ADDRESS_BITS) - 1);
-        let &(unordered, resource, rest) = self.shapes.get((payload >> PLACED_ADDRESS_BITS) as usize)?;
-        let mut desc = [0u32; 16];
-        desc[..10].copy_from_slice(&rest[..10]);
-        (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
-        desc[12..].copy_from_slice(&rest[10..]);
-        Some(View::Placed(unordered, resource, desc))
+        let extra = self.shape_collisions.get(&key)?;
+        extra.iter().copied().find(|&at| shapes.get(at).as_ref() == Some(shape))
     }
 
     /// The record words of `view` as a table entry, if it has one.
@@ -1386,6 +1685,7 @@ impl Views {
 
     /// The record words of `view` as a table entry: its entry (a new or a
     /// freed one if the view is not there yet) and that entry's generation.
+    #[cfg(all(test, windows, feature = "diagnostics"))]
     fn entry(&mut self, view: View) -> [u32; 2] {
         self.entry_kept(view, ownerless_cap())
     }
@@ -1394,8 +1694,7 @@ impl Views {
     /// without a resource (0: all).
     fn entry_kept(&mut self, view: View, cap: usize) -> [u32; 2] {
         let ownerless = view.resources() == [0, 0] && matches!(view, View::Constant(..) | View::Placed(..));
-        let fresh = !self.index.contains_key(&view);
-        let words = self.entry_made(view);
+        let (words, fresh) = self.entry_made(view);
         if ownerless && fresh {
             self.ownerless.push_back((words[0], words[1]));
             while cap != 0 && self.ownerless.len() > cap {
@@ -1430,108 +1729,228 @@ impl Views {
         self.free.push(i);
     }
 
-    fn entry_made(&mut self, view: View) -> [u32; 2] {
-        let i = match self.index.get(&view) {
-            Some(&i) => i,
-            None => {
-                let i = match self.free.pop() {
-                    Some(i) => {
-                        #[cfg(all(windows, feature = "diagnostics"))]
-                        {
-                            let old_kind = self.list[i as usize].0.kind_index();
-                            self.kind_usage[old_kind].free -= 1;
-                        }
-                        self.list[i as usize].0 = view.clone();
-                        i
-                    }
-                    None => {
-                        self.list.push((view.clone(), 1));
-                        self.list.len() as u32 - 1
-                    }
-                };
+    fn entry_made(&mut self, view: View) -> ([u32; 2], bool) {
+        if let Some(&i) = self.index.get(&view) {
+            return ([i, self.list[i as usize].1], false);
+        }
+        let i = match self.free.pop() {
+            Some(i) => {
                 #[cfg(all(windows, feature = "diagnostics"))]
                 {
-                    self.kind_usage[view.kind_index()].occupied += 1;
+                    let old_kind = self.list[i as usize].0.kind_index();
+                    self.kind_usage[old_kind].free -= 1;
                 }
-                for r in view.resources().into_iter().filter(|&r| r != 0) {
-                    self.by_resource.entry(r).or_default().push(i);
-                }
-                self.index.insert(view, i);
+                self.list[i as usize].0 = view.clone();
                 i
             }
+            None => {
+                self.list.push((view.clone(), 1));
+                self.list.len() as u32 - 1
+            }
         };
-        [i, self.list[i as usize].1]
+        #[cfg(all(windows, feature = "diagnostics"))]
+        {
+            self.kind_usage[view.kind_index()].occupied += 1;
+        }
+        for r in view.resources().into_iter().filter(|&r| r != 0) {
+            self.by_resource.entry(r).or_default().push(i);
+        }
+        self.index.insert(view, i);
+        ([i, self.list[i as usize].1], true)
+    }
+}
+
+impl<const SLAB_BITS: u32, const SLAB_LEN: usize, const MAX_SLABS: usize>
+    ViewRegistryCore<SLAB_BITS, SLAB_LEN, MAX_SLABS>
+{
+    const fn new() -> Self {
+        Self {
+            shapes: ShapeArenaCore::new(),
+            state: std::sync::RwLock::new(Views::new()),
+        }
+    }
+
+    #[inline]
+    fn read_state(&self) -> std::sync::RwLockReadGuard<'_, Views> {
+        self.state.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[cfg(test)]
+    fn read(
+        &self,
+    ) -> Result<ViewsReadGuard<'_, SLAB_BITS, SLAB_LEN, MAX_SLABS>, std::convert::Infallible> {
+        Ok(ViewsReadGuard {
+            guard: self.read_state(),
+            shapes: &self.shapes,
+        })
+    }
+
+    #[inline]
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, Views> {
+        self.state.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Returns the arena index of `shape`, inserting it if absent; `None` when
+    /// the arena has reached its capacity ceiling. Pre-hashes `shape` once
+    /// outside any lock.
+    fn intern_shape(&self, shape: Shape) -> Option<u32> {
+        let key = ShapeKey::of(&shape);
+        self.intern_shape_with_key(shape, key)
+    }
+
+    fn intern_shape_with_key(&self, shape: Shape, key: ShapeKey) -> Option<u32> {
+        // Nearly every placed view has a shape seen before.
+        if let Some(at) = self.read_state().known_shape(&self.shapes, key, &shape) {
+            return Some(at);
+        }
+        let mut views = self.write();
+        if let Some(at) = views.known_shape(&self.shapes, key, &shape) {
+            return Some(at);
+        }
+        // SAFETY: holding the exclusive write lock on `self.state` serializes
+        // all writers to `self.shapes`.
+        let at = unsafe { self.shapes.push_exclusive(shape) }?;
+        match views.shape_index.entry(key) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(at);
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {
+                views.shape_collisions.entry(key).or_default().push(at);
+            }
+        }
+        drop(views);
+        #[cfg(feature = "diagnostics")]
+        if matches!(at + 1, 1024 | 16384 | 131_072 | 1_048_576) {
+            log_shape_words(&self.shapes);
+        }
+        Some(at)
+    }
+
+    /// The view of placed memory [`placed_words`] named. Wait-free: reads
+    /// straight from `self.shapes` without touching `self.state`.
+    #[inline]
+    fn placed_of(&self, i: u32, generation: u32) -> Option<View> {
+        let payload = payload(i, generation);
+        let address = payload & ((1 << PLACED_ADDRESS_BITS) - 1);
+        let (unordered, resource, rest) =
+            self.shapes.get((payload >> PLACED_ADDRESS_BITS) as u32)?;
+        let mut desc = [0u32; 16];
+        desc[..10].copy_from_slice(&rest[..10]);
+        (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+        desc[12..].copy_from_slice(&rest[10..]);
+        Some(View::Placed(unordered, resource, desc))
+    }
+
+    /// The view the record words `i` and `generation` name: the one they hold
+    /// whole, or the view of entry `i` if `generation` is still its own.
+    #[inline]
+    fn view_at(&self, i: u32, generation: u32) -> Option<View> {
+        match generation >> KIND_SHIFT {
+            0 => {
+                let views = self.read_state();
+                let (view, current) = views.list.get(i as usize)?;
+                (*current == generation).then(|| view.clone())
+            }
+            CONSTANT => Some(constant_of(i, generation)),
+            PLACED => self.placed_of(i, generation),
+            _ => None,
+        }
+    }
+
+    fn words_for_with(
+        &self,
+        view: View,
+        use_inline: bool,
+        cap: usize,
+        count_whole: bool,
+    ) -> [u32; 2] {
+        use std::sync::atomic::Ordering::Relaxed;
+        if use_inline {
+            match &view {
+                View::Constant(address, size) => {
+                    if let Some(words) = constant_words(*address, *size) {
+                        if count_whole {
+                            NAMED_WHOLE[0].fetch_add(1, Relaxed);
+                        }
+                        return words;
+                    }
+                }
+                View::Placed(unordered, resource, desc) => {
+                    let (shape, address) = shape_of(*unordered, resource, desc);
+                    if address >> PLACED_ADDRESS_BITS == 0
+                        && let Some(shape) = self.intern_shape(shape)
+                    {
+                        if count_whole {
+                            NAMED_WHOLE[1].fetch_add(1, Relaxed);
+                        }
+                        return placed_words(shape, address);
+                    }
+                }
+                _ => {}
+            }
+        }
+        // A view written before keeps its entry and generation.
+        if let Some(words) = self.read_state().entry_of(&view) {
+            return words;
+        }
+        self.write().entry_kept(view, cap)
+    }
+
+    fn forget_resource(&self, resource: usize) {
+        let mut views = self.write();
+        let Some(entries) = views.by_resource.remove(&resource) else {
+            return;
+        };
+        for i in entries {
+            let (view, generation) = views.list[i as usize].clone();
+            // Entries freed through a view's other resource may hold another
+            // view by now.
+            if views.index.get(&view) != Some(&i) || !view.resources().contains(&resource) {
+                continue;
+            }
+            // The view's other resource (a counter) keeps a stale entry, which
+            // `forget` of that resource skips.
+            views.free_entry(i, &view, generation);
+        }
     }
 }
 
 /// The two words that name `view` in a record: the view itself where its
 /// kind allows ([`Views`]), else its table entry.
 fn words_for(view: View) -> [u32; 2] {
-    use std::sync::atomic::Ordering::Relaxed;
-    if inline() {
-        match &view {
-            View::Constant(address, size) => {
-                if let Some(words) = constant_words(*address, *size) {
-                    NAMED_WHOLE[0].fetch_add(1, Relaxed);
-                    return words;
-                }
-            }
-            View::Placed(unordered, resource, desc) => {
-                let (shape, address) = shape_of(*unordered, resource, desc);
-                if address >> PLACED_ADDRESS_BITS == 0 {
-                    // Nearly every placed view has a shape seen before.
-                    let known = views_read().known_shape(&shape);
-                    let shape = known.or_else(|| views_write().shape(shape));
-                    if let Some(shape) = shape {
-                        NAMED_WHOLE[1].fetch_add(1, Relaxed);
-                        return placed_words(shape, address);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    // A view written before keeps its entry and generation.
-    if let Some(words) = views_read().entry_of(&view) {
-        return words;
-    }
-    views_write().entry(view)
-}
-
-fn views_read() -> std::sync::RwLockReadGuard<'static, Views> {
-    VIEWS.read().unwrap_or_else(|e| e.into_inner())
-}
-
-fn views_write() -> std::sync::RwLockWriteGuard<'static, Views> {
-    VIEWS.write().unwrap_or_else(|e| e.into_inner())
+    VIEWS.words_for_with(view, inline(), ownerless_cap(), true)
 }
 
 /// For the memory line: the distinct views kept ([`Views`]), those of them
 /// free for reuse, and the bytes the table and its index hold for them (an
-/// estimate: an entry of the table, and one of the index with its share of
-/// a tree node; the shapes likewise); then the entries that are constant
-/// buffer views and views of placed memory (those that did not fit a
-/// record, or all of them with `VICTORY_VIEW_INLINE=0`), the shapes of
-/// placed views kept, and the views named whole in their records since the
-/// start: constant buffer views, views of placed memory. Both the summary and
-/// the per-kind slot counts come from the same read lock.
+/// estimate: table slots, hash map buckets, allocated shape slabs, and any
+/// collision chains); then the entries that are constant buffer views and
+/// views of placed memory (those that did not fit a record, or all of them
+/// with `VICTORY_VIEW_INLINE=0`), the shapes of placed views kept, and the
+/// views named whole in their records since the start: constant buffer views,
+/// views of placed memory. Both the summary and the per-kind slot counts come
+/// from the same read lock.
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn views_kept() -> ([u64; 8], [ViewKindUsage; 6]) {
     use std::sync::atomic::Ordering::Relaxed;
-    let views = views_read();
+    let views = VIEWS.read_state();
     let each = size_of::<(View, u32)>() as u64;
     let shape = size_of::<Shape>() as u64;
+    let shapes_len = VIEWS.shapes.len() as u64;
+    let shapes_cap = VIEWS.shapes.allocated_slots() as u64;
+    let collision_entries: usize = views.shape_collisions.values().map(Vec::capacity).sum();
     let [constant, .., placed] = views.kind_usage;
     let summary = [
         views.list.len() as u64,
         views.free.len() as u64,
         views.list.capacity() as u64 * each
-            + views.index.len() as u64 * each * 3 / 2
-            + views.shapes.capacity() as u64 * shape
-            + views.shape_index.len() as u64 * size_of::<(u64, u32)>() as u64 * 3 / 2,
+            + views.index.capacity() as u64 * (each + 1)
+            + shapes_cap * shape
+            + views.shape_index.capacity() as u64 * (size_of::<(ShapeKey, u32)>() as u64 + 1)
+            + collision_entries as u64 * size_of::<u32>() as u64,
         constant.occupied + constant.free,
         placed.occupied + placed.free,
-        views.shapes.len() as u64,
+        shapes_len,
         NAMED_WHOLE[0].load(Relaxed),
         NAMED_WHOLE[1].load(Relaxed),
     ];
@@ -1670,36 +2089,13 @@ pub(crate) fn forget(resource: usize) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&resource);
-    let mut views = views_write();
-    let Some(entries) = views.by_resource.remove(&resource) else {
-        return;
-    };
-    for i in entries {
-        let (view, generation) = views.list[i as usize].clone();
-        // Entries freed through a view's other resource may hold another
-        // view by now.
-        if views.index.get(&view) != Some(&i) || !view.resources().contains(&resource) {
-            continue;
-        }
-        // The view's other resource (a counter) keeps a stale entry, which
-        // `forget` of that resource skips.
-        views.free_entry(i, &view, generation);
-    }
+    VIEWS.forget_resource(resource);
 }
 
 /// The view the record words `i` and `generation` name: the one they hold
 /// whole, or the view of entry `i` if `generation` is still its own.
 fn view_at(i: u32, generation: u32) -> Option<View> {
-    match generation >> KIND_SHIFT {
-        0 => {
-            let views = views_read();
-            let (view, current) = views.list.get(i as usize)?;
-            (*current == generation).then(|| view.clone())
-        }
-        CONSTANT => Some(constant_of(i, generation)),
-        PLACED => views_read().placed_of(i, generation),
-        _ => None,
-    }
+    VIEWS.view_at(i, generation)
 }
 
 /// The words of the record at `handle`, if they are a view's.

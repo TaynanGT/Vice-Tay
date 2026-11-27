@@ -156,6 +156,38 @@ pub fn pool_check_code() -> Vec<u8> {
     c
 }
 
+/// +0x247ad45, the size of the back buffers' pool when the title runs as a
+/// Series S: `mov eax, 82 MiB` (then `mov ecx, 64 MiB` for a Series X and
+/// `cmovne rcx, rax` on the console test before them). The pool is sized for
+/// the Series S output; at 2560x1440 its allocator (+0x56a2ae0) ran past the
+/// end and stopped on its `int3` (+0x56a2afd, from +0x247aeb6) before the
+/// first frame (#212).
+pub const SERIES_S_POOL: Site = Site {
+    at: 0x247ad45,
+    what: "Series S back buffer pool's size",
+    bytes: &[0xb8, 0x00, 0x00, 0x20, 0x05],
+};
+
+/// The Series S pool's size, in bytes, for an output of `w` x `h`: as it is
+/// (82 MiB) up to 1920x1080, else 16 bytes more for every pixel past
+/// 1920x1080 (twice the 7.5 a pixel the Series X pool's left-over gives at
+/// 3840x2160 and 1920x1080), on 2 MiB: 108 MiB at 2560x1440, 178 MiB at
+/// 3840x2160. `None` where the title's own size holds.
+pub fn series_s_pool_bytes(w: u32, h: u32) -> Option<u32> {
+    const BASE: u64 = 82 << 20;
+    const STEP: u64 = 2 << 20;
+    let extra = (u64::from(w) * u64::from(h)).checked_sub(1920 * 1080).filter(|&p| p > 0)?;
+    let bytes = (BASE + extra * 16).div_ceil(STEP) * STEP;
+    u32::try_from(bytes).ok()
+}
+
+/// What goes at [`SERIES_S_POOL`]: `mov eax, <bytes>`.
+pub fn series_s_pool_code(bytes: u32) -> Vec<u8> {
+    let mut c = vec![0xb8];
+    c.extend_from_slice(&bytes.to_le_bytes());
+    c
+}
+
 /// The title's own upscaler, its method +0x28f1e70: `mov dword [rcx+90h],
 /// 2/3` (the scale +0x7e9440 renders at).
 pub const OWN_SCALE: Site = Site {
@@ -324,8 +356,22 @@ pub unsafe fn apply_asked(base: usize, size: usize) {
             asked.push((&OUTPUT, code, value));
         } else {
             asked.push((&OUTPUT, output_code(w, h), format!("{w}x{h}")));
-            if (w, h) != (3840, 2160) {
+            // A larger Series S pool leaves more than the check allows at
+            // 3840x2160 too, so the check goes with it.
+            // VICTORY_SERIES_S_POOL_MB=<n> sizes it by hand (to find the room
+            // another output needs).
+            let pool = std::env::var("VICTORY_SERIES_S_POOL_MB")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .filter(|mb| (82..=1024).contains(mb))
+                .map(|mb| mb << 20)
+                .or_else(|| series_s_pool_bytes(w, h));
+            if (w, h) != (3840, 2160) || pool.is_some() {
                 asked.push((&POOL_CHECK, pool_check_code(), format!("{w}x{h}")));
+            }
+            if let Some(bytes) = pool {
+                let value = format!("{} MiB for {w}x{h}", bytes >> 20);
+                asked.push((&SERIES_S_POOL, series_s_pool_code(bytes), value));
             }
             if viewbox::requested((w, h), std::env::var_os("VICTORY_UI_VIEWBOX").as_deref()) {
                 asked.push((&viewbox::SITE, viewbox::FITTED.to_vec(), format!("{w}x{h}")));
@@ -431,6 +477,21 @@ mod tests {
         assert!(changed.iter().all(|&i| (0x2c..0x30).contains(&i) || (0x36..0x3a).contains(&i) || (0x64..0x68).contains(&i)));
         assert_eq!(picker_code(7), [0xb8, 7, 0, 0, 0, 0xc3]);
         assert_eq!(pool_check_code(), [0x48, 0x3d, 0xff, 0xff, 0x1f, 0x00, 0xeb, 0x01]);
+    }
+
+    #[test]
+    fn the_series_s_pool_grows_only_past_its_own_output() {
+        for (w, h) in [(1280, 720), (1664, 936), (1920, 1080)] {
+            assert_eq!(series_s_pool_bytes(w, h), None, "{w}x{h} keeps 82 MiB");
+        }
+        assert_eq!(series_s_pool_bytes(2560, 1440), Some(108 << 20));
+        assert_eq!(series_s_pool_bytes(3840, 2160), Some(178 << 20));
+        // The code keeps the instruction's length and opcode; the old
+        // bytes are the title's 82 MiB.
+        let code = series_s_pool_code(108 << 20);
+        assert_eq!(code.len(), SERIES_S_POOL.bytes.len());
+        assert_eq!(code, [0xb8, 0x00, 0x00, 0xc0, 0x06]);
+        assert_eq!(SERIES_S_POOL.bytes[1..], (82u32 << 20).to_le_bytes());
     }
 
     #[cfg(windows)]

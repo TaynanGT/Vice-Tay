@@ -11,7 +11,7 @@
 # -Fsr4K        PC FidelityFX at 3840x2160 (quality, balanced or performance)
 # -Dlss4K       NVIDIA DLSS at 3840x2160 (quality, balanced or performance); FSR if it cannot start
 # -Build        target\diag (the default, the build all measurements are of) or target\release
-# -Machine      auto (the default: by the graphics card), 7900xtx, 4070, 4090 or laptop
+# -Machine      auto (the default: by the graphics card), 7900xtx, 4070, 4070tisuper, 4090 or laptop
 #               (laptop: an NVIDIA PC with 16 GB of RAM and a 6-8 GB card, docs/laptop-16gb.md)
 # -More         other settings: -More @{VICTORY_PANEL='1'} or -More @{VICTORY_AMBIENT='1.0'}
 # On a smaller NVIDIA PC, compare the same Series S scene after a fresh start
@@ -32,7 +32,7 @@ param(
     [ValidateSet('quality', 'balanced', 'performance')][string]$Fsr4K,
     [ValidateSet('quality', 'balanced', 'performance')][string]$Dlss4K,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
-    [ValidateSet('auto', '7900xtx', '4070', '4090', 'laptop')][string]$Machine = 'auto',
+    [ValidateSet('auto', '7900xtx', '4070', '4070tisuper', '4090', 'laptop')][string]$Machine = 'auto',
     [hashtable]$More = @{}
 )
 $settings = @{
@@ -47,8 +47,9 @@ $controllers = @(if ($Machine -in 'auto', '7900xtx') {
 })
 $hasNvidia = [bool]($controllers.PNPDeviceID -match 'VEN_10DE')
 if ($Machine -eq 'auto') {
-    # Use the existing vendor defaults. The 4070 / 7800X3D profile is explicit.
-    $Machine = if ($hasNvidia) { '4090' } else { '7900xtx' }
+    # Use the existing vendor defaults. The 4070 / 7800X3D profile is explicit; the
+    # RTX 4070 Ti SUPER (16 GB) gets its own profile by name.
+    $Machine = if ($controllers.Name -match 'RTX 4070 Ti SUPER') { '4070tisuper' } elseif ($hasNvidia) { '4090' } else { '7900xtx' }
 }
 if ($Machine -eq '7900xtx') {
     # i9-12900K, RX 7900 XTX, 64 GB: the page-mapping lock was fastest with one
@@ -94,6 +95,22 @@ if ($Machine -eq '4070') {
         $settings.VICTORY_CARD_RESERVE_BUDGETS = '1'
         $settings.VICTORY_CARD_BUFFERS_MIN_KB = '64'; $settings.VICTORY_CARD_BUFFERS_MB = '1536'
         $settings.VICTORY_CARD_WINDOWS_MB = '1024'
+    }
+}
+if ($Machine -eq '4070tisuper') {
+    # RTX 4070 Ti SUPER (16 GB, DXGI budget about 15.3 GB), Ryzen 7 9850X3D (eight cores), 32 GB.
+    # The 4070 profile's threads and card budgets: doubling them (3 GB of buffer copies, 4 GB of
+    # windows) took the card from 6.8 to 9.3 GB in the prison walk with the same frames (median
+    # 30, p10 27.5) and 2.5 GB more private memory, since a card copy keeps its CPU side in RAM.
+    # What the 16 GB card can take instead is the windows themselves, with no CPU side:
+    # up to 4 GB of them in card memory the CPU maps. That needs Resizable BAR (the GPU upload
+    # heap); without it the setting does nothing and windows stay as on the 4070 profile.
+    $settings.VICTORY_THIN_THREADS = '8'; $settings.VICTORY_UNDER_THREADS = '6'; $settings.VICTORY_LAND_THREADS = '4'
+    $settings.VICTORY_MAP_THREADS = '1'; $settings.VICTORY_PIPELINE_WORKERS = '3'
+    if (-not $Safe) {
+        $settings.VICTORY_CARD_RESERVE_BUDGETS = '1'
+        $settings.VICTORY_CARD_BUFFERS_MIN_KB = '64'; $settings.VICTORY_CARD_BUFFERS_MB = '1536'
+        $settings.VICTORY_CARD_WINDOWS_MB = '1024'; $settings.VICTORY_WINDOWS_BAR_MB = '4096'
     }
 }
 if ($Machine -eq 'laptop') {

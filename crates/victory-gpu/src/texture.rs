@@ -113,6 +113,9 @@ struct Last {
     /// first checks, and after the hash found a change the guard had not
     /// seen ([`hot_textures`]). 0: not checked under the guard yet.
     hot_until: u64,
+    /// The frame it was read in ahead of its submission
+    /// ([`Staging::refresh_ahead`]).
+    ahead: Option<u64>,
 }
 
 impl Last {
@@ -1430,15 +1433,17 @@ impl Staging {
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let frame = crate::frame::current();
+            let stale_ahead = last.ahead.is_none_or(|at| frame > at + 1);
             let turn = frame
                 .wrapping_add((start >> 16) as u64)
-                .is_multiple_of(HASH_EVERY);
+                .is_multiple_of(HASH_EVERY)
+                && stale_ahead;
             // A texture starts hot: one written that way from its first
             // frames on changes before the hash has ever caught it.
             if last.hot_until == 0 {
                 last.hot_until = frame + HOT_FRAMES;
             }
-            let hot = hot_textures() && frame < last.hot_until;
+            let hot = hot_textures() && frame < last.hot_until && stale_ahead;
             if !exact && unwritten && !turn && !hot {
                 return 0;
             }
@@ -1534,6 +1539,46 @@ impl Staging {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size
+    }
+
+    /// Detiles the texture memory into the staging buffer ahead of the
+    /// submission, on the thread of `crate::heap_worker`: read through the
+    /// kernel, so that the runtime's remapping never waits for it, whole or
+    /// not at all (the submission then does it, as ever). False if it was
+    /// not read. What the title writes after this is found at submission
+    /// (unless `self.once`, which skips write-watching as `refresh_timed`
+    /// does).
+    pub(crate) fn refresh_ahead(&self) -> bool {
+        let size = self.read;
+        let start = self.memory as usize;
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        let last = &mut *last;
+        if last.hash.is_some() || last.asked != 0 {
+            // Detiled before: the submission's check is cheap.
+            return true;
+        }
+        let alone = self.once.load(std::sync::atomic::Ordering::Relaxed);
+        let now = if alone {
+            0
+        } else {
+            let Some((now, _)) = crate::watch::writes(start, start + size, false)
+                .or_else(|| crate::watch::writes(start, start + size, true))
+            else {
+                return false;
+            };
+            now
+        };
+        with_read(size, |read| {
+            if !crate::host::read_into(self.memory, read) {
+                return false;
+            }
+            last.hash = Some(digest(read));
+            self.detile(read);
+            self.keep_whole(read);
+            last.asked = now;
+            last.ahead = Some(crate::frame::current());
+            true
+        })
     }
 
     /// A refresh while the runtime is remapping title memory ([`no_wait`]):

@@ -373,10 +373,30 @@ static NEW_PENDING: std::sync::LazyLock<Mutex<std::collections::HashSet<(usize, 
 /// Slots held back by [`show_new_later`] since the start.
 pub(crate) static NEW_LATER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// The submissions begun when the host texture `view` shows was made, if
-/// one begun before that may still run ([`crate::pool::begun_before`]). The
-/// host texture is made here if it is not yet, as [`make`] would.
-fn begun_before(view: &View) -> Option<u64> {
+thread_local! {
+    /// This thread is publishing an already-uploaded texture slot
+    /// ([`HostHeap::publish_uploaded_slot`] / [`HostHeap::publish_for_late`]):
+    /// `note_buffer` must not re-queue the slot in `TextureQueue`.
+    static PUBLISHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct PublishingGuard(bool);
+
+impl PublishingGuard {
+    fn enter() -> Self {
+        PublishingGuard(PUBLISHING.replace(true))
+    }
+}
+
+impl Drop for PublishingGuard {
+    fn drop(&mut self) {
+        PUBLISHING.set(self.0);
+    }
+}
+
+/// Resolves a texture view to its title resource and host texture, creating
+/// the host texture if it does not exist yet (as [`make`] would).
+fn texture_of_view<'a>(view: &View) -> Option<(crate::object::This, &'a ID3D12Resource)> {
     // (Resolved first: the texture made here, a moment ago, is the case.)
     let shader = match view {
         View::Placed(false, resource, _) if resource[0] != 1 => placed_texture(view)?,
@@ -386,8 +406,33 @@ fn begun_before(view: &View) -> Option<u64> {
     let View::Shader(resource, _) = shader else {
         return None;
     };
-    let texture = crate::resource::host_resource(resource as crate::object::This)?;
+    let resource = resource as crate::object::This;
+    let texture = crate::resource::host_resource(resource)?;
+    Some((resource, texture))
+}
+
+/// The submissions begun when the host texture `view` shows was made, if
+/// one begun before that may still run ([`crate::pool::begun_before`]). The
+/// host texture is made here if it is not yet, as [`make`] would.
+fn begun_before(view: &View) -> Option<u64> {
+    let (_, texture) = texture_of_view(view)?;
     crate::pool::begun_before(texture)
+}
+
+/// Deferred fence ceiling for a list-less (`same`-only) late publish,
+/// combining `VICTORY_SHOW_NEW_LATER` (`new_later`) and `VICTORY_SHOW_AFTER`
+/// (`show_after_on` with in-flight submissions and a fresh non-ahead texture).
+fn late_same_after(
+    new_later: Option<u64>,
+    show_after_on: bool,
+    submissions: (u64, u64),
+    fresh_not_ahead: impl FnOnce() -> bool,
+) -> Option<u64> {
+    let mut after = new_later;
+    if show_after_on && submissions.0 > submissions.1 && fresh_not_ahead() {
+        after = after.max(Some(submissions.0));
+    }
+    after
 }
 
 /// Slots shown late ([`show_after`]), the frames they waited, the longest;
@@ -2718,14 +2763,32 @@ impl HostHeap {
         Some((view, key))
     }
 
-    /// Exposes the real host descriptor for slot `index` after its synchronous
-    /// bake upload has completed on the GPU, updating `Spans`/stride tracking
-    /// without re-queuing the slot in `TextureQueue`.
+    /// Exposes the real host descriptor for slot `index` after its upload has
+    /// completed (or is ready to publish without `VICTORY_SHOW_AFTER` /
+    /// `VICTORY_SHOW_NEW_LATER`), updating `Spans`/stride tracking without
+    /// re-queuing the slot in `TextureQueue`.
     pub(crate) fn publish_uploaded_slot(&self, index: u32, handle: u64, key: u64) -> bool {
+        self.publish_uploaded_slot_with(index, handle, key, || {})
+    }
+
+    /// Key-pinned core of [`HostHeap::publish_uploaded_slot`]. Re-verifies
+    /// `record_key(handle) == key` under `self.made.lock(index)` and builds
+    /// the descriptor strictly from `key` (never re-reading `handle`).
+    fn publish_uploaded_slot_with(
+        &self,
+        index: u32,
+        handle: u64,
+        key: u64,
+        between_check_and_install: impl FnOnce(),
+    ) -> bool {
         if index >= self.count || key == 0 {
             return false;
         }
-        let (published, stale) = {
+        if record_key(handle) != key {
+            return false;
+        }
+        between_check_and_install();
+        let (published, stale, requeue) = {
             let _made = self.made.lock(index);
             if self.made.get(index) == Some(key) {
                 return false;
@@ -2736,20 +2799,156 @@ impl HostHeap {
             let Some(view) = view_at(key as u32, (key >> 32) as u32) else {
                 return false;
             };
-            let stale = self.note_buffer(index, Some(&view), true);
-            if let Some(kept) = make(&view, self.at(index)) {
-                self.put(index);
+            let stale = {
+                let _publishing = PublishingGuard::enter();
+                self.note_buffer(index, Some(&view), true)
+            };
+            let (kept, deferred) =
+                crate::residency::upload_deferred_during(|| make(&view, self.at(index)));
+            if let Some(kept) = kept {
                 self.quick_is(index, 0);
+                self.put(index);
                 self.clear_twin(index);
                 self.made.set(index, key);
                 self.keep(index, kept);
-                (true, stale)
+                self.quick_is(index, key);
+                (true, stale, false)
             } else {
-                (false, stale)
+                (false, stale, deferred)
             }
         };
+        if requeue {
+            self.queue_texture(index, true, false, crate::frame::current());
+        }
         self.unmake_stale(index, stale);
         published
+    }
+
+    /// Publishes an already-uploaded worker slot for a late submission
+    /// (`crate::heap_worker::take_ready_for_late`).
+    ///
+    /// Preserves `VICTORY_HELD_LEVELS=1` (`shows_other` mip-upgrade deferral
+    /// when `list` is `Some`), `VICTORY_SHOW_AFTER=1` (for both upload-list
+    /// batches and `same`-only batches without a list), and
+    /// `VICTORY_SHOW_NEW_LATER=1` (when earlier flights may still run on the
+    /// GPU) via `show_later` and `flip` / `FLIPS` instead of publishing
+    /// immediately. Never calls `mirror()` and never builds `View` by
+    /// re-reading `handle`.
+    pub(crate) fn publish_for_late(
+        &self,
+        list: Option<&crate::host::HostList>,
+        index: u32,
+        handle: u64,
+        key: u64,
+    ) -> bool {
+        if index >= self.count || key == 0 || record_key(handle) != key {
+            return false;
+        }
+        let Some(view) = view_at(key as u32, (key >> 32) as u32) else {
+            return false;
+        };
+        if let Some(worker_list) = list {
+            if !self.sampler
+                && crate::resource::held_only()
+                && let Some(shown) = self.made.get(index)
+                && shown != 0
+                && shown != key
+                && view_at(shown as u32, (shown >> 32) as u32)
+                    .is_some_and(|old| same_placed_texture(&old, &view))
+            {
+                self.flip(worker_list, index, handle, key, None);
+                return true;
+            }
+            if show_after() {
+                let shown = {
+                    let _publishing = PublishingGuard::enter();
+                    self.show_later(index, handle, key)
+                };
+                if shown {
+                    self.flip(worker_list, index, handle, key, Some(crate::frame::current()));
+                }
+                return shown;
+            }
+        }
+        let check_new_later = show_new_later();
+        let check_show_after = list.is_none() && show_after();
+        if !self.sampler && (check_new_later || check_show_after) && is_texture_view(&view) {
+            let ((after, from_new_later), allocation_deferred) =
+                crate::residency::upload_deferred_during(|| {
+                    let submissions = if check_show_after {
+                        crate::host::submissions()
+                    } else {
+                        (0, 0)
+                    };
+                    let check_fresh = check_show_after && submissions.0 > submissions.1;
+                    if !check_new_later && !check_fresh {
+                        return (None, false);
+                    }
+                    let Some((resource, texture)) = texture_of_view(&view) else {
+                        return (None, false);
+                    };
+                    let new_later = if check_new_later {
+                        crate::pool::begun_before(texture)
+                    } else {
+                        None
+                    };
+                    let after = late_same_after(new_later, check_show_after, submissions, || {
+                        crate::pool::fresh(texture) && !crate::texture::ahead::there(resource)
+                    });
+                    (after, new_later.is_some())
+                });
+            if allocation_deferred {
+                self.queue_texture(index, true, false, crate::frame::current());
+                return false;
+            }
+            if let Some(after) = after {
+                if let Some(worker_list) = list {
+                    let shown = {
+                        let _publishing = PublishingGuard::enter();
+                        self.show_later(index, handle, key)
+                    };
+                    if shown {
+                        self.flip(worker_list, index, handle, key, Some(crate::frame::current()));
+                        NEW_LATER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    return shown;
+                }
+                let own = (std::ptr::from_ref(self) as usize, index, key);
+                if !NEW_PENDING
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(own)
+                {
+                    return true;
+                }
+                let shown = {
+                    let _publishing = PublishingGuard::enter();
+                    self.show_later(index, handle, key)
+                };
+                if shown {
+                    let flip = Flip {
+                        after,
+                        heap: std::ptr::from_ref(self) as usize,
+                        index,
+                        handle,
+                        key,
+                        late: Some(crate::frame::current()),
+                        asked: crate::host::now_ms(),
+                    };
+                    FLIPS.lock().unwrap_or_else(|e| e.into_inner()).push(flip);
+                    if from_new_later {
+                        NEW_LATER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                } else {
+                    NEW_PENDING
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&own);
+                }
+                return shown;
+            }
+        }
+        self.publish_uploaded_slot(index, handle, key)
     }
 
     /// Makes the slots whose new view's upload has run
@@ -2951,6 +3150,9 @@ impl HostHeap {
     /// `texture`, whether it now holds a view of a texture the title may
     /// fill; `seen` as for [`HostHeap::note_buffer`].
     fn queue_texture(&self, index: u32, texture: bool, seen: bool, frame: u64) {
+        if PUBLISHING.get() {
+            return;
+        }
         let stamp = if tabled_out() { self.tabled_stamp(index) } else { 0 };
         let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
         // A table's slot lately: the draw that reads it uploads its
@@ -3810,6 +4012,12 @@ impl HostHeap {
     #[cfg(test)]
     pub(crate) fn made(&self, index: u32) -> bool {
         self.made.get(index).is_some_and(|key| key != 0)
+    }
+
+    /// The record key slot `index` is currently made from, or 0 (tests).
+    #[cfg(test)]
+    pub(crate) fn made_key(&self, index: u32) -> u64 {
+        self.made.get(index).unwrap_or(0)
     }
 
     /// Whether host slot `index` shows `buffer`; `None` if it shows no
@@ -6969,5 +7177,149 @@ mod bake_flip_tests {
         assert_eq!(cb1(), None);
         drop(cb2);
         assert!(take_pending_list_flip(id2).is_none(), "dropping uncalled closure cleans up entry");
+    }
+
+    /// Deterministic TOCTOU regression test: if the title replaces the slot's
+    /// record between the initial key check and descriptor installation,
+    /// `publish_uploaded_slot_with` rejects the publish and never exposes the
+    /// unuploaded replacement view.
+    #[test]
+    fn publish_rejects_slot_replaced_between_reads() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let view = |at: u64| {
+            let mut desc = [0u32; 16];
+            (desc[0], desc[1], desc[2], desc[5]) = (98, 4, 5768, 1);
+            (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
+            View::Placed(
+                false,
+                [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0],
+                desc,
+            )
+        };
+        let mut title = [0u32; 8];
+        let handle = title.as_mut_ptr() as u64;
+        crate::descriptor::record(handle, view(0x7fec_0000_0000));
+        let (first, key_a) = heap.prepare_texture_slot(1, handle).unwrap();
+        assert!(heap.note_buffer(1, Some(&first), false).is_empty());
+        let (index, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
+        assert_eq!(index, 1);
+        heap.texture_slot_done(1, write, None);
+        assert!(!heap.made(1));
+
+        let shown = heap.publish_uploaded_slot_with(1, handle, key_a, || {
+            crate::descriptor::record(handle, view(0x7feb_0000_0000));
+        });
+        let (_, key_b) = heap.prepare_texture_slot(1, handle).unwrap();
+        assert_ne!(key_a, key_b);
+        assert!(!shown);
+        assert!(!heap.made(1));
+        assert_eq!(heap.made_key(1), 0);
+        assert_ne!(heap.made_key(1), key_b);
+    }
+
+    /// A slot published after `texture_slot_done` stays out of `TextureQueue`
+    /// (`PUBLISHING` suppresses re-queueing in `note_buffer`), and a later
+    /// rewrite cannot be published under the stale key.
+    #[test]
+    fn published_slot_stays_out_of_texture_queue() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let view = |at: u64| {
+            let mut desc = [0u32; 16];
+            (desc[0], desc[1], desc[2], desc[5]) = (98, 4, 5768, 1);
+            (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
+            View::Placed(
+                false,
+                [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0],
+                desc,
+            )
+        };
+        let mut title = [0u32; 8];
+        let handle = title.as_mut_ptr() as u64;
+        crate::descriptor::record(handle, view(0x7fec_0000_0000));
+        let (first, key_a) = heap.prepare_texture_slot(1, handle).unwrap();
+        assert!(heap.note_buffer(1, Some(&first), false).is_empty());
+        let (index, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
+        assert_eq!(index, 1);
+        heap.texture_slot_done(1, write, None);
+        assert!(!heap.made(1));
+
+        assert!(heap.publish_uploaded_slot(1, handle, key_a));
+        assert!(heap.made(1));
+        assert_eq!(heap.made_key(1), key_a);
+        assert!(heap.texture_slots_due(u64::MAX, 8).0.is_empty());
+
+        crate::descriptor::record(handle, view(0x7feb_0000_0000));
+        assert!(!heap.publish_uploaded_slot(1, handle, key_a));
+        assert_eq!(heap.made_key(1), key_a);
+    }
+
+    #[test]
+    fn publish_for_late_same_after_combines_show_after_and_new_later() {
+        let mut probed = false;
+        assert_eq!(
+            late_same_after(None, false, (10, 8), || {
+                probed = true;
+                true
+            }),
+            None
+        );
+        assert!(!probed);
+        assert_eq!(late_same_after(None, true, (10, 10), || true), None);
+        assert_eq!(late_same_after(None, true, (10, 8), || false), None);
+        assert_eq!(late_same_after(None, true, (10, 8), || true), Some(10));
+        assert_eq!(late_same_after(Some(9), true, (10, 8), || true), Some(10));
+        assert_eq!(late_same_after(Some(12), true, (10, 8), || true), Some(12));
+        assert_eq!(late_same_after(Some(9), false, (10, 8), || true), Some(9));
+    }
+
+    /// Under `VICTORY_HELD_LEVELS=1` (default) and `VICTORY_SHOW_AFTER=0`
+    /// (default), a worker upload replacing a slot with another view of the
+    /// same placed texture (e.g. a sharper mip) defers via `flip(..., None)`
+    /// instead of overwriting the live descriptor immediately.
+    #[test]
+    fn publish_for_late_defers_shows_other_mip_upgrade() {
+        let Some(gpu) = host() else {
+            return;
+        };
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return;
+        };
+        let list = gpu.new_list().unwrap();
+        let view = |first_mip: u32, mip_levels: u32| {
+            let mut desc = [0u32; 16];
+            (desc[0], desc[1], desc[2], desc[4], desc[5]) = (98, 4, 5768, first_mip, mip_levels);
+            let at = 0x7fea_0000_0000u64;
+            (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
+            View::Placed(
+                false,
+                [3, 0, 0, 0, 64, 0, 64, 0x2_0001, 98, 1, 0, 0x105, 0, 0],
+                desc,
+            )
+        };
+        let coarse = view(1, 1);
+        let sharp = view(0, 2);
+        assert!(same_placed_texture(&coarse, &sharp));
+
+        let mut title = [0u32; 8];
+        let handle = title.as_mut_ptr() as u64;
+        crate::descriptor::record(handle, coarse);
+        let (_, key_coarse) = heap.prepare_texture_slot(1, handle).unwrap();
+        assert!(heap.publish_uploaded_slot(1, handle, key_coarse));
+        assert_eq!(heap.made_key(1), key_coarse);
+
+        crate::descriptor::record(handle, sharp);
+        let (_, key_sharp) = heap.prepare_texture_slot(1, handle).unwrap();
+        assert_ne!(key_coarse, key_sharp);
+
+        assert!(heap.publish_for_late(Some(&list), 1, handle, key_sharp));
+        assert_eq!(heap.made_key(1), key_coarse);
+        let pending = heap.take_pending_list_flips();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].key(), key_sharp);
+        assert!(pending[0].flip.late.is_none());
     }
 }

@@ -71,6 +71,18 @@ pub(crate) extern "system" fn add_ref(this: This) -> u32 {
     unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 
+/// Adds a reference to an object that has one; false if it has none any
+/// more (its last one is being released).
+#[cfg(windows)]
+pub(crate) fn add_ref_alive(this: This) -> bool {
+    // SAFETY: `this` is one of our objects, not freed yet.
+    let refs = &unsafe { &*this }.refs;
+    refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+        if n > 0 { n.checked_add(1) } else { None }
+    })
+    .is_ok()
+}
+
 pub(crate) extern "system" fn release(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
     let refs = &unsafe { &*this }.refs;
@@ -560,5 +572,19 @@ mod tests {
         );
         assert!(found.is_null());
         slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn add_ref_alive_rejects_zero_refcount() {
+        static TABLE: Table<0> = Table([]);
+        let object = Object::new(&TABLE);
+        let this: This = &object;
+        assert!(!add_ref_alive(this));
+        assert_eq!(add_ref(this), 1);
+        assert!(add_ref_alive(this));
+        assert_eq!(release(this), 1);
+        assert_eq!(release(this), 0);
+        assert!(!add_ref_alive(this));
     }
 }

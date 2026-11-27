@@ -619,6 +619,25 @@ mod tests {
         assert_eq!(image, before);
     }
 
+    #[test]
+    fn refusing_any_later_page_leaves_all_four_step_sites_unchanged() {
+        let mut image = [0u8; 32];
+        let before = image;
+        let sites: [(usize, &[u8], &[u8]); 4] = [(4, &[0], &[1]), (8, &[0], &[2]), (12, &[0], &[3]), (16, &[0], &[4])];
+        for fail_at in 2..=4 {
+            let mut calls = 0;
+            // SAFETY: all sites belong to the writable image owned by this test.
+            let result = unsafe {
+                write_all_with(image.as_mut_ptr() as usize, image.len(), &sites, |_, _| {
+                    calls += 1;
+                    if calls == fail_at { Err("refused") } else { Ok(()) }
+                })
+            };
+            assert_eq!(result, Err((fail_at - 1, Patched::Failed("refused"))));
+            assert_eq!(image, before);
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn cross_page_group_restores_protection_after_success_and_failure() {

@@ -74,6 +74,11 @@ How each of these was found, with the numbers:
   it on any console; an explicit `VICTORY_UPSCALER=<kind>` (6 or 7) always takes
   precedence and is written to both sites.
 
+- **Longer simulation step** (known build only): `-More @{VICTORY_MAX_STEP_MS='100'}`
+  raises the longest simulation step from about 66.7 ms. The switch is off by
+  default and accepts 66.7–333 ms. It can reduce slowdown at low frame rates.
+  At 5 FPS, a 100 ms cap still allows at most about half real-time simulation.
+
 ## Loading and the runtime
 
 - **DirectStorage**: a queue submits itself when it holds half its capacity, unless

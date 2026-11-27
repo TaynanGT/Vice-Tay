@@ -229,6 +229,41 @@ pub fn run(
         // SAFETY: the image stays mapped and nothing of it has run yet.
         unsafe { victory_loader::resolution::apply_asked(image.base(), size, upscaler_default) };
     }
+    // VICTORY_MAX_STEP_MS=<ms> (off without it): the title's longest
+    // simulation step (1/15 s) raised to reduce slowdown below
+    // 15 frames a second (victory-game's `step`). Only on the known build,
+    // every site compared first (all or nothing).
+    #[cfg(windows)]
+    if execute && let Ok(spec) = std::env::var("VICTORY_MAX_STEP_MS") {
+        match (victory_game::step::parse_ms(&spec), build) {
+            (Err(why), _) => eprintln!("VIctory: {why}; the title's step is left as it is"),
+            (Ok(_), None) => eprintln!("VIctory: VICTORY_MAX_STEP_MS: not a known build of the title; its step is left as it is"),
+            (Ok(ms), Some(_)) => {
+                let size = image.info().size_of_image as usize;
+                let patches = victory_game::step::patches(ms);
+                let sites: Vec<_> = patches
+                    .iter()
+                    .map(|(rva, old, new)| (*rva as usize, old.as_slice(), new.as_slice()))
+                    .collect();
+                // SAFETY: the image stays mapped and nothing of it has run yet.
+                match unsafe { victory_loader::resolution::write_all(image.base(), size, &sites) } {
+                    Ok(()) => {
+                        for (rva, old, new) in &patches {
+                            println!(
+                                "title patch    +{rva:#x} longest step {ms} ms (VICTORY_MAX_STEP_MS): {} -> {}",
+                                hex_str(old),
+                                hex_str(new)
+                            );
+                        }
+                        tracing::info!(ms, "title step: longest simulation step raised (VICTORY_MAX_STEP_MS)");
+                    }
+                    Err((index, why)) => {
+                        eprintln!("VIctory: VICTORY_MAX_STEP_MS: +{:#x} {why:?}; the title's step is left as it is", patches[index].0);
+                    }
+                }
+            }
+        }
+    }
     if !execute {
         println!("not executing (pass --execute to start the title)");
         return Ok(());
@@ -545,6 +580,12 @@ impl LoaderLock {
         }
         result
     }
+}
+
+/// Bytes as lower-case hex.
+#[cfg(windows)]
+fn hex_str(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Whether the known build's Series S upscaler choice applies, given

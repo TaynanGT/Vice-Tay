@@ -3938,6 +3938,7 @@ struct Sent {
     /// Its number among the submissions started.
     number: u64,
     card: Option<CardPlan>,
+    gpu_sync: Option<crate::gpu_sync::SubmissionPlan>,
     back: Vec<Declared>,
     /// What was taken off it to be done on the card.
     own: Option<card_steps::Taken>,
@@ -4002,6 +4003,7 @@ struct Flight {
     lists: Vec<crate::list::Detached>,
     order: Vec<usize>,
     card: Option<CardPlan>,
+    gpu_sync: Option<crate::gpu_sync::SubmissionPlan>,
     back: Vec<Declared>,
     /// The list of ours that ran ahead of them ([`card_steps`]).
     own: Option<card_steps::Taken>,
@@ -4656,6 +4658,53 @@ pub(crate) fn settle_for_fence() {
 #[cfg(feature = "diagnostics")]
 static LAND_RETIRE_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
+/// Settles all in-flight GPU work before title memory is freed (`VirtualFree` /
+/// `XMemFreeDefault`), drops `gone` synchronously while `host.submitted` is still
+/// held, and if `still_overlapping()` reports an already-evicted `gpu_sync` shadow
+/// still alive in `RETIRED`, drains ONLY matured entries (`*at <= FINISHED`, lag = 0)
+/// so queued unmatured entries (`*at > FINISHED`) are never dropped prematurely.
+///
+/// Must NEVER be called while `watch::is_changing()` (`MAPPING.write()`) is held.
+pub(crate) fn settle_and_release_for_memory_free<T, F>(gone: T, mut still_overlapping: F)
+where
+    F: FnMut() -> bool,
+{
+    let Some(host) = host() else {
+        drop(gone);
+        return;
+    };
+    let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+    if late() {
+        host.settle(&mut submitted, WHY_SYNC);
+    }
+    let target = *submitted;
+    if target > 0 {
+        // SAFETY: `host.fence` and `host.event` belong to `host`; `submitted` lock held.
+        unsafe {
+            if host.fence.GetCompletedValue() < target
+                && host.fence.SetEventOnCompletion(target, host.event).is_ok()
+            {
+                WaitForSingleObject(host.event, INFINITE);
+            }
+        }
+    }
+    drop(gone);
+    if still_overlapping() {
+        let finished = FINISHED.load(Ordering::Acquire);
+        for part in &RETIRED {
+            let done: Vec<(u64, Retired)> = {
+                let mut retired = part.lock().unwrap_or_else(|e| e.into_inner());
+                let n = retired.iter().take_while(|(at, _)| *at <= finished).count();
+                if n == 0 {
+                    continue;
+                }
+                retired.drain(..n).collect()
+            };
+            drop(done);
+        }
+    }
+}
+
 /// Resets the host lists of settled flights and keeps them for reuse, as
 /// a queue does for the lists it ran (`crate::list::recycle`), [`bury_lag`]
 /// flights after they landed. `settle` already releases each flight's dynamic
@@ -5022,7 +5071,7 @@ struct RelayBack {
 fn relay_hand_back(back: &[Declared]) -> RelayBack {
     let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
     for (shadow, declared) in back {
-        if shadow.carded() {
+        if shadow.carded() || shadow.gpu_synced() {
             continue;
         }
         let mut spans: Vec<(usize, usize)> = Vec::new();
@@ -5552,7 +5601,7 @@ fn hand_back(back: &[Declared]) {
         // threads), then the merges, in order, as below.
         let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
         for (shadow, declared) in back {
-            if shadow.carded() {
+            if shadow.carded() || shadow.gpu_synced() {
                 continue;
             }
             let mut sorted = declared.clone();
@@ -5583,8 +5632,8 @@ fn hand_back(back: &[Declared]) {
         return;
     }
     for (shadow, declared) in back {
-        if shadow.carded() {
-            // Done before (`Host::card_back`).
+        if shadow.carded() || shadow.gpu_synced() {
+            // Done before (`Host::card_back` / `crate::gpu_sync`).
             shadow.copy_back_done(declared);
             continue;
         }
@@ -6547,12 +6596,12 @@ impl Host {
     /// then, in the line's order, each flight's read-backs, its
     /// bottom-of-pipe writes and the fence signals behind it. Title memory
     /// is complete before the title is told anything.
-    fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>, texture_scratch: &mut crate::texback::Scratch) {
+    fn relay_land(&self, mut items: Vec<Late>, fetch: &mut Option<RelayFetch>, texture_scratch: &mut crate::texback::Scratch) {
         let landing = std::time::Instant::now();
         let mut stage = crate::timeline::span("landing: what is to be looked through");
         {
-            let flights: Vec<&Flight> = items
-                .iter()
+            let mut flights: Vec<&mut Flight> = items
+                .iter_mut()
                 .filter_map(|l| match l {
                     Late::Run(flight) => Some(flight),
                     _ => None,
@@ -6575,7 +6624,7 @@ impl Host {
                 // (Each byte once: the ranges are joined.)
                 let mut back: Vec<Declared> = Vec::new();
                 for flight in &flights {
-                    for (shadow, ranges) in flight.back.iter().filter(|(shadow, _)| !shadow.carded()) {
+                    for (shadow, ranges) in flight.back.iter().filter(|(shadow, _)| !shadow.carded() && !shadow.gpu_synced()) {
                         match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
                             Some((_, all)) => all.extend_from_slice(ranges),
                             None => back.push((shadow.clone(), ranges.clone())),
@@ -6590,9 +6639,15 @@ impl Host {
                         hand_back.look(crate::land::stat::SCAN_BESIDE);
                     }
                 });
+                for flight in &mut flights {
+                    if let Some(gs) = flight.gpu_sync.take() {
+                        crate::gpu_sync::finish_submission(self, gs);
+                    }
+                }
                 stage.next("landing: copies in the PC's memory");
                 hand_back.merge();
-                if Self::landed_touches_shader_heap(&flights) {
+                let flights_ref: Vec<&Flight> = flights.iter().map(|f| &**f).collect();
+                if Self::landed_touches_shader_heap(&flights_ref) {
                     crate::port_journal::prep_wrote();
                 }
                 stage.next("landing: ranges done with");
@@ -6941,6 +6996,7 @@ impl Host {
                 lists,
                 order,
                 card: sent.card,
+                gpu_sync: sent.gpu_sync,
                 back: sent.back,
                 own: sent.own,
                 texture_back_ranges: sent.texture_back_ranges,
@@ -7008,6 +7064,7 @@ impl Host {
                 lists: Vec::new(),
                 order: Vec::new(),
                 card: sent.card,
+                gpu_sync: sent.gpu_sync,
                 back: sent.back,
                 own: sent.own,
                 texture_back_ranges: sent.texture_back_ranges,
@@ -7052,7 +7109,7 @@ impl Host {
         let mut counted = false;
         let mut texture_scratch = crate::texback::Scratch::default();
         loop {
-            let items = {
+            let mut items = {
                 let mut line = line();
                 if line.line.is_empty() {
                     line.settling = false;
@@ -7119,12 +7176,15 @@ impl Host {
                 let copying = std::time::Instant::now();
                 let mut seen = std::collections::HashSet::new();
                 let mut back: Vec<Declared> = Vec::new();
-                for item in &items {
+                for item in &mut items {
                     let Late::Run(flight) = item else {
                         continue;
                     };
                     if let Some(card) = &flight.card {
                         self.card_back(card, submitted, &mut seen);
+                    }
+                    if let Some(gs) = flight.gpu_sync.take() {
+                        crate::gpu_sync::finish_submission(self, gs);
                     }
                     for (shadow, ranges) in &flight.back {
                         match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
@@ -7286,8 +7346,13 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         ahead.part(12);
         stage.next("submit: waiting for flights it reads from");
-        if !late {
+        if !late || (crate::gpu_sync::on() && crate::gpu_sync::needs_settle()) {
+            let gs_wait = crate::gpu_sync::on() && crate::gpu_sync::needs_settle();
+            let wait_t0 = gs_wait.then(std::time::Instant::now);
             self.settle(&mut submitted, WHY_SYNC);
+            if let Some(t0) = wait_t0 {
+                crate::gpu_sync::note_fence_wait_us(t0.elapsed().as_micros() as u64);
+            }
         } else if own.is_none()
             && let Some(why) = late_blocked(runs)
         {
@@ -7490,21 +7555,47 @@ impl Host {
         }
         let declared = declared_writes(runs);
         let card = self.card_before(&declared, &picked, flown);
+        let mut gpu_sync = if crate::gpu_sync::on() {
+            let sync_declared = crate::picked::with(declared.clone(), &picked.written);
+            crate::gpu_sync::prepare_submission(self, &sync_declared, &batch.placed)
+        } else {
+            None
+        };
         // The sends are taken: from here on the references hold what the
         // copies in the lists put.
-        for (shadow, at, bytes) in batch.placed.drain(..) {
-            shadow.placed_copy(at, &bytes);
+        for placed in batch.placed.drain(..) {
+            placed.shadow.placed_copy(placed.at, &placed.bytes);
         }
         // Buffers decay to COMMON between ExecuteCommandLists calls. The
         // compare must start a new call in case a title list promoted one
         // to COPY_DEST. The trailing GPU timestamps still cover it.
-        let compare_at = card.as_ref().and_then(|c| c.check.clone()).map(|check| {
+        let mut compare_at = card.as_ref().and_then(|c| c.check.clone()).map(|check| {
             let at = lists.len();
             #[cfg(feature = "diagnostics")]
             marks.push((at, crate::copystat::Timed::Compare));
             lists.push(Some(check));
             at
         });
+        if let Some(post) = gpu_sync.as_ref().and_then(|g| g.post_list.clone()) {
+            let at = lists.len();
+            #[cfg(feature = "diagnostics")]
+            marks.push((at, crate::copystat::Timed::Compare));
+            lists.push(Some(post));
+            compare_at.get_or_insert(at);
+        }
+        // Splice `gpu_sync.pre_list` directly at the front of `lists` so upload/Init
+        // executes in the same submission batch without an extra `ExecuteCommandLists`
+        // call (`pre_list` transitions every modified buffer back to `COMMON` at end).
+        if let Some(pre) = gpu_sync.as_ref().and_then(|g| g.pre_list.clone()) {
+            lists.insert(0, Some(pre));
+            #[cfg(feature = "diagnostics")]
+            {
+                marks.iter_mut().for_each(|m| m.0 += 1);
+                marks.insert(0, (0, crate::copystat::Timed::Prelude));
+            }
+            firsts.iter_mut().for_each(|first| *first += 1);
+            compare_at = compare_at.map(|at| at + 1);
+        }
         #[cfg(feature = "diagnostics")]
         split.part(4);
         stage.next("submit: waiting for the heaps' records");
@@ -7561,6 +7652,9 @@ impl Host {
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
+            if let Some(gs) = gpu_sync.as_mut() {
+                gs.note_submitted();
+            }
             mark_frame_preparations(runs);
             #[cfg(feature = "diagnostics")]
             split.part(5);
@@ -7577,6 +7671,7 @@ impl Host {
             let sent = Sent {
                 number: this_submission,
                 card,
+                gpu_sync,
                 back,
                 own,
                 texture_back_ranges,
@@ -7632,7 +7727,11 @@ impl Host {
                         working(false);
                         #[cfg(feature = "diagnostics")]
                         let _card = crate::timeline::card_wait(Some(*submitted));
+                        let wait_t0 = std::time::Instant::now();
                         WaitForSingleObject(self.event, INFINITE);
+                        if gpu_sync.is_some() {
+                            crate::gpu_sync::note_fence_wait_us(wait_t0.elapsed().as_micros() as u64);
+                        }
                         stood(started);
                         working(true);
                     }
@@ -7669,6 +7768,9 @@ impl Host {
                     tracing::warn!("slow list command, {ms:.1} ms: {op}");
                 }
             }
+        }
+        if let Some(gs) = gpu_sync.as_mut() {
+            gs.note_submitted();
         }
         mark_frame_preparations(runs);
         let _ = &firsts;
@@ -7710,6 +7812,9 @@ impl Host {
         // pieces that differ are fetched and merged.
         if let Some(card) = &card {
             self.card_back(card, &mut submitted, &mut std::collections::HashSet::new());
+        }
+        if let Some(gs) = gpu_sync {
+            crate::gpu_sync::finish_submission(self, gs);
         }
         let back = crate::picked::with(declared, &picked.written);
         hand_back(&back);
@@ -9304,8 +9409,20 @@ impl HostList {
                     if free {
                         batch.title_written(TitleWrite::PlacedCopy);
                     }
+                    let pre_bytes = if free && p.shadow.gpu_synced() {
+                        let mut prev = vec![0u8; p.len];
+                        copy_mapped(prev.as_mut_ptr(), p.dst as *const u8, p.len, false);
+                        Some(prev)
+                    } else {
+                        None
+                    };
                     if let Some(bytes) = p.prepare(free) {
-                        batch.placed.push((p.shadow.clone(), p.dst, bytes));
+                        batch.placed.push(crate::gpu_sync::PlacedCopy {
+                            shadow: p.shadow.clone(),
+                            at: p.dst,
+                            bytes,
+                            pre_bytes,
+                        });
                     }
                     // Raise the floor after `prepare` wrote title memory (non-free
                     // placed copies land via GPU copy-back and raise the floor there).
@@ -9644,8 +9761,9 @@ struct Batch {
     /// Those due ([`Batch::refresh_textures`]).
     due: Vec<std::sync::Arc<crate::texture::Staging>>,
     /// What copies at their place in the submission's lists put into title
-    /// memory ([`place`]): the host copy, the title address, the bytes.
-    placed: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, Vec<u8>)>,
+    /// memory ([`place`]): the host copy, the title address, the bytes (and
+    /// pre-copy bytes for `gpu_sync` shadows).
+    placed: Vec<crate::gpu_sync::PlacedCopy>,
     /// Fills not done yet (destination, source, bytes): [`wide_fills`].
     fills: Vec<(usize, usize, usize)>,
     /// Copies (by address) brought up to date ahead of the steps, and the

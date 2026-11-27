@@ -630,8 +630,15 @@ impl Recorder {
                 lock(&self.states).remove(id);
                 lock(&self.names).remove(&id);
             }
-            Gone::List { ptr } => {
-                write(&self.lists).remove(&ptr);
+            Gone::List { ref pointers } => {
+                let state = {
+                    let mut lists = write(&self.lists);
+                    pointers.iter().filter_map(|ptr| lists.remove(ptr)).last()
+                };
+                if let Some(state) = state {
+                    // Shims keep their state address, but a dead list's recording can go.
+                    *lock(&state.inner) = ListInner::default();
+                }
             }
             Gone::Heap { id, ptr } => {
                 self.ids.remove(ptr, id);
@@ -762,7 +769,7 @@ impl pso::Keep for Keeper<'_> {
 /// Which object died.
 enum Gone {
     Resource { id: u32, ptr: usize, va: u64 },
-    List { ptr: usize },
+    List { pointers: Vec<usize> },
     Heap { id: u32, ptr: usize },
 }
 
@@ -1306,13 +1313,14 @@ unsafe extern "system" fn create_list(
                 iids.iter()
                     .all(|iid| query(p, iid).is_none_or(|q| q.as_raw() == p))
             });
-            let mut all = vec![p];
+            let mut pointers = vec![p as usize];
             if !same {
-                all.extend(
-                    iids.iter()
-                        .filter_map(|iid| query(p, iid))
-                        .map(|q| q.as_raw()),
-                );
+                for q in iids.iter().filter_map(|iid| query(p, iid)) {
+                    let ptr = q.as_raw() as usize;
+                    if !pointers.contains(&ptr) {
+                        pointers.push(ptr);
+                    }
+                }
             }
             {
                 let mut inner = lock(&state.inner);
@@ -1320,15 +1328,13 @@ unsafe extern "system" fn create_list(
                     r.armed.load(Ordering::SeqCst) && kind == D3D12_COMMAND_LIST_TYPE_DIRECT;
                 begin(&mut inner, r, pso);
             }
-            for q in all {
+            for &ptr in &pointers {
                 // The state's address is kept for good, as the table is.
-                hook::install(q, Arc::into_raw(state.clone()).cast(), list_table);
-                write(&r.lists).insert(q as usize, state.clone());
-                r.tell_gone(
-                    &*borrow::<ID3D12CommandList>(q),
-                    Gone::List { ptr: q as usize },
-                );
+                hook::install(ptr as Ptr, Arc::into_raw(state.clone()).cast(), list_table);
+                write(&r.lists).insert(ptr, state.clone());
             }
+            // The interfaces share private data, so one notice must cover the whole list.
+            r.tell_gone(&*borrow::<ID3D12CommandList>(p), Gone::List { pointers });
         }
         hr
     }
@@ -2733,6 +2739,38 @@ const _: () = assert!(ALL == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_destroyed_list_releases_its_recording() {
+        let folder = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(Settings {
+            folder: folder.path().into(),
+            at: At::Trigger,
+            frames: 1,
+            always: true,
+        })
+        .unwrap();
+        let commands = Arc::new(vec![42]);
+        let state = Arc::new(ListState {
+            kind: D3D12_COMMAND_LIST_TYPE_DIRECT.0,
+            inner: Mutex::new(ListInner {
+                closed: Some((Some(commands.clone()), Arc::default())),
+                ..ListInner::default()
+            }),
+        });
+        write(&recorder.lists).insert(1, state.clone());
+        write(&recorder.lists).insert(2, state.clone());
+
+        recorder.gone(&Gone::List {
+            pointers: vec![1, 2],
+        });
+
+        assert!(!recorder.knows(1 as Ptr));
+        assert!(!recorder.knows(2 as Ptr));
+        assert!(state.closed().is_none());
+        assert_eq!(Arc::strong_count(&commands), 1);
+        assert_eq!(commands.as_slice(), [42]);
+    }
 
     #[test]
     fn when_to_record() {

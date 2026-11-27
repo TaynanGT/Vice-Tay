@@ -3288,7 +3288,7 @@ impl HostHeap {
     }
 
     /// What slot `index` views.
-    fn kept_in(&self, index: u32) -> Option<ID3D12Resource> {
+    pub(crate) fn kept_in(&self, index: u32) -> Option<ID3D12Resource> {
         self.kept.get(index as usize)?.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
@@ -4689,6 +4689,9 @@ fn make_twinned(
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
+            if address == 0 || size == 0 {
+                return None;
+            }
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
             if crate::port_cbv::on() {

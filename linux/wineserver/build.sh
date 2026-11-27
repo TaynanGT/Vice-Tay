@@ -58,14 +58,17 @@ fi
 [ -n "${OUT:-}" ] || { echo "no Steam folder found for the copy; set OUT=/path/to/compatibilitytools.d/$TAG-viewtree"; exit 1; }
 # Never write into the source Proton: OUT must resolve to a folder of its own,
 # neither GE's folder nor one inside it (nor one containing it).
-GE_REAL=$(realpath -e "$GE")
-OUT_REAL=$(realpath -m "$OUT")
-case "$OUT_REAL/" in
-    "$GE_REAL/"*) echo "OUT ($OUT) resolves into the source Proton ($GE_REAL); choose another folder"; exit 1 ;;
+GE_REAL=$(realpath -e -- "$GE")
+OUT_REAL=$(realpath -m -- "$OUT")
+case "${OUT_REAL%/}/" in
+    "${GE_REAL%/}/"*) echo "OUT ($OUT) resolves into the source Proton ($GE_REAL); choose another folder"; exit 1 ;;
 esac
-case "$GE_REAL/" in
-    "$OUT_REAL/"*) echo "OUT ($OUT) contains the source Proton ($GE_REAL); choose another folder"; exit 1 ;;
+case "${GE_REAL%/}/" in
+    "${OUT_REAL%/}/"*) echo "OUT ($OUT) contains the source Proton ($GE_REAL); choose another folder"; exit 1 ;;
 esac
+# Keep using the validated paths after changing to the Wine build directory.
+GE=$GE_REAL
+OUT=$OUT_REAL
 # An existing copy must be of the same Proton.
 if [ -e "$OUT" ] && [ "$(version_of "$OUT")" != "$TAG" ]; then
     echo "$OUT exists but its version file does not say $TAG; remove it or set OUT elsewhere"

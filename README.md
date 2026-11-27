@@ -35,12 +35,6 @@ The playtest logged a 17.0 FPS 1% low, a measure of its slowest frames, and peak
 
 </details>
 
-### Additional stability observation
-
-An RTX 5070 (12 GB) diagnostic session ran for **1 hour 47 minutes 54 seconds** from startup to manual close, with no observed crash. This used a local integration build based on `2dd3479` plus `perf/watch-ask-rest` (`755dc92`) and `perf/preserve-raw-copy-watch` (`e11801e`), with a 1,152 MiB card-buffer cap.
-
-The retained local log contains one launch, renderer submission reports throughout the session, and an explicit manual-close event followed by title termination. The duration includes startup/loading and may include menus or idle time; it is not a measurement of uninterrupted active gameplay. This is a single-session stability observation on a local build, separate from the RTX 4090 performance measurements above. No comparable FPS, frame-time or general stability claim is made.
-
 ## Gameplay
 
 Checkpoint retries worked after the boat ran aground. The HUD, minimap, mission prompts and pause menu were usable along the route.

@@ -62,3 +62,14 @@ and is left out of conclusions (README, Known problems).
 | Series S | 94 | 23.5 / 24.1 | 27.4 | 8.8 | 86.0 | 134.5 | 49.6 | 2760.0 | 624 |
 
 CPU seconds per minute: the game's CPU time over all its threads; 60 is one core busy all the time.
+
+## RTX 5070 session observation
+
+t90 recorded a session lasting 1 hour, 47 minutes and 54 seconds from launch
+through manual close on an RTX 5070 (12 GB). The diagnostics build combined
+`2dd3479`, `755dc92` and `e11801e` locally and used a 1,152 MiB card-buffer cap.
+
+The log contains 6,322 renderer submission reports, with a maximum gap of
+3.457 seconds between reports. The elapsed time includes startup and loading
+and may include menu or idle time. It describes this session's continuity.
+[Contributor report](https://github.com/TaynanGT/Vice-Tay/pull/240)

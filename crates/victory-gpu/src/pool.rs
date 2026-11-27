@@ -389,8 +389,11 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
         // Only gate speculative bindless prefetch on staging-pool growth
         // headroom; table-bound textures and decoration bakes are sampled
         // immediately and would otherwise read uninitialized/reused VRAM.
-        let speculative = crate::texture::PICKING.get().is_some() && !crate::texture::BAKING.get();
-        if speculative && !crate::residency::allow_staging_growth(false) {
+        let speculative = crate::residency::speculative_upload(
+            crate::texture::PICKING.get().is_some(),
+            crate::texture::BAKING.get(),
+        );
+        if speculative && !crate::residency::allow_staging_growth(BLOCK, false) {
             return None;
         }
         let (buffer, data) = host.upload_buffer(BLOCK)?;
@@ -767,6 +770,22 @@ mod tests {
         }
         assert_eq!(calls.get(), 1);
         assert!(pool.take(24080, 512, 1012, || Some(1)).is_some());
+    }
+
+    #[test]
+    fn existing_staging_space_is_reused_before_a_new_block_is_made() {
+        let mut pool: Pool<u32> = Pool::new(2);
+        let calls = std::cell::Cell::new(0);
+        let make = || {
+            calls.set(calls.get() + 1);
+            Some(calls.get())
+        };
+        assert!(pool.take(BLOCK / 2, 512, 0, make).is_some());
+        assert!(pool.take(BLOCK / 2, 512, 0, make).is_some());
+        assert_eq!(calls.get(), 1);
+        assert!(pool.take(BLOCK / 2, 512, 0, make).is_some());
+        assert_eq!(calls.get(), 2);
+        assert_eq!(pool.blocks(), 2);
     }
 
     #[test]

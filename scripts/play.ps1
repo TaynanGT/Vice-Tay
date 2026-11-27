@@ -5,6 +5,7 @@
 # -Windowed     a window instead of the whole screen (full screen is the default)
 # -NoPanel      without the performance panel (on by default, F3 hides it while playing)
 # -SkipShaders  start even when the shader cache is cold (otherwise every shader is translated first)
+# -DryRun       show memory and effective settings without launching the title
 # -Console      series-x (the default) or series-s: the console the title takes this PC for
 # -FrameGen     AMD frame generation
 # -Fsr / -Dlss  PC upscaling in Series S (quality, balanced or performance)
@@ -25,6 +26,7 @@ param(
     [switch]$Windowed,
     [switch]$NoPanel,
     [switch]$SkipShaders,
+    [switch]$DryRun,
     [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x',
     [switch]$FrameGen,
     [ValidateSet('quality', 'balanced', 'performance')][string]$Fsr,
@@ -41,7 +43,17 @@ $settings = @{
     VICTORY_TITLE_PRIORITIES = '0'
     VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = 'faults'
 }
-$ram = (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).TotalPhysicalMemory
+function Format-LaunchMiB {
+    param([object]$Value, [double]$Divisor = 1)
+    if ($null -eq $Value) { return 'unavailable' }
+    '{0:N0} MiB' -f ([double]$Value / $Divisor)
+}
+
+$ram = try { (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).TotalPhysicalMemory } catch { $null }
+$osMemory = try { Get-CimInstance Win32_OperatingSystem -ErrorAction Stop } catch { $null }
+$systemMemory = try { Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory -ErrorAction Stop } catch { $null }
+$pageFiles = @()
+try { $pageFiles = @(Get-CimInstance Win32_PageFileUsage -ErrorAction Stop) } catch { }
 $controllers = @(if ($Machine -in 'auto', '7900xtx') {
     Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue
 })
@@ -165,9 +177,35 @@ if ($Dlss4K) { $settings.VICTORY_DLSS_4K = $Dlss4K.ToLowerInvariant() }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
 Write-Host "Settings for the $Machine$(if ($Safe) { ', safe' })$(if ($RayTracing) { ', with ray tracing' })."
+Write-Host 'Effective VICTORY_* settings:'
+foreach ($entry in $settings.GetEnumerator() | Sort-Object Key) {
+    Write-Host "  $($entry.Key)=$($entry.Value)"
+}
 if ($Console -eq 'series-s' -and $Machine -in '4090', 'laptop') {
     Write-Host ("Series S requests {0} list translation threads, {1} for memory updates, and {2} for landing." -f
         $settings.VICTORY_THIN_THREADS, $settings.VICTORY_UNDER_THREADS, $settings.VICTORY_LAND_THREADS)
+}
+if ($systemMemory -or $osMemory -or $pageFiles.Count -gt 0) {
+    $physicalFree = if ($osMemory) { Format-LaunchMiB $osMemory.FreePhysicalMemory 1024 } else { 'unavailable' }
+    $commitUsed = if ($systemMemory) { Format-LaunchMiB $systemMemory.CommittedBytes 1MB } else { 'unavailable' }
+    $commitLimit = if ($systemMemory) { Format-LaunchMiB $systemMemory.CommitLimit 1MB } else { 'unavailable' }
+    $commitHeadroom = if ($systemMemory) {
+        Format-LaunchMiB ($systemMemory.CommitLimit - $systemMemory.CommittedBytes) 1MB
+    } else { 'unavailable' }
+    $pageFileAllocated = if ($pageFiles.Count -gt 0) {
+        ($pageFiles | Measure-Object -Property AllocatedBaseSize -Sum).Sum
+    } else { $null }
+    $pageFileUsed = if ($pageFiles.Count -gt 0) {
+        ($pageFiles | Measure-Object -Property CurrentUsage -Sum).Sum
+    } else { $null }
+    $pageFilePeak = if ($pageFiles.Count -gt 0) {
+        ($pageFiles | Measure-Object -Property PeakUsage -Sum).Sum
+    } else { $null }
+    Write-Host ("Windows memory (read-only): physical free {0}; system commit {1} of {2} (headroom {3}); page files allocated/current/peak {4}/{5}/{6}." -f
+        $physicalFree, $commitUsed, $commitLimit, $commitHeadroom,
+        (Format-LaunchMiB $pageFileAllocated), (Format-LaunchMiB $pageFileUsed), (Format-LaunchMiB $pageFilePeak))
+} else {
+    Write-Host 'Windows memory (read-only): physical, commit, and page-file queries are unavailable.'
 }
 if ($ram -and $ram -lt 60GB) {
     Write-Host ("Windows reports {0:N1} GiB of physical RAM. Keep a system-managed page file. See docs/measurements.md for measured Series S memory use." -f ($ram / 1GB))
@@ -207,6 +245,10 @@ if ($hasNvidia -or $Machine -ne '7900xtx') {
     } elseif ($waveWideInherited) {
         Write-Warning "Inherited VICTORY_WAVE_WIDE=1 without VICTORY_WAVE_WIDE_ONLY was discarded for this launch. Since PR #161, the 4 safe shaders are enabled by default; VICTORY_WAVE_WIDE=1 alone enables unrestricted wave-wide barriers across all wave64 compute shaders on NVIDIA (which can cause TDR 0x887A0006 hangs). Unset VICTORY_WAVE_WIDE or pass VICTORY_WAVE_WIDE_ONLY."
     }
+}
+if ($DryRun) {
+    Write-Host 'Dry run: not launching the title.'
+    return
 }
 $Exe = (Resolve-Path -LiteralPath $Exe).Path
 Push-Location -LiteralPath (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here

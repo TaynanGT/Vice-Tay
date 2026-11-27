@@ -44,7 +44,7 @@ pub(crate) fn upload_deferred_during<T>(work: impl FnOnce() -> T) -> (T, bool) {
 }
 
 pub(crate) fn upload_refused() -> bool {
-    crate::host::coarse_ms() < RETRY_UPLOAD_AT.load(Ordering::Relaxed)
+    !retry_ready(crate::host::coarse_ms(), RETRY_UPLOAD_AT.load(Ordering::Relaxed))
 }
 
 fn sample_commit(now: u64) -> u64 {
@@ -74,21 +74,29 @@ fn has_growth_reserve(commit: u64, bytes: u64, bake: bool) -> bool {
     commit.saturating_sub(bytes) >= if bake { 256 * MIB } else { 1024 * MIB }
 }
 
+fn retry_ready(now: u64, retry_at: u64) -> bool {
+    now >= retry_at
+}
+
+pub(crate) fn speculative_upload(picking: bool, baking: bool) -> bool {
+    picking && !baking
+}
+
 /// Leave commit for game allocations and submissions already in flight while
 /// still letting bindless textures and one-shot material bakes upload.
 pub(crate) fn admit_texture_pass(bake: bool) -> bool {
     let now = crate::host::coarse_ms();
-    if now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) {
+    if !retry_ready(now, RETRY_UPLOAD_AT.load(Ordering::Relaxed)) {
         return false;
     }
     has_upload_reserve(sample_commit(now), bake)
 }
 
-/// Whether the staging allocator may commit a brand-new OS upload buffer
+/// Whether the staging allocator may commit `bytes` of new OS upload storage
 /// (reusing existing free ranges in already-committed pool blocks stays open
 /// whenever `admit_texture_pass` is true).
-pub(crate) fn allow_staging_growth(bake: bool) -> bool {
-    allow_growth(0, bake)
+pub(crate) fn allow_staging_growth(bytes: u64, bake: bool) -> bool {
+    allow_growth(bytes, bake)
 }
 
 /// Whether a second CPU-backed buffer can fit while leaving the existing
@@ -99,7 +107,7 @@ pub(crate) fn allow_optional_buffer_growth(bytes: u64) -> bool {
 
 fn allow_growth(bytes: u64, bake: bool) -> bool {
     let now = crate::host::coarse_ms();
-    if now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) {
+    if !retry_ready(now, RETRY_UPLOAD_AT.load(Ordering::Relaxed)) {
         return false;
     }
     has_growth_reserve(sample_commit(now), bytes, bake)
@@ -183,8 +191,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_upload_deferral_reaches_the_enclosing_operation() {
+    fn upload_deferrals_are_scoped_to_the_current_operation() {
         note_upload_deferred();
+        assert!(!upload_deferred_during(|| ()).1);
+        assert!(upload_deferred_during(note_upload_deferred).1);
         assert!(!upload_deferred_during(|| ()).1);
         let (_, deferred) = upload_deferred_during(|| {
             assert!(upload_deferred_during(note_upload_deferred).1);
@@ -209,10 +219,37 @@ mod tests {
     }
 
     #[test]
-    fn a_second_buffer_counts_against_the_growth_reserve() {
+    fn staging_growth_subtracts_the_full_allocation_at_boundaries() {
+        assert!(has_growth_reserve(GIB, 0, false));
         assert!(!has_growth_reserve(GIB, 64 * MIB, false));
         assert!(has_growth_reserve(GIB + 64 * MIB, 64 * MIB, false));
+        assert!(!has_growth_reserve(GIB + 64 * MIB - 1, 64 * MIB, false));
         assert!(!has_growth_reserve(512 * MIB, GIB, false));
+        assert!(!has_growth_reserve(u64::MAX, u64::MAX, false));
+        assert!(has_growth_reserve(256 * MIB + 16 * MIB, 16 * MIB, true));
+        assert!(!has_growth_reserve(256 * MIB + 16 * MIB - 1, 16 * MIB, true));
+    }
+
+    #[test]
+    fn a_standalone_footprint_can_fit_when_a_pool_block_cannot() {
+        let commit = GIB + 32 * MIB;
+        assert!(!has_growth_reserve(commit, 64 * MIB, false));
+        assert!(has_growth_reserve(commit, 32 * MIB, false));
+    }
+
+    #[test]
+    fn allocation_failure_cooldown_expires_before_growth_resumes() {
+        assert!(!retry_ready(499, 500));
+        assert!(retry_ready(500, 500));
+        assert!(retry_ready(501, 500));
+    }
+
+    #[test]
+    fn required_and_baked_uploads_are_not_speculative() {
+        assert!(!speculative_upload(false, false));
+        assert!(speculative_upload(true, false));
+        assert!(!speculative_upload(true, true));
+        assert!(!speculative_upload(false, true));
     }
 
     #[test]

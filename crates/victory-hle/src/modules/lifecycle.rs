@@ -163,7 +163,7 @@ fn place(
     width: i32,
     height: i32,
 ) -> (Windowed, Option<WindowState>) {
-    if !placeable(ex_style, style, !parent.is_null()) || zero_sized(width, height) {
+    if !placeable(ex_style, style, !parent.is_null()) || zero_sized(style, width, height) {
         return ((ex_style, style, (x, y, width, height)), None);
     }
     // Use the chosen monitor's work area for the windowed size and its
@@ -187,11 +187,15 @@ fn place(
     (if full_screen { full } else { windowed }, Some(WindowState { windowed, full_screen }))
 }
 
-/// Whether a window asks for no area of its own (a hidden helper keeps what it asked for). A
-/// width of `CW_USEDEFAULT` leaves the size to Windows, which then ignores the height: a height
-/// of 0 there is a normal default-sized window, not a zero-sized one.
-fn zero_sized(width: i32, height: i32) -> bool {
-    width != wm::CW_USEDEFAULT && (width == 0 || height == 0)
+/// Whether a window asks for no area of its own. Win32 supplies a default
+/// size to overlapped windows, and uses zero size for a pop-up or child
+/// with a default width.
+fn zero_sized(style: u32, width: i32, height: i32) -> bool {
+    match width {
+        wm::CW_USEDEFAULT => style & (wm::WS_POPUP | wm::WS_CHILD) != 0,
+        0 => true,
+        _ => height == 0,
+    }
 }
 
 /// The styles and place the title's top-level window had (or would have
@@ -787,13 +791,29 @@ mod tests {
     #[test]
     fn a_default_width_with_zero_height_is_not_a_zero_sized_helper() {
         let default = wm::CW_USEDEFAULT;
-        assert!(!zero_sized(default, 0));
-        assert!(!zero_sized(default, default));
-        assert!(zero_sized(0, 0));
-        assert!(zero_sized(0, 600));
-        assert!(zero_sized(800, 0));
-        let (_, state) = place(wm::WS_EX_APPWINDOW, wm::WS_OVERLAPPEDWINDOW, std::ptr::null_mut(), default, 0, default, 0);
+        let style = wm::WS_OVERLAPPEDWINDOW;
+        assert!(!zero_sized(style, default, 0));
+        assert!(!zero_sized(style, default, default));
+        assert!(zero_sized(style, 0, 0));
+        assert!(zero_sized(style, 0, 600));
+        assert!(zero_sized(style, 800, 0));
+        let (_, state) = place(
+            wm::WS_EX_APPWINDOW, style, std::ptr::null_mut(), default, 0, default, 0,
+        );
         assert!(state.is_some(), "the default-sized window keeps its full-screen state");
+    }
+
+    #[test]
+    fn a_popup_with_default_width_keeps_its_native_zero_size() {
+        let default = wm::CW_USEDEFAULT;
+        let style = wm::WS_POPUP;
+        assert!(zero_sized(style, default, 0));
+        assert!(zero_sized(style, default, 600));
+        assert!(zero_sized(wm::WS_CHILD, default, 600));
+        assert!(!zero_sized(style, 800, 600));
+        let (placed, state) = place(0, style, std::ptr::null_mut(), 10, 20, default, 0);
+        assert_eq!(placed, (0, style, (10, 20, default, 0)));
+        assert!(state.is_none());
     }
 
     /// `VICTORY_MONITOR`: a device name with or without its prefix, any

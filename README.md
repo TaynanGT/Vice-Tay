@@ -73,6 +73,7 @@ Use [`Play-VIctory.cmd`](Play-VIctory.cmd) to pass the same options from Command
 | --- | --- |
 | `-Console series-s` | Select the lighter console profile used in the sessions above. |
 | `-Machine 4090` / `-Machine 4070` / `-Machine 7900xtx` | Select a GPU preset explicitly. See the [RTX 4070 test notes](docs/rtx4070-performance.md). |
+| `-Machine 4070tisuper` | The RTX 4070 Ti SUPER (16 GB) preset, asked for explicitly. With Resizable BAR on, it moves up to 4 GB of shader-read windows from RAM into the card's memory. |
 | `-Machine laptop` | Try the [16 GB NVIDIA laptop preset](docs/laptop-16gb.md), measured on one RTX 3050 laptop. |
 | `-Machine 3060` | Try the [six-core, 16 GB NVIDIA desktop preset](docs/rtx3060-16gb.md), measured on one RTX 3060 12 GB / i5-12400F PC. |
 | `-Safe` | Launch with the conservative settings when investigating a graphics or stability issue. |
@@ -174,11 +175,13 @@ Restart Steam and pick `GE-Proton11-14-viewtree`. GE-Proton's `master` already c
 GAME=/path/to/title linux/play.sh series-s
 ```
 
+DLSS also runs under Proton. Set `PROTON_ENABLE_NVAPI=1` and point `VICTORY_DLSS_DIR` at a folder that holds `nvngx_dlss.dll` (from [NVIDIA's DLSS SDK](https://github.com/NVIDIA/DLSS), `lib/Windows_x86_64/rel`). For example, add `PROTON_ENABLE_NVAPI=1 VICTORY_DLSS=quality VICTORY_DLSS_DIR="Z:/path/to/dlss"` to the launch options. On one RTX 5080 (Series S profile, GE-Proton11-14-viewtree, NVIDIA 620.73.04, DLSS 310.9.16), the log showed `NVIDIA DLSS serves the title's upscaler` and `DLSS: 1000 frames evaluated` at 1280 × 720 to 1920 × 1080; on that setup NGX found the driver's files through the environment at `/run/host/usr/lib/nvidia/wine` and turned its updater off under Wine. In two short runs on that machine in the opening area, the in-world median was 19.8 fps (7,233 draws a frame) with the title's own upscaler and 22.8 fps (7,019 draws a frame) with DLSS Quality, and the copies 27.5 and 18.5 ms a frame: DLSS replaces the title's own upscaler passes, along with the copies of their results.
+
 </details>
 
 ## Known problems
 
-- **RX 6700 XT on Windows 11 LTSC.** Drivers 32.0.21045.26001 and 32.0.32029.2010 can reset the device while loading the world. The AMD launcher profile defaults to relay mode 0 on those drivers. See [#138](https://github.com/TaynanGT/Vice-Tay/issues/138) for the reported runs. The launcher still accepts an explicit relay mode through its settings override.
+- **RDNA2 world-load resets on Windows 11.** The AMD launcher profile defaults to relay mode 0 on the RX 6700 XT with drivers 32.0.21045.26001 or 32.0.32029.2010 on LTSC, and on the RX 6900 XT with driver 32.0.21045.29003 on all Windows 11 editions. The launcher accepts an explicit relay mode through its settings override. See the test reports in [#138](https://github.com/TaynanGT/Vice-Tay/issues/138).
 - **Frame time.** The 30-minute run recorded a median frame time of 47.3 ms, with 33.7 ms for CPU-side submission preparation and 12.6 ms for GPU read-back. [Frame breakdown](docs/measurements.md#series-s-baseline)
 - **Memory pressure.** The five-minute overlay session peaked at 27.1 GB of private game memory. Low free RAM can lead to paging and long stalls. [Memory findings](docs/findings-rtx4090.md)
 - **Rendering.** Colour banding, flat-colour surfaces, blocky clouds and reflections, and missing or incorrect shading remain visible in some scenes. Ray-traced indirect lighting requires `-RayTracing`.

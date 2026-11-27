@@ -26,14 +26,14 @@ export VICTORY_TEXTURE_NO_WAIT=1 VICTORY_RELAY=2 VICTORY_WIDE_BACK=1 VICTORY_CAR
   VICTORY_TITLE_PRIORITIES=0 VICTORY_SHOW_AFTER=1 VICTORY_AMBIENT=0.8 VICTORY_D3D12_DRED=light \
   VICTORY_THIN_THREADS=12 VICTORY_UNDER_THREADS=8 VICTORY_LAND_THREADS=6
 # SAFE=1 is play.ps1's -Safe: none of the settings still on trial.
-if [ -n "${SAFE:-}" ]; then
+if [ "${SAFE:-0}" = 1 ]; then
   export VICTORY_UNDER_WIDE=0 VICTORY_LAND_ECHO=0
 else
   export VICTORY_MAP_THREADS=auto VICTORY_PLACED_ORDER=1 \
     VICTORY_THIN=1 VICTORY_JOIN_PARTS=8 VICTORY_UPLOAD_AHEAD=1 VICTORY_INDIRECT_BATCH=2
 fi
-[ -n "${WINDOWED:-}" ] || export VICTORY_FULLSCREEN=1
-[ -n "${NOPANEL:-}" ] || export VICTORY_PANEL=1
+[ "${WINDOWED:-0}" = 1 ] || export VICTORY_FULLSCREEN=1
+[ "${NOPANEL:-0}" = 1 ] || export VICTORY_PANEL=1
 
 PREFIX=${VICTORY_PREFIX:-$VH/prefix-$(awk "{print \$2}" "$PROTON/version")}
 # ponytail: `proton run` exits 1 with no output for victory.exe, so Proton only builds the
@@ -46,7 +46,13 @@ fi
 export VKD3D_SHADER_CACHE_PATH=${VKD3D_SHADER_CACHE_PATH:-$VH/vkd3d}; mkdir -p "$VKD3D_SHADER_CACHE_PATH"
 export WINEPREFIX=$PREFIX/pfx WINEDEBUG=${WINEDEBUG:--all} \
   WINEDLLOVERRIDES="d3d12,d3d12core,dxgi,d3d11,d3d10core,d3d9=n;${WINEDLLOVERRIDES:-}"
-run() { if [ -n "${NET:-}" ]; then "$PROTON/files/bin/wine" "$EXE" "$@"; else unshare -rn sh -c 'ip link set lo up 2>/dev/null; exec "$@"' sh "$PROTON/files/bin/wine" "$EXE" "$@"; fi; }
+run() {
+    if [ "${NET:-0}" = 1 ]; then
+        "$PROTON/files/bin/wine" "$EXE" "$@"
+    else
+        unshare -rn sh -c 'ip link set lo up 2>/dev/null; exec "$@"' sh "$PROTON/files/bin/wine" "$EXE" "$@"
+    fi
+}
 
 # Pretranslate shaders on first run, as play.ps1 does (it resumes from cache).
 CACHE=$(run config 2>/dev/null | awk '/^cache_dir/{print $3}' | tr -d '\r')
@@ -63,4 +69,12 @@ CACHE=${CACHE//\\//}
 LOG=$VH/last-run.log
 [ -f "$LOG" ] && mv -f "$LOG" "$LOG.1"
 echo "log: $LOG"
-run run "Z:${GAME//\//\\}\\game_scarlett_master.exe" --console "$CONSOLE" --execute "$@" 2>&1 | tee "$LOG"; rc=${PIPESTATUS[0]}; echo "exit code: $rc" | tee -a "$LOG"; exit $rc
+# Collect both statuses before errexit can skip the exit report.
+set +e
+run run "Z:${GAME//\//\\}\\game_scarlett_master.exe" --console "$CONSOLE" --execute "$@" 2>&1 | tee "$LOG"
+status=("${PIPESTATUS[@]}")
+set -e
+rc=${status[0]}
+printf 'exit code: %s\n' "$rc" | tee -a "$LOG" || status[1]=1
+if (( rc != 0 )); then exit "$rc"; fi
+exit "${status[1]}"

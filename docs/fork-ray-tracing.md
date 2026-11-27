@@ -185,6 +185,33 @@ The counters also report direct dispatches with zero groups, counted indirect
 dispatches and indirect dispatches with multiple records.
 [Original reflection hold](https://github.com/avatarmanz/VIctory-7900XTX/pull/314)
 
+## Every ray a miss (`VICTORY_RT_MISS=1`)
+
+From edsuuu/VI-BR-PORT (7d7b9e49, and the idea of ab4571df, 1556de82 and
+24f8d2ed). With `VICTORY_RT_MISS=1` the node test is written as a constant
+miss: a box node answers four absent children, any other node the triangle
+miss. It is part of the translation: the shader cache's key holds it only
+when it is on, so translations cached without it keep their key. Compute
+programs can then be left out by names given at run time (meant for those
+that only skin for the structures or trace against them); the two lists have no names built in.
+
+| variable | does |
+|---|---|
+| `VICTORY_RT_MISS=1` | the node test hits nothing (off by default; only `1` turns it on) |
+| `VICTORY_RT_SKIN_NAMES=<list>` | compute programs whose container matches the list are left out: no host pipeline is made for them and their dispatches are dropped (meant for programs that skin only for the structures) |
+| `VICTORY_RT_TRACE_NAMES=<list>` | the same (meant for programs that trace against the structures) |
+
+The two lists act only with `VICTORY_RT_MISS=1` and `VICTORY_BVH_BUILDER` not
+`1`; unset or empty, nothing is left out. A list is entries split by `,`; an
+entry is terms split by `+`, each a name the program's container must hold,
+or with a leading `-` one it must not hold (exact bytes, case-sensitive; spaces around a term are trimmed); an
+entry with no name it must hold matches nothing. When either list holds an
+entry, the log has a line "ray-only programs named by
+VICTORY_RT_SKIN_NAMES / VICTORY_RT_TRACE_NAMES" with `on` and the entry
+counts, once, when the lists are read as pipelines are created. The 1st,
+2nd, 4th, 8th, ... pipeline each list leaves out logs "pipeline left out:
+..." with its shaders' hashes.
+
 ## Where to look
 
 - `crates/victory-shader/src/bvh.rs`: the reference for the node test.

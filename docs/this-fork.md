@@ -2,8 +2,9 @@
 
 Vice-Tay carries the work of the trees it comes from (see the README's
 credits) and the changes below, made and measured on one PC: RTX 4090, Ryzen 9
-9950X3D, 48 GB of RAM, a 4K screen. Each change names the switch that controls it
-where there is one; the default is the behaviour described.
+9950X3D, 48 GB of RAM, a 4K screen (all but the last section, which names its own
+PC). Each change names the switch that controls it where there is one; the
+default is the behaviour described.
 
 ## Playing
 
@@ -167,3 +168,15 @@ Compare it alongside the number of joined submissions in the same interval.
   a placed texture view that gets no host view says why once per kind.
 - [VIctory-NVIDIA changes](victory-nvidia.md) covers the source revisions,
   graphics fixes, optional settings and fault capture reader.
+
+## Measured on another PC
+
+Measured on an RTX 5070 Ti, Ryzen 7 9800X3D and 64 GB of RAM, not on the PC
+named at the top.
+
+- **Every ray can be made a miss** (`VICTORY_RT_MISS=1`, off by default; from
+  edsuuu/VI-BR-PORT): the ray-tracing node test hits nothing. While it is on
+  and the structure builder is off, compute programs whose containers match
+  the names given at run time in `VICTORY_RT_SKIN_NAMES` and
+  `VICTORY_RT_TRACE_NAMES` are left out. How the lists are written:
+  [fork-ray-tracing.md](fork-ray-tracing.md#every-ray-a-miss-victory_rt_miss1).

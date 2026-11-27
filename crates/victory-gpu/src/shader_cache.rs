@@ -152,6 +152,11 @@ fn build() -> [u8; 32] {
         if victory_shader::emit::constants_raw() {
             bytes.extend_from_slice(b"VICTORY_PORT_CBV=1");
         }
+        // Rays that hit nothing (`VICTORY_RT_MISS=1`): the node test is
+        // written as a constant miss. Only when on, as above.
+        if victory_shader::emit::rt_miss() {
+            bytes.extend_from_slice(b"VICTORY_RT_MISS=1");
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();

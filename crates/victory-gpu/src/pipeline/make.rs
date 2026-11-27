@@ -88,7 +88,111 @@ fn left_out(shaders: &[Arc<Shader>], skip_hashes: &[String]) -> Option<&'static 
     if super::skipped_in_list(shaders, skip_hashes).is_some() {
         return Some("skipped by VICTORY_SKIP_PIPELINES");
     }
+    if let Some(why) = ray_list_left_out(shaders) {
+        return Some(why);
+    }
     None
+}
+
+/// Compute programs named at run time ([`NameList`]): an entry is terms
+/// joined by `+`, each a name the program's container holds, or with a
+/// leading `-` one it does not hold; entries are joined by `,`. An entry
+/// with no name it must hold matches nothing.
+#[derive(Debug, Default, PartialEq)]
+struct NameList(Vec<Vec<(bool, Vec<u8>)>>);
+
+impl NameList {
+    fn parse(text: &str) -> NameList {
+        NameList(
+            text.split(',')
+                .filter_map(|entry| {
+                    let terms: Vec<(bool, Vec<u8>)> = entry
+                        .split('+')
+                        .map(str::trim)
+                        .map(|term| match term.strip_prefix('-') {
+                            Some(absent) => (false, absent.trim()),
+                            None => (true, term),
+                        })
+                        .filter(|(_, name)| !name.is_empty())
+                        .map(|(holds, name)| (holds, name.as_bytes().to_vec()))
+                        .collect();
+                    terms.iter().any(|(holds, _)| *holds).then_some(terms)
+                })
+                .collect(),
+        )
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn matches(&self, container: &[u8]) -> bool {
+        let has = |name: &[u8]| container.windows(name.len()).any(|w| w == name);
+        self.0.iter().any(|entry| entry.iter().all(|(holds, name)| has(name) == *holds))
+    }
+}
+
+/// The run-time lists of programs that only feed or walk the ray-tracing
+/// structures, left out while every ray misses (`VICTORY_RT_MISS=1`) and
+/// the structure builder is off (after edsuuu/VI-BR-PORT ab4571d, 1556de8
+/// and 24f8d2e, whose names are given here at run time):
+/// `VICTORY_RT_SKIN_NAMES` (the skinning passes made for the structures)
+/// and `VICTORY_RT_TRACE_NAMES` (tracing against them). Both unset: nothing
+/// is left out.
+struct RayLists {
+    skin: NameList,
+    trace: NameList,
+}
+
+/// Reads `VICTORY_RT_SKIN_NAMES` and `VICTORY_RT_TRACE_NAMES` once
+/// ([`RayLists`], [`NameList`]); both come back empty unless
+/// `VICTORY_RT_MISS=1` and `VICTORY_BVH_BUILDER` is not `1`.
+fn ray_lists() -> &'static RayLists {
+    static LISTS: OnceLock<RayLists> = OnceLock::new();
+    LISTS.get_or_init(|| {
+        let read = |name: &str| std::env::var(name).map(|text| NameList::parse(&text)).unwrap_or_default();
+        let (skin, trace) = (read("VICTORY_RT_SKIN_NAMES"), read("VICTORY_RT_TRACE_NAMES"));
+        if skin.is_empty() && trace.is_empty() {
+            return RayLists { skin, trace };
+        }
+        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
+        let on = victory_shader::emit::rt_miss() && !builder;
+        tracing::info!(
+            on,
+            skin_entries = skin.0.len(),
+            trace_entries = trace.0.len(),
+            "ray-only programs named by VICTORY_RT_SKIN_NAMES / VICTORY_RT_TRACE_NAMES: left out only with VICTORY_RT_MISS=1 and the builder off"
+        );
+        if on {
+            RayLists { skin, trace }
+        } else {
+            RayLists { skin: NameList::default(), trace: NameList::default() }
+        }
+    })
+}
+
+/// Pipelines left out by [`ray_lists`] so far: skinning, tracing.
+static RAY_LEFT_OUT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+fn ray_list_left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    let lists = ray_lists();
+    if lists.skin.is_empty() && lists.trace.is_empty() {
+        return None;
+    }
+    let listed = |list: &NameList| shaders.iter().any(|s| s.stage == "compute" && list.matches(&s.container));
+    let (kind, why) = if listed(&lists.skin) {
+        (0, "skins only for the ray-tracing structures, which every ray misses (VICTORY_RT_SKIN_NAMES), left out")
+    } else if listed(&lists.trace) {
+        (1, "traces the ray-tracing structures, which every ray misses (VICTORY_RT_TRACE_NAMES), left out")
+    } else {
+        return None;
+    };
+    let count = RAY_LEFT_OUT[kind].fetch_add(1, Ordering::Relaxed) + 1;
+    if count.is_power_of_two() {
+        let hashes: Vec<&str> = shaders.iter().map(|s| s.hash.as_str()).collect();
+        tracing::info!(count, shaders = %hashes.join("+"), "pipeline left out: {why}");
+    }
+    Some(why)
 }
 
 /// Confirmed first-scene producers. Prepare these at creation even on a cold
@@ -722,6 +826,22 @@ mod tests {
         let pending = Pending::new(Vec::new(), None);
         pending.queue_state.store(MAKING, Ordering::Relaxed);
         assert_eq!(missing(&pending).as_deref(), Some("being made"));
+    }
+
+    #[test]
+    fn name_lists_match_held_and_absent_names() {
+        let list = NameList::parse("AlphaPass, Beta+_Deep ,Gamma+-Soft");
+        assert_eq!(list.0.len(), 3);
+        assert!(list.matches(b"..\0AlphaPass_01_Wrapped\0.."));
+        assert!(list.matches(b"..\0Beta_Rays_Deep\0.."));
+        assert!(!list.matches(b"..\0Beta_Rays_Flat\0.."));
+        assert!(list.matches(b"..\0Gamma_Hard\0.."));
+        assert!(!list.matches(b"..\0Gamma_Soft\0.."));
+        assert!(!list.matches(b"Delta"));
+        // Nothing to hold: the entry matches nothing.
+        assert!(NameList::parse("-Soft").is_empty());
+        assert!(NameList::parse("").is_empty());
+        assert!(NameList::parse(" , +, -").is_empty());
     }
 
     #[test]

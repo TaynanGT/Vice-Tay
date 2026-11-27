@@ -27,8 +27,12 @@ const ALLOWED_NAMES: &[&str] = &[
     "LICENSE-MIT",
     "LICENSE-APACHE",
 ];
-// The benchmark documentation still goes through every content check below.
-const ALLOWED_DOCUMENTATION: &[&str] = &["docs/.nojekyll", "docs/index.html"];
+// These text files still go through every content check below.
+const ALLOWED_TEXT_PATHS: &[&str] = &[
+    "docs/.nojekyll",
+    "docs/index.html",
+    "linux/wineserver/view-tree.patch",
+];
 
 /// Paths explicitly exempted, with a reason. Keep this empty if at all possible.
 const EXCEPTIONS: &[(&str, &str)] = &[(
@@ -151,7 +155,7 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     let name = path.rsplit('/').next().unwrap_or(path);
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
     let allowed = ALLOWED_NAMES.contains(&name)
-        || ALLOWED_DOCUMENTATION.contains(&path)
+        || ALLOWED_TEXT_PATHS.contains(&path)
         || ext
             .as_deref()
             .is_some_and(|e| ALLOWED_EXTENSIONS.contains(&e));
@@ -242,9 +246,9 @@ mod tests {
     }
 
     #[test]
-    fn documentation_paths_keep_the_content_checks() {
+    fn allowed_text_paths_keep_the_content_checks() {
         let svg = br#"<svg xmlns="http://www.w3.org/2000/svg"/>"#;
-        for path in super::ALLOWED_DOCUMENTATION {
+        for path in super::ALLOWED_TEXT_PATHS {
             assert!(check(path, b"original documentation").is_empty());
             assert!(!check(path, b"DDS \0").is_empty());
         }

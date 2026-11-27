@@ -1605,7 +1605,8 @@ impl State {
                 addresses.push(self.view_address(compute, u.slot, u.dword));
             }
         }
-        crate::memory::ready(list, heap, &addresses, &written, &constants, use_, t.threads)
+        let builder = crate::pipeline::is_builder(self.pipeline as This);
+        crate::memory::ready(list, heap, &addresses, &written, &constants, use_, t.threads, builder)
     }
 
     /// The bound heap holding `handle`.

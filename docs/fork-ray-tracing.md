@@ -96,7 +96,8 @@ after it was given them as an unordered access view.
 | `VICTORY_BVH_SIZES_WAIT=1` | submissions that ask for structures' sizes are waited for (off: no help, slow) |
 | `VICTORY_BVH_BOUNDS=0` | the builder's accesses are not bounded |
 | `VICTORY_BVH_TRACE=1` | logs what sizes are asked, when they came, and the copies; every 300 frames, how many copies were recorded with the size slot still as before the ask (stale) and whether those sizes were too small (diagnostics) |
-| `VICTORY_BVH_OPEN_ALL=0` | stores by address reach only title buffers a builder dispatch was given as views, as before (default: every title buffer's copy) |
+| `VICTORY_BVH_OPEN_NAMED=0` | stores by address reach only title buffers a builder dispatch was given as views, as before (default: also those a builder dispatch names by address, in root views or constants) |
+| `VICTORY_BVH_OPEN_ALL=1` | every title buffer's copy takes every program's stores by address (a test) |
 | `VICTORY_MEMORY_CLOSED_NOTES=1` | stores by address to pages they do not reach are noted and logged by title buffer (diagnostics; part of the translation) |
 | `VICTORY_SHADER_TRACE_LOOP_LIMIT=<n>` | iterations after which a loop of a program with the node test is left (4,096 by default; set 512 to test the shorter limit). Part of the translation |
 | `VICTORY_SHADER_COMPUTE_LOOP_LIMIT=<n>` | the same for every compute program (4,096; diagnostics) |
@@ -128,11 +129,16 @@ dispatches, faults and what came.
   closed to stores by address unless a builder dispatch was given them as a
   view, and the builder writes structures into buffers it is given only by
   address; those stores were dropped (`VICTORY_MEMORY_CLOSED_NOTES=1`: about
-  1,000 pages of 10 buffers in two minutes). Open (now the default,
-  `VICTORY_BVH_OPEN_ALL`): the screen probes' trace 41.8 -> 6.0 ms a frame at
-  a limit of 4,096, the compacted structures' children outside them 2,972 ->
-  140 and wrong parent links 2,884 -> 77, the opening's median 12.1 -> 14.1
-  fps and its slowest quarter 8.2 -> 10.9. Still open: the non-compacted
+  1,000 pages of 10 buffers in two minutes). Opened (every title buffer,
+  `VICTORY_BVH_OPEN_ALL=1`): the compacted structures' children outside them
+  2,972 -> 140 and wrong parent links 2,884 -> 77. Now the default opens only
+  the title buffers a builder dispatch names (`VICTORY_BVH_OPEN_NAMED`):
+  no store by address dropped in two minutes of ray tracing, 34 buffers
+  opened, other programs' stores unchanged. The trace's time: in the same
+  100 s of the unattended opening (cutscenes), 14.6 ms a frame closed, 11.2
+  builder-named, 12.3 all open (run to run variation is about as large);
+  in the dorm, played, 41.8 closed against 6.0 all open in another session,
+  not yet measured side by side. Still open: the non-compacted
   built structures (`0x8000`; the walk may misread their layout), the static
   ones left packed, and orange patches of light that look the same either
   way. Not the cause: stale sizes (`VICTORY_BVH_TRACE`: 4 of

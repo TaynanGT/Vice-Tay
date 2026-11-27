@@ -945,9 +945,23 @@ pub(crate) fn asked_sizes<'a>(lists: impl Iterator<Item = &'a HostList>) -> bool
 /// 14.1 open, the slowest quarter 8.2 against 10.9). Open, a dump's
 /// compacted structures had 140 children outside them instead of 2,972 and
 /// 77 wrong parent links instead of 2,884.
+///
+/// `VICTORY_BVH_OPEN_ALL=1` opens every title buffer to every program's
+/// stores by address (a test: other programs then reach buffers they were
+/// not given too). By default only those a builder dispatch names are
+/// opened ([`open_named`]).
 fn open_all() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_OPEN_ALL").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_OPEN_ALL").is_some_and(|v| v == "1"))
+}
+
+/// Whether a title buffer a builder dispatch names by address takes stores
+/// by address from then on (`VICTORY_BVH_OPEN_NAMED=0`: only those it was
+/// given as views, as before): the builder is given where to put structures
+/// by address, in its constants, as well as by view.
+fn open_named() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_OPEN_NAMED").is_none_or(|v| v != "0"))
 }
 
 /// [`fill`] of a page stores by address do not reach.
@@ -1002,6 +1016,7 @@ fn merge(title: &[u8; PIECE], ours: &mut [u8], never: bool) -> usize {
 /// module), every numbered copy
 /// has its view in `heap`'s run and is brought up to date when `list` is
 /// submitted. None if the host cannot hold it; the draw is then dropped.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn ready(
     list: &HostList,
     heap: &HostHeap,
@@ -1010,6 +1025,7 @@ pub(crate) fn ready(
     constants: &[u32],
     use_: Use,
     threads: Option<[u32; 3]>,
+    builder: bool,
 ) -> Option<Ready> {
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
@@ -1064,6 +1080,24 @@ pub(crate) fn ready(
         }
     }
     let mut came = [held(m) - before, 0, 0, 0];
+    // A title buffer a builder dispatch names by address (a root view, a
+    // 64-bit address in two constants, one in 256-byte units) takes its
+    // stores from here on, as one it was given as a view does
+    // ([`open_named`]); other programs' stores by address still do not reach
+    // title buffers they were not given.
+    if builder && open_named() && !open_all() {
+        let pairs = constants
+            .windows(2)
+            .filter(|w| (1..=0x1F).contains(&w[1]) && w[0] >= 0x1_0000)
+            .map(|w| u64::from(w[0]) | u64::from(w[1]) << 32);
+        let units = constants.iter().filter(|c| (0x0100_0000..0x2000_0000).contains(*c)).map(|&c| u64::from(c) << 8);
+        let named_here: Vec<u64> = pairs.chain(units).chain(addresses.iter().copied().filter(|&a| a >= 1 << 32)).collect();
+        for at in named_here {
+            if crate::shadow::in_buffer(at, 1).is_some() && named(6, at) {
+                m.opens(at);
+            }
+        }
+    }
     for &at in addresses.iter().filter(|&&a| a >= 1 << 32) {
         // (Several structures to a page.)
         let mut packed = false;

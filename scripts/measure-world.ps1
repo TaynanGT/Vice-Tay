@@ -26,6 +26,7 @@ $samples = @()
 $consecutive = 0
 $nextPromptRetry = 20
 $lastSample = 0
+$lastFrameReport = 0
 $recorder = $null
 try {
     while (!$game.HasExited) {
@@ -49,6 +50,7 @@ try {
         }
         while ($reader -and ($line = $reader.ReadLine()) -ne $null) {
             if ($line -match ' ([\d.]+) fps, ([\d.]+) ms/frame .*?, (\d+) draws/frame') {
+                $lastFrameReport = $timer.Elapsed.TotalSeconds
                 $fps = [double]::Parse($Matches[1], [cultureinfo]::InvariantCulture)
                 $draws = [int]$Matches[3]
                 if ($draws -lt 1000) {
@@ -74,8 +76,8 @@ try {
                 }
             }
         }
-        if ($null -ne $worldStart -and $timer.Elapsed.TotalSeconds - $lastSample -gt 30) {
-            throw 'World-frame reporting stopped before the measurement finished.'
+        if ($null -ne $worldStart -and $timer.Elapsed.TotalSeconds - $lastFrameReport -gt 30) {
+            throw 'Frame reporting stopped before the measurement finished.'
         }
         if ($null -ne $worldStart -and $samples.Count -ge 2 -and $lastSample - $worldStart -ge $Seconds) {
             if ($Ffmpeg -and !$recorder) { throw 'No game window was available to record.' }
@@ -84,6 +86,9 @@ try {
             $median = ($ordered[$middle] + $ordered[($ordered.Count - 1) -shr 1]) / 2
             Write-Host "Median world FPS $median ($($ordered.Count) reporting intervals)."
             return
+        }
+        if ($null -ne $worldStart -and $timer.Elapsed.TotalSeconds - $worldStart -ge ($Seconds + 60)) {
+            throw 'Timed out waiting for a final world-frame sample.'
         }
         if ($null -eq $worldStart -and $timer.Elapsed.TotalMinutes -ge 5) { throw 'Timed out waiting for world rendering.' }
         Start-Sleep -Milliseconds 250

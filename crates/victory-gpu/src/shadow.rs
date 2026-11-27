@@ -548,6 +548,34 @@ fn window_mapped_most() -> u64 {
 /// Bytes alive of windows in card memory the CPU maps.
 static WINDOW_MAPPED_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// For the memory line: [`WINDOW_MAPPED_BYTES`].
+#[cfg(feature = "diagnostics")]
+pub(crate) fn window_mapped_bytes() -> u64 {
+    WINDOW_MAPPED_BYTES.load(Ordering::Relaxed)
+}
+
+/// How much of the card's budget may be in use with a window mapped there
+/// ([`window_mapped_most`]), in percent: `VICTORY_WINDOWS_BAR_PERCENT`, 80 by
+/// default, 50 to 95. Each byte of a window there is a byte of the PC's
+/// memory not locked for the card; on a PC whose RAM runs out before the
+/// card's memory does (16 GB and a 6 GB card) more of the card is worth it.
+/// Textures and the card's own copies take the rest: past the budget the
+/// system moves memory of the card into the PC's.
+fn window_mapped_percent() -> u64 {
+    static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PERCENT.get_or_init(|| {
+        let p = std::env::var("VICTORY_WINDOWS_BAR_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        mapped_percent(p)
+    })
+}
+
+/// [`window_mapped_percent`] for a setting.
+fn mapped_percent(p: Option<u64>) -> u64 {
+    p.map_or(80, |p| p.clamp(50, 95))
+}
+
 /// A buffer for a window of `size` bytes in card memory the CPU maps, if it is
 /// to be there ([`window_mapped_most`]).
 fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
@@ -557,7 +585,7 @@ fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
     }
     let host = host()?;
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used + size > budget / 100 * window_mapped_percent()
     {
         return None;
     }
@@ -6258,6 +6286,14 @@ mod window_tests {
 
     /// The setting takes powers of two from 64 KiB to 4 MiB; anything else
     /// leaves the grid as it was.
+    #[test]
+    fn windows_on_the_card_go_to_the_percent_asked_for_within_bounds() {
+        assert_eq!(super::mapped_percent(None), 80);
+        assert_eq!(super::mapped_percent(Some(92)), 92);
+        assert_eq!(super::mapped_percent(Some(100)), 95);
+        assert_eq!(super::mapped_percent(Some(10)), 50);
+    }
+
     #[test]
     fn the_grid_is_a_power_of_two_or_the_default() {
         assert_eq!(grid(None), WINDOW);

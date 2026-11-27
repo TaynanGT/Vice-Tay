@@ -14,6 +14,7 @@ use std::ptr::null_mut;
 use windows_sys::Win32::Foundation::{
     EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT, EXCEPTION_ILLEGAL_INSTRUCTION,
     EXCEPTION_INT_DIVIDE_BY_ZERO, EXCEPTION_PRIV_INSTRUCTION, EXCEPTION_STACK_OVERFLOW, HMODULE,
+    NTSTATUS,
 };
 
 use windows_sys::Win32::System::Diagnostics::Debug::{
@@ -514,6 +515,22 @@ unsafe fn instruction_bytes(at: usize) -> String {
     hex.join(" ")
 }
 
+/// For an exception whose report should show the bytes of the faulting
+/// instruction, the word that labels them in the report; `None` otherwise.
+///
+/// A breakpoint (`int3`, a title's own assert or `__debugbreak`) faults at
+/// the trap byte the CPU just executed, so its page is mapped the same as an
+/// illegal or privileged instruction's. Showing the byte tells a deliberate
+/// `cc` trap from a jump into unmapped or wrong code, which the address alone
+/// does not (see Vice-Tay issue #174).
+fn faulting_instruction_label(code: NTSTATUS) -> Option<&'static str> {
+    match code {
+        EXCEPTION_ILLEGAL_INSTRUCTION | EXCEPTION_PRIV_INSTRUCTION => Some("code"),
+        EXCEPTION_BREAKPOINT => Some("breakpoint"),
+        _ => None,
+    }
+}
+
 /// MSVC's code for a C++ `throw`, and its magic first parameter.
 const CPP_EXCEPTION: i32 = 0xE06D_7363_u32 as i32;
 const CPP_MAGIC: usize = 0x1993_0520;
@@ -575,9 +592,10 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
     } else if code == CPP_EXCEPTION && record.NumberParameters >= 4 && p[0] == CPP_MAGIC {
         // SAFETY: a live MSVC throw.
         format!(" (C++ {} thrown)", unsafe { thrown(&p) })
-    } else if code == EXCEPTION_ILLEGAL_INSTRUCTION || code == EXCEPTION_PRIV_INSTRUCTION {
-        // SAFETY: the CPU refused the instruction at `at`, so it fetched it.
-        format!(" (code {})", unsafe { instruction_bytes(at) })
+    } else if let Some(label) = faulting_instruction_label(code) {
+        // SAFETY: the CPU fetched the instruction at `at` (it refused it, or
+        // executed a trap there), so that page is mapped.
+        format!(" ({label} {})", unsafe { instruction_bytes(at) })
     } else {
         String::new()
     };
@@ -1895,6 +1913,29 @@ mod tests {
             let end = page.add(0x1000 - 3);
             end.copy_from_nonoverlapping(code.as_ptr(), 3);
             assert_eq!(instruction_bytes(end as usize), "0f 01 fd");
+            VirtualFree(page.cast(), 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn a_breakpoint_is_reported_with_its_bytes() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        // A breakpoint shows the faulting bytes like an illegal instruction,
+        // under its own label; other codes carry no instruction bytes.
+        assert_eq!(faulting_instruction_label(EXCEPTION_BREAKPOINT), Some("breakpoint"));
+        assert_eq!(faulting_instruction_label(EXCEPTION_ILLEGAL_INSTRUCTION), Some("code"));
+        assert_eq!(faulting_instruction_label(EXCEPTION_PRIV_INSTRUCTION), Some("code"));
+        assert_eq!(faulting_instruction_label(EXCEPTION_ACCESS_VIOLATION), None);
+        // A title's own `int3` (0xcc) reads back as the trap it executed.
+        // SAFETY: a fresh page of ours, read only within it.
+        unsafe {
+            let page = VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+                .cast::<u8>();
+            assert!(!page.is_null());
+            page.write_bytes(0xcc, 1);
+            assert!(instruction_bytes(page as usize).starts_with("cc"));
             VirtualFree(page.cast(), 0, MEM_RELEASE);
         }
     }

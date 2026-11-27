@@ -63,14 +63,14 @@ pub const FIRST: u32 = 32;
 pub const WIDE: u32 = 64;
 /// Whole-function sparse conditional known-bits, `exec`-predicate correlation,
 /// bitfield collapse, and backward demanded-bits optimization (`dataflow.rs`).
-pub const DATAFLOW: u32 = 512;
+pub const DATAFLOW: u32 = 1 << 12;
 /// The passes over the module.
 pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS | DATAFLOW;
 /// Every pass.
 pub const ALL: u32 = MODULE | FIRST | WIDE;
 /// The passes that run when nothing says which: every one except [`WIDE`] and
-/// opt-in [`DATAFLOW`] (`VICTORY_SHADER_OPT=575` enables `DATAFLOW` alongside
-/// the default passes; `VICTORY_SHADER_OPT=639` enables every pass with `WIDE`).
+/// opt-in [`DATAFLOW`] (`VICTORY_SHADER_OPT=4159` enables `DATAFLOW` alongside
+/// the default passes; `VICTORY_SHADER_OPT=4223` enables every pass with `WIDE`).
 pub const DEFAULT: u32 = ALL & !(WIDE | DATAFLOW);
 
 /// What the instructions a module writes use, of the features a shader

@@ -836,7 +836,7 @@ fn wave_ordered_barrierless_lds_soundness_hw_parity() {
     //    load in emitted DXIL (zero space-3 store-to-load forwarding).
     // 2) Cross-lane LDS exchange (`lds[64 + tid] = tid ^ s1`, read
     //    `lds[64 + (tid ^ 1)]` after `s_barrier`) must match bit-exact across
-    //    `opt=0`, `opt=63`, and `opt=575` on both HW & WARP.
+    //    `opt=0`, `opt=63`, and `opt=4159` on both HW & WARP.
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());

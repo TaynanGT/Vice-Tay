@@ -226,9 +226,9 @@ pub fn builder_bounds() -> bool {
 ///   which half has a lane (where every lane has one),
 ///   64 the dwords of one console load read by one call for every four
 ///   (not on unless asked),
-///   512 whole-function sparse conditional known-bits, `exec`-predicate
+///   4096 whole-function sparse conditional known-bits, `exec`-predicate
 ///   correlation, bitfield collapse, and backward demanded-bits dataflow
-///   (opt-in: `575` enables it alongside the default passes; `639` is every
+///   (opt-in: `4159` enables it alongside the default passes; `4223` is every
 ///   pass with `WIDE`).
 ///
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
@@ -1628,12 +1628,13 @@ mod tests {
         assert_eq!(parse_shader_opt(Some("0")), 0);
         assert_eq!(parse_shader_opt(Some(" 1 ")), 1);
         assert_eq!(parse_shader_opt(Some("0x1")), 1);
-        assert_eq!(parse_shader_opt(Some("512")), super::bitcode::opt::DATAFLOW);
+        assert_eq!(parse_shader_opt(Some("4096")), super::bitcode::opt::DATAFLOW);
         assert_eq!(
-            parse_shader_opt(Some("575")),
+            parse_shader_opt(Some("4159")),
             usual | super::bitcode::opt::DATAFLOW
         );
-        assert_eq!(parse_shader_opt(Some("639")), all);
+        assert_eq!(parse_shader_opt(Some("575")), usual);
+        assert_eq!(parse_shader_opt(Some("4223")), all);
         assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
         assert_eq!(parse_shader_opt(Some("on")), usual);
     }

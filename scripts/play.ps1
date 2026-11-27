@@ -12,8 +12,9 @@
 # -Fsr4K        PC FidelityFX at 3840x2160 (quality, balanced or performance)
 # -Dlss4K       NVIDIA DLSS at 3840x2160 (quality, balanced or performance); FSR if it cannot start
 # -Build        target\diag (the default, the build all measurements are of) or target\release
-# -Machine      auto (the default: by the graphics card), 7900xtx, 4070, 4070tisuper, 4090 or laptop
-#               (laptop: an NVIDIA PC with 16 GB of RAM and a 6-8 GB card, docs/laptop-16gb.md)
+# -Machine      auto (the default: by the graphics card), 7900xtx, 4070, 4070tisuper, 4090, 3060 or laptop
+#               (3060: a six-core NVIDIA desktop with 16 GB of RAM and a 12 GB card, docs/rtx3060-16gb.md;
+#               laptop: an NVIDIA PC with 16 GB of RAM and a 6-8 GB card, docs/laptop-16gb.md)
 # -More         other settings: -More @{VICTORY_PANEL='1'} or -More @{VICTORY_AMBIENT='1.0'}
 # On a smaller NVIDIA PC, compare the same Series S scene after a fresh start
 # with one override at a time, e.g. -More @{VICTORY_LAND_THREADS='3'} for
@@ -34,7 +35,7 @@ param(
     [ValidateSet('quality', 'balanced', 'performance')][string]$Fsr4K,
     [ValidateSet('quality', 'balanced', 'performance')][string]$Dlss4K,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
-    [ValidateSet('auto', '7900xtx', '4070', '4070tisuper', '4090', 'laptop')][string]$Machine = 'auto',
+    [ValidateSet('auto', '7900xtx', '4070', '4070tisuper', '4090', '3060', 'laptop')][string]$Machine = 'auto',
     [hashtable]$More = @{}
 )
 $settings = @{
@@ -100,7 +101,7 @@ if ($Machine -eq '7900xtx') {
         $settings.VICTORY_PLACED_ORDER = '1'
     }
 }
-if ($Machine -eq '4070') {
+if ($Machine -in '4070', '3060') {
     # Ryzen 7 7800X3D: eight physical cores, versus the 4090 test PC's sixteen.
     # Keep the same rendering profile; spend VRAM on
     # shader buffers before textures consume it. No approximate shader modes.
@@ -111,6 +112,15 @@ if ($Machine -eq '4070') {
         $settings.VICTORY_CARD_BUFFERS_MIN_KB = '64'; $settings.VICTORY_CARD_BUFFERS_MB = '1536'
         $settings.VICTORY_CARD_WINDOWS_MB = '1024'
     }
+}
+if ($Machine -eq '3060') {
+    # i5-12400F (six cores, twelve threads), RTX 3060 12 GB, 16 GB (docs/rtx3060-16gb.md); asked for
+    # explicitly, the measurements cover that one machine. The 4070 settings above, with fewer
+    # threads for six cores, pages mapped by several threads while the title streams, and up to
+    # 3 GB of windows in the card's memory (Resizable BAR) instead of the RAM 16 GB doesn't have.
+    $settings.VICTORY_THIN_THREADS = '6'; $settings.VICTORY_UNDER_THREADS = '4'; $settings.VICTORY_LAND_THREADS = '3'
+    $settings.VICTORY_WINDOWS_BAR_MB = '3072'
+    if (-not $Safe) { $settings.VICTORY_MAP_THREADS = 'auto' }
 }
 if ($Machine -eq '4070tisuper') {
     # RTX 4070 Ti SUPER (16 GB, DXGI budget about 15.3 GB), Ryzen 7 9850X3D (eight cores), 32 GB.

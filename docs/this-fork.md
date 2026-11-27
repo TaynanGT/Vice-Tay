@@ -14,7 +14,8 @@ where there is one; the default is the behaviour described.
   Alt+Enter, which would make the swap chain exclusive full screen, is turned off.
 - **Settings for an RTX 4090 / Ryzen 9 9950X3D / 48 GB** (`scripts\play.ps1
   -Machine 4090`, picked for any NVIDIA card; `-Machine laptop` for 16 GB of RAM,
-  [laptop-16gb.md](laptop-16gb.md)): the thread counts and switches
+  [laptop-16gb.md](laptop-16gb.md); `-Machine 3060` for a six-core desktop with
+  16 GB, [rtx3060-16gb.md](rtx3060-16gb.md)): the thread counts and switches
   `scripts\play.ps1` sets. `-Safe` keeps the wave-wide list there: without it four
   wave64 programs do not translate on a 32-lane card and their draws are dropped.
 - **A performance panel** in the top-left corner (diagnostics builds; on by
@@ -101,6 +102,11 @@ How each of these was found, with the numbers:
 - The shader cache rebuilds entries when the translator version changes.
 
 ## Loading and the runtime
+
+- Set `VICTORY_MAPPING_WAIT_MS` to a positive number of milliseconds to limit
+  the wait for the GPU memory-mapping fence. After a timeout, the runtime
+  checks that same fence before reusing its command list or submitting a
+  new mapping marker.
 
 - **DirectStorage**: a queue submits itself when it holds half its capacity, unless
   the title created it with automatic submission off (`DSTORAGE_QUEUE_OPTIONS`).

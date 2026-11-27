@@ -232,6 +232,32 @@ static RAM_GATE: [std::sync::atomic::AtomicU64; 6] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(u64::MAX),
 ];
+/// The title's heartbeat flag the throttle sets while it holds the title
+/// back (`VICTORY_RAM_KEEP_ALIVE=1`, `victory_loader::heartbeat`); null: none.
+static RAM_KEEP_ALIVE: std::sync::atomic::AtomicPtr<std::sync::atomic::AtomicU8> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// Gives the throttle the title's heartbeat flag, to set during its waits.
+///
+/// # Safety
+/// `flag` points to a byte that stays valid for writes for the rest of the
+/// process (`victory_loader::heartbeat::asked` checks one in the title image).
+pub unsafe fn ram_keep_alive_at(flag: *const std::sync::atomic::AtomicU8) {
+    RAM_KEEP_ALIVE.store(flag.cast_mut(), Ordering::Relaxed);
+}
+
+/// In a wait of the throttle: the title's main loop would have ticked.
+fn ram_keep_alive() {
+    let flag = RAM_KEEP_ALIVE.load(Ordering::Relaxed);
+    if !flag.is_null() {
+        // SAFETY: valid for writes for the rest of the process
+        // (`ram_keep_alive_at`'s contract). An atomic byte store: the
+        // throttle's threads never race one another; the title's own stores
+        // to it are single bytes too.
+        unsafe { &*flag }.store(1, Ordering::Relaxed);
+    }
+}
+
 /// The second [`ram_wait_share`] is counted in (above [`SPENT_BITS`]) and
 /// the milliseconds spent of it (below), in one word: a new second and a
 /// charge to it are one operation ([`take_share`]).
@@ -316,6 +342,7 @@ pub(crate) fn ram_gate(size: u64) {
             waited = true;
             RAM_GATE[0].fetch_add(1, Ordering::Relaxed);
         }
+        ram_keep_alive();
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     if waited {
@@ -386,6 +413,7 @@ pub(crate) fn ram_gate_submission() {
         return;
     }
     while now_ms() < begun + most && ram_held(ram_free_now(), 0, floor) {
+        ram_keep_alive();
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     let end = now_ms();

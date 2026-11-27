@@ -16,6 +16,7 @@ mod image_watch;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use victory_gpu::frame_phase;
 pub use victory_gpu::frames_begun;
+pub use victory_gpu::ram_keep_alive_at;
 
 pub mod modules;
 mod registry;

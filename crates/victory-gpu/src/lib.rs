@@ -131,6 +131,7 @@ pub fn frames_begun() -> u64 {
     frame::current()
 }
 #[cfg(windows)]
+pub use host::ram_keep_alive_at;
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]
 pub use watch::{

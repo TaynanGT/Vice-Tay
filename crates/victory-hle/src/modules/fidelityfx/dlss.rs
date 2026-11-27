@@ -1197,16 +1197,8 @@ pub(super) fn destroy_context(context: *mut *mut c_void) -> u32 {
     OK
 }
 
-/// Whether [`shut_down`] calls `NVSDK_NGX_D3D12_Shutdown1`
-/// (`VICTORY_DLSS_SHUTDOWN=1`). Off by default: every caller ends the
-/// process right after, and `Shutdown1` wrote through a null pointer inside
-/// the core (`_nvngx.dll+0x46694`, from its `Shutdown1` at +0x6a650) on
-/// every exit after a DLSS session: #176 on an RTX 3080 (driver 610.88),
-/// and on an RTX 4070 Ti SUPER (driver 621.40) in both sessions of #212.
-/// The call site is the one after `release_pending` (victory.exe's return
-/// address in those dumps). The features are still released and the GPU
-/// still drained first, so nothing of NGX's is left running when the
-/// process ends, and Windows takes back the rest with the process.
+/// Whether process exit also calls the NGX device shutdown.
+/// Set VICTORY_DLSS_SHUTDOWN=1 to request full SDK shutdown.
 fn calls_shutdown1() -> bool {
     std::env::var("VICTORY_DLSS_SHUTDOWN").is_ok_and(|v| v == "1")
 }

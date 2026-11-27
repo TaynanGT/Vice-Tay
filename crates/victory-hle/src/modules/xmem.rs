@@ -411,6 +411,9 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
+            // Detach & settle any `VICTORY_GPU_SYNC` L0 heaps BEFORE taking `MAPPING.write()`
+            // (`title_memory_remapping`) to avoid AB-BA deadlock with `Host::submit` -> `MAPPING.read()`.
+            victory_gpu::gpu_sync_memory_freeing(address as usize, 0);
             // The GPU side forgets the allocation first and gives its guarded
             // pages write access back, as for the title's own `VirtualFree`:
             // after the release another allocation may take the address, and
@@ -2052,9 +2055,15 @@ fn watch_xmem_alloc() -> bool {
 /// first: the address may be other memory's the moment it is free.
 extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u32) -> BOOL {
     const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
+    let freeing_pages = kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0;
+    if freeing_pages {
+        // Detach & settle any `VICTORY_GPU_SYNC` L0 heaps BEFORE taking `MAPPING.write()`
+        // (`title_memory_remapping`) to avoid AB-BA deadlock with `Host::submit` -> `MAPPING.read()`.
+        victory_gpu::gpu_sync_memory_freeing(address as usize, size);
+    }
     // Returning a private allocation to its placeholder can remove live pages.
     let _changing = victory_gpu::title_memory_remapping();
-    if kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0 {
+    if freeing_pages {
         victory_gpu::title_memory_freed(address as usize, size);
     }
     // SAFETY: the title's own arguments.

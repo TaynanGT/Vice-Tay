@@ -466,6 +466,11 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// With `crate::gpu_sync` (`VICTORY_GPU_SYNC=1`): `buffer` is in local
+    /// VRAM (L1) and title memory is opened directly via
+    /// `OpenExistingHeapFromAddress1` (L0) with an L1 `before` baseline so
+    /// upload and 3-way sync run on GPU with zero CPU staging allocations.
+    gpu_sync: Option<crate::gpu_sync::SyncedShadow>,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -730,6 +735,33 @@ fn remaining_card_room(buffers: u64, used: u64, refused: u64, windows: u64, wind
 /// The copies in the card's memory.
 static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 
+/// The copies managed by GPU-direct zero-CPU-copy 3-way sync (`VICTORY_GPU_SYNC=1`).
+static GPU_SYNCED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+
+/// Pending `(shadow, init_ranges, upload3way_ranges)` batches queued for GPU-direct upload.
+#[allow(clippy::type_complexity)]
+pub(crate) fn gpu_sync_dirty() -> Vec<(Arc<Shadow>, Vec<(usize, usize)>, Vec<(usize, usize)>)> {
+    let mut out = Vec::new();
+    let mut synced = GPU_SYNCED.lock().unwrap_or_else(|e| e.into_inner());
+    synced.retain(|weak| {
+        let Some(shadow) = weak.upgrade() else {
+            return false;
+        };
+        let Some(gs) = shadow.gpu_sync.as_ref() else {
+            return false;
+        };
+        if !gs.has_uploads() {
+            return true;
+        }
+        let (init_ranges, up_ranges) = gs.take_uploads(shadow.len as usize);
+        if !init_ranges.is_empty() || !up_ranges.is_empty() {
+            out.push((shadow, init_ranges, up_ranges));
+        }
+        true
+    });
+    out
+}
+
 /// Since the last frame line: bytes copied to card sides and the ranges
 /// they were; pieces compared on the card, pieces fetched and their
 /// bytes; the waits for the card the fetches added and their microseconds.
@@ -848,6 +880,39 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     let buffer = host.uav_buffer(size);
     if buffer.is_none() {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+    }
+    buffer
+}
+
+/// Reserves L1 VRAM strictly for a `VICTORY_GPU_SYNC=1` shadow pair (`shadow.buffer` +
+/// `before_buffer` = `2 * size` bytes) against both DXGI local memory budget and `CARD_BYTES[0]`,
+/// never falling back to an L0 `shared_buffer` under `VICTORY_CARD_ALL=1`.
+fn card_room_for_gpu_sync(size: u64) -> Option<ID3D12Resource> {
+    if !cards() {
+        return None;
+    }
+    let (least, most) = card_limits();
+    if size < least || size >= 1 << 30 {
+        return None;
+    }
+    let total = size.saturating_mul(2);
+    let host = host()?;
+    if !host.card_ready() {
+        return None;
+    }
+    let hundredths = if card_room_kept_on() { 97 } else { 80 };
+    if let Some([budget, used, ..]) = host.video_memory()
+        && used.saturating_add(total) > budget / 100 * hundredths
+    {
+        return None;
+    }
+    if CARD_BYTES[0].fetch_add(total, Ordering::Relaxed).saturating_add(total) > most {
+        CARD_BYTES[0].fetch_sub(total, Ordering::Relaxed);
+        return None;
+    }
+    let buffer = host.uav_buffer(size);
+    if buffer.is_none() {
+        CARD_BYTES[0].fetch_sub(total, Ordering::Relaxed);
     }
     buffer
 }
@@ -1088,7 +1153,7 @@ pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let mut all: Vec<Arc<Shadow>> = buffers_read().values().filter_map(|e| e.shadow.clone()).collect();
     all.extend(LOOSE.read().unwrap_or_else(|e| e.into_inner()).values().cloned());
-    all.retain(|s| s.place.is_none() && s.watched.load(Ordering::Relaxed) == 1);
+    all.retain(|s| s.place.is_none() && s.gpu_sync.is_none() && s.watched.load(Ordering::Relaxed) == 1);
     all.sort_by_key(|s| s.id);
     let next = NEXT.load(Ordering::Relaxed);
     let turn = all.partition_point(|s| s.id < next);
@@ -1170,6 +1235,36 @@ pub(crate) fn send_copied(dst: usize, len: usize) {
             shadow.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().filter(|&(a, b)| a < to && b > from).collect();
         for (a, b) in outside(from, to, busy) {
             shadow.copy(a, b);
+        }
+    }
+    if crate::gpu_sync::on() {
+        let synced: Vec<Arc<Shadow>> = GPU_SYNCED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .collect();
+        for shadow in synced {
+            let (start, end) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
+            let (from, to) = (dst.max(start), (dst + len).min(end));
+            if from >= to {
+                continue;
+            }
+            if !shadow.has_pending.load(Ordering::Acquire) {
+                shadow.copy(from, to);
+                continue;
+            }
+            let busy: Vec<(usize, usize)> = shadow
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .copied()
+                .filter(|&(a, b)| a < to && b > from)
+                .collect();
+            for (a, b) in outside(from, to, busy) {
+                shadow.copy(a, b);
+            }
         }
     }
 }
@@ -3485,6 +3580,15 @@ impl Drop for Shadow {
                 CARD_BYTES[1].fetch_sub(card_hash_bytes(card.size), Ordering::Relaxed);
             }
         }
+        if let Some(gs) = &self.gpu_sync {
+            let total = gs.size.saturating_mul(2);
+            if window {
+                WINDOW_CARD_BYTES.fetch_sub(total, Ordering::Relaxed);
+            } else {
+                CARD_BYTES[0].fetch_sub(total, Ordering::Relaxed);
+            }
+            crate::gpu_sync::note_dropped(self.len);
+        }
     }
 }
 
@@ -4073,6 +4177,7 @@ impl Shadow {
             changes_only: Default::default(),
             mapped: false,
             place: None,
+            gpu_sync: None,
         }
     }
 
@@ -4130,10 +4235,8 @@ impl Shadow {
         if pending.contains(&range) {
             return;
         }
-        // In the card's memory: no snapshot. What shaders wrote is found on
-        // the card (`Host::card_before` reads the declared ranges from the
-        // lists).
-        if self.card.is_some() {
+        // In the card's memory (or GPU-direct sync): no CPU snapshot.
+        if self.card.is_some() || self.gpu_sync.is_some() {
             pending.push(range);
             self.has_pending.store(true, Ordering::Release);
             return;
@@ -4236,7 +4339,7 @@ impl Shadow {
     /// [`Shadow::copy_back`]; `found`, if given, is the pieces of the range
     /// that differ from the snapshot, found beforehand ([`find_all`]).
     pub(crate) fn copy_back_with(&self, address: usize, len: usize, found: Option<Vec<(usize, usize)>>) -> usize {
-        if self.place.is_some() {
+        if self.place.is_some() || self.gpu_sync.is_some() {
             return 0;
         }
         let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
@@ -4338,7 +4441,7 @@ impl Shadow {
     /// memory. Returns the bytes written to title memory.
     pub(crate) fn relay_merge(&self, at: usize, n: usize, now: &mut Vec<u8>, title: &mut Vec<u8>) -> usize {
         let start = self.start as usize;
-        if self.card.is_some() || n == 0 || at + n > self.len as usize {
+        if self.card.is_some() || self.gpu_sync.is_some() || n == 0 || at + n > self.len as usize {
             return 0;
         }
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
@@ -4452,7 +4555,7 @@ impl Shadow {
             pending.retain(|r| !ranges.contains(r));
         }
         self.has_pending.store(!pending.is_empty(), Ordering::Release);
-        if !pending.is_empty() || self.card.is_some() {
+        if !pending.is_empty() || self.card.is_some() || self.gpu_sync.is_some() {
             return;
         }
         if keeps() {
@@ -4628,6 +4731,26 @@ impl Shadow {
             UNDER_NS[8].fetch_add(stale.len() as u64, Ordering::Relaxed);
             let t = under_ns(1, t);
             if stale.is_empty() {
+                continue;
+            }
+            if let Some(gs) = &self.gpu_sync {
+                let mut taken = Vec::new();
+                for page in stale {
+                    let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
+                    if lo < hi {
+                        let init = !gs.is_page_initialized(lo - start);
+                        gs.queue_upload(lo - start, hi - start, init);
+                        if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
+                            taken.push(page);
+                        }
+                    }
+                }
+                if !taken.is_empty() {
+                    let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                    for page in taken {
+                        copied.set(page - base, now);
+                    }
+                }
                 continue;
             }
             // The lock of the copy's reference (the snapshot, or the
@@ -4952,6 +5075,9 @@ impl Shadow {
     /// the copy and the address. One that differs once is a write of the
     /// title's that arrived between the refresh and the look.
     fn refresh_check(&self, from: usize, to: usize) {
+        if self.gpu_sync.is_some() {
+            return;
+        }
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_CHECK").is_some_and(|v| v == "1")) {
             return;
@@ -5037,6 +5163,15 @@ impl Shadow {
         const LONG: usize = 1 << 20;
         const PART: usize = 256 << 10;
         let bytes = runs.iter().map(|r| r.1 - r.0).sum();
+        if let Some(gs) = &self.gpu_sync {
+            let start = self.start as usize;
+            for (from, to, known) in runs {
+                if from < to {
+                    gs.queue_upload(from - start, to - start, !known);
+                }
+            }
+            return bytes;
+        }
         if bytes < LONG || !crate::watch::light() {
             for (from, to, known) in runs {
                 self.take(from, to, known);
@@ -5144,6 +5279,13 @@ impl Shadow {
     /// Copies title memory `[from, to)` (inside the buffer) into the copy;
     /// `known`: the copy held it before ([`send_changed`]).
     fn take(&self, from: usize, to: usize, known: bool) -> usize {
+        if let Some(gs) = &self.gpu_sync {
+            let start = self.start as usize;
+            if from < to {
+                gs.queue_upload(from - start, to - start, !known);
+            }
+            return to.saturating_sub(from);
+        }
         thread_local! {
             /// A page of title memory, as read.
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -5196,6 +5338,12 @@ impl Shadow {
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        if let Some(gs) = &self.gpu_sync {
+            if from < to {
+                gs.queue_upload(from - start, to - start, true);
+            }
+            return to.saturating_sub(from);
+        }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         if self.card.is_some() && from < to && crate::host::upcheck::on() {
@@ -5218,6 +5366,15 @@ impl Shadow {
     /// ([`cards`]).
     pub(crate) fn carded(&self) -> bool {
         self.card.is_some()
+    }
+
+    /// Whether this copy uses GPU-direct zero-CPU-copy 3-way sync (`VICTORY_GPU_SYNC=1`).
+    pub(crate) fn gpu_synced(&self) -> bool {
+        self.gpu_sync.is_some()
+    }
+
+    pub(crate) fn gpu_sync_ref(&self) -> Option<&crate::gpu_sync::SyncedShadow> {
+        self.gpu_sync.as_ref()
     }
 
     /// Shaders store in it what is not declared: from here on only the dwords
@@ -5272,7 +5429,7 @@ impl Shadow {
     /// is declared written by it, and its sends are taken.
     pub(crate) fn placed_copy(&self, address: usize, bytes: &[u8]) {
         let (from, to) = self.inside(address, bytes.len());
-        if from >= to || self.place.is_some() {
+        if from >= to || self.place.is_some() || self.gpu_sync.is_some() {
             return;
         }
         let bytes = &bytes[self.start as usize + from - address..][..to - from];
@@ -5697,7 +5854,7 @@ impl Shadow {
     /// as [`Shadow::land_card`]. The copy is read once and never written.
     /// Returns the bytes put into title memory.
     pub(crate) fn land_back(&self, at: usize, n: usize, notes: &mut crate::land::Notes) -> u64 {
-        if self.card.is_some() || n == 0 || at + n > self.len as usize {
+        if self.card.is_some() || self.gpu_sync.is_some() || n == 0 || at + n > self.len as usize {
             return 0;
         }
         let waiting = std::time::Instant::now();
@@ -6070,6 +6227,133 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     n
 }
 
+/// Resolves the byte length of the whole VirtualAlloc allocation starting at `at` when `len == 0`.
+fn resolve_free_len(at: u64, len: u64) -> u64 {
+    if len != 0 || at == 0 {
+        return len;
+    }
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let mut cur = at as usize;
+    let mut end = cur;
+    loop {
+        // SAFETY: plain POD struct filled by VirtualQuery.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: valid out pointer.
+        let n = unsafe { VirtualQuery(cur as *const _, &mut info, std::mem::size_of_val(&info)) };
+        if n == 0 || info.AllocationBase as usize != at as usize || info.RegionSize == 0 {
+            break;
+        }
+        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        if next <= end {
+            break;
+        }
+        end = next;
+        cur = next;
+    }
+    (end - at as usize) as u64
+}
+
+/// Detaches any GPU-direct synced copies whose 64 KiB-rounded
+/// `OpenExistingHeapFromAddress1` locked page range overlaps `[at, at + len)`
+/// when title memory is about to be freed, decommitted, or remapped.
+///
+/// Settles in-flight GPU work and drops detached `SyncedShadow` handles synchronously
+/// (never deferring via `host::retire`) so `OpenExistingHeapFromAddress1` unlocks the
+/// pages before the title's `VirtualFree` / `XMemFreeDefault` runs on the next line.
+pub(crate) fn gpu_sync_let_go(at: u64, len: u64) -> u64 {
+    let len = resolve_free_len(at, len);
+    if len == 0 {
+        return 0;
+    }
+    const K64: u64 = 1 << 16;
+    let aligned_at = at & !(K64 - 1);
+    let aligned_end = at.saturating_add(len).checked_next_multiple_of(K64).unwrap_or(u64::MAX);
+    let overlaps = |start: u64, end: u64| -> bool {
+        let lock_start = start & !(K64 - 1);
+        let lock_end = end.checked_next_multiple_of(K64).unwrap_or(u64::MAX);
+        lock_end > aligned_at && lock_start < aligned_end
+    };
+    let mut gone: Vec<Arc<Shadow>> = Vec::new();
+    {
+        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        let keys: Vec<(u64, u64)> = map
+            .range((aligned_at.saturating_sub(WINDOW), 0)..(aligned_end, 0))
+            .filter(|(key, shadow)| shadow.gpu_sync.is_some() && overlaps(key.0, key.0.saturating_add(key.1)))
+            .map(|(key, _)| *key)
+            .collect();
+        gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
+    }
+    {
+        let mut map = buffers();
+        for (key, entry) in map.range_mut(..(aligned_end, 0)).rev().take(256) {
+            if entry.shadow.as_ref().is_some_and(|s| s.gpu_sync.is_some()) && overlaps(key.0, entry.end) {
+                gone.extend(entry.shadow.take());
+            }
+        }
+    }
+    let n = gone.len() as u64;
+    let has_live_overlap = || -> bool {
+        let synced = GPU_SYNCED.lock().unwrap_or_else(|e| e.into_inner());
+        synced.iter().any(|w| {
+            w.upgrade().is_some_and(|s| {
+                let (s_start, s_len) = s.span();
+                overlaps(s_start, s_start.saturating_add(s_len))
+            })
+        })
+    };
+    if !gone.is_empty() || has_live_overlap() {
+        if !crate::watch::is_changing() {
+            // Normal path (`xmem.rs` calls `gpu_sync_memory_freeing` BEFORE `MAPPING.write()`):
+            // settle GPU work under `host.submitted`, drop `gone` synchronously, and drain ONLY
+            // matured retired entries (`*at <= FINISHED`) if an evicted shadow still overlaps.
+            crate::host::settle_and_release_for_memory_free(gone, &has_live_overlap);
+        } else {
+            // Already inside `MAPPING.write()` (`watch::title_memory_remapping`): NEVER acquire
+            // `host.submitted` (prevents AB-BA deadlock with `Host::submit` -> `MAPPING.read()`).
+            // If no GPU host is live (e.g. unit tests) drop synchronously; otherwise retire safely.
+            if host().is_none() {
+                drop(gone);
+            } else {
+                for shadow in gone {
+                    crate::host::retire(shadow);
+                }
+            }
+        }
+    }
+    GPU_SYNCED.lock().unwrap_or_else(|e| e.into_inner()).retain(|w| w.strong_count() > 0);
+    n
+}
+
+#[cfg(test)]
+pub(crate) fn new_gpu_sync_for_test(
+    buffer: ID3D12Resource,
+    start: u64,
+    len: u64,
+    synced: crate::gpu_sync::SyncedShadow,
+) -> Arc<Shadow> {
+    CARD_BYTES[0].fetch_add(synced.size.saturating_mul(2), Ordering::Relaxed);
+    crate::gpu_sync::note_attached(len);
+    // SAFETY: live D3D12 buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let mut shadow = Shadow::new(buffer, std::ptr::null_mut(), gpu, start, len);
+    shadow.gpu_sync = Some(synced);
+    let shadow = Arc::new(shadow);
+    GPU_SYNCED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+    shadow
+}
+
+#[cfg(test)]
+pub(crate) fn register_gpu_sync_for_test(resource: usize, shadow: Arc<Shadow>) {
+    let (start, len) = shadow.span();
+    buffers().insert(
+        (start, resource),
+        Entry {
+            end: start + len,
+            shadow: Some(shadow),
+        },
+    );
+}
+
 /// For the in-place census (`crate::inplace`): the title buffers (start,
 /// bytes, false) and the windows outside buffers that have a copy (start,
 /// bytes, true).
@@ -6173,6 +6457,35 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
+        }
+        // Opt-in GPU-direct zero-CPU-copy 3-way sync (`VICTORY_GPU_SYNC=1`):
+        // avoids allocating a CPU-side staging buffer (`title_shared_buffer`)
+        // when the title buffer is eligible and hardware supports L0 sync.
+        // Reserve 2 * size L1 VRAM (`card_room_for_gpu_sync`, never L0 fallback)
+        // BEFORE `try_attach` so failed VRAM admission never opens/drops an L0
+        // heap or inflates attach counters, and `CARD_BYTES[0]` accounts for both
+        // `shadow.buffer` and `before_buffer`.
+        if big
+            && crate::gpu_sync::on()
+            && crate::gpu_sync::check_eligibility(key.0, len).is_ok()
+            && let Some(h) = host()
+            && let Some(on_card) = card_room_for_gpu_sync(size)
+        {
+            if let Some(synced) = crate::gpu_sync::try_attach(h, key.0, len, size) {
+                debug_assert_eq!(synced.size, size);
+                crate::gpu_sync::note_attached(len);
+                crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} gpu-sync L1", key.0));
+                // SAFETY: live D3D12 buffer.
+                let gpu = unsafe { on_card.GetGPUVirtualAddress() };
+                let mut shadow = Shadow::new(on_card, std::ptr::null_mut(), gpu, key.0, len);
+                shadow.gpu_sync = Some(synced);
+                let shadow = Arc::new(shadow);
+                GPU_SYNCED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+                entry.shadow = Some(shadow);
+                return entry.shadow.clone();
+            }
+            drop(on_card);
+            CARD_BYTES[0].fetch_sub(size.saturating_mul(2), Ordering::Relaxed);
         }
         let (buffer, data) = host()?.title_shared_buffer(size)?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));

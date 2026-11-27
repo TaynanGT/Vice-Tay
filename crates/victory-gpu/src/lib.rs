@@ -51,6 +51,8 @@ pub mod fence;
 pub mod frame;
 #[cfg(windows)]
 pub mod framegen;
+#[cfg(windows)]
+mod gpu_sync;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod book;
 #[cfg(windows)]
@@ -162,6 +164,8 @@ pub fn frame_phase() -> u32 {
 pub fn frames_begun() -> u64 {
     frame::current()
 }
+#[cfg(windows)]
+pub use gpu_sync::memory_freeing as gpu_sync_memory_freeing;
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]

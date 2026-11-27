@@ -3763,6 +3763,11 @@ pub fn title_memory_remapping() -> Remapping {
     Remapping(changing)
 }
 
+/// Returns true if this thread currently holds [`title_memory_remapping`] (`MAPPING.write()`).
+pub(crate) fn is_changing() -> bool {
+    CHANGING.get().0
+}
+
 /// What a read of title memory in place holds ([`title_memory_reading`]).
 pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
 
@@ -3831,6 +3836,13 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
+    if crate::gpu_sync::on() || crate::gpu_sync::has_eligible() {
+        let resolved_end = if len != 0 { at.saturating_add(len) } else { allocation_end(at, at) };
+        let resolved_len = resolved_end.saturating_sub(at);
+        if resolved_len > 0 {
+            crate::inplace::title_memory_freeing(at, resolved_len);
+        }
+    }
     let first = at / BLOCK;
     let freed_end = if len != 0 {
         at.saturating_add(len).div_ceil(BLOCK)

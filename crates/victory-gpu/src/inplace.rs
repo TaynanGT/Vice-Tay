@@ -191,6 +191,12 @@ pub(crate) fn gone(window: bool, bytes: u64) {
 pub fn title_memory_freeing(at: usize, len: usize) {
     // Renderer port 1's regions there: no longer what the title shows.
     crate::port::forget(at, len);
+    if crate::gpu_sync::on() || crate::gpu_sync::has_eligible() {
+        let detached = crate::shadow::gpu_sync_let_go(at as u64, len as u64);
+        if detached > 0 {
+            crate::gpu_sync::note_detached(detached);
+        }
+    }
     if STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) == 0 {
         return;
     }

@@ -747,6 +747,10 @@ pub(crate) fn flush_retired() {
 mod retire_batch_tests {
     use super::*;
 
+    /// Serializes tests that advance `STARTED` and call `bury()` when `cargo test`
+    /// runs default unit tests in parallel.
+    static RETIRE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn a_late_batch_does_not_hide_eligible_retirements() {
         let item = |stamp| (stamp, Retired::Any(Box::new(())));
@@ -793,7 +797,9 @@ mod retire_batch_tests {
         let Some(host) = host() else {
             return;
         };
-        let prev_started = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
+        let _lock = RETIRE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = host.log_messages();
+        let _ = STARTED.fetch_add(1, Ordering::AcqRel);
         std::thread::scope(|s| {
             s.spawn(|| {
                 retire_in_batches();
@@ -812,7 +818,8 @@ mod retire_batch_tests {
                 assert_eq!(BATCH.with(|b| b.borrow().entries.len()), 0, "toggling off flushes buffered entries");
             });
         });
-        bury(prev_started.saturating_add(bury_lag()));
+        let end_stamp = STARTED.load(Ordering::Acquire) + crate::queue::queued();
+        bury(end_stamp.saturating_add(bury_lag()));
         assert_eq!(host.log_messages(), None);
     }
 
@@ -821,7 +828,9 @@ mod retire_batch_tests {
         let Some(host) = host() else {
             return;
         };
-        let prev_started = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
+        let _lock = RETIRE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = host.log_messages();
+        let _ = STARTED.fetch_add(1, Ordering::AcqRel);
         std::thread::scope(|s| {
             s.spawn(|| {
                 retire_in_batches();
@@ -837,7 +846,8 @@ mod retire_batch_tests {
                 assert_eq!(BATCH.with(|b| b.borrow().entries.len()), 0);
             });
         });
-        bury(prev_started.saturating_add(bury_lag()));
+        let end_stamp = STARTED.load(Ordering::Acquire) + crate::queue::queued();
+        bury(end_stamp.saturating_add(bury_lag()));
         assert_eq!(host.log_messages(), None);
     }
 
@@ -846,10 +856,12 @@ mod retire_batch_tests {
         let Some(host) = host() else {
             return;
         };
+        let _lock = RETIRE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = host.log_messages();
         const THREADS: usize = 4;
         const PER_THREAD: usize = 300; // exceeds BATCH_MOST (256) to exercise auto-flush + tail flush
         let before = RETIREMENTS[1].load(Ordering::Relaxed);
-        let prev_started = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
+        let _ = STARTED.fetch_add(1, Ordering::AcqRel);
         std::thread::scope(|s| {
             for t in 0..THREADS {
                 s.spawn(move || {
@@ -871,7 +883,8 @@ mod retire_batch_tests {
             "expected at least {} queued retirements, got {queued_now}",
             THREADS * PER_THREAD
         );
-        bury(prev_started.saturating_add(bury_lag()));
+        let end_stamp = STARTED.load(Ordering::Acquire) + crate::queue::queued();
+        bury(end_stamp.saturating_add(bury_lag()));
         assert_eq!(host.log_messages(), None);
     }
 
@@ -884,7 +897,9 @@ mod retire_batch_tests {
         let Some(host) = host() else {
             return;
         };
-        let stamp = STARTED.fetch_add(1, Ordering::AcqRel) + 1 + crate::queue::queued();
+        let _lock = RETIRE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = host.log_messages();
+        let stamp_before = STARTED.fetch_add(1, Ordering::AcqRel) + 1 + crate::queue::queued();
         let (buf_explicit, _) = host.upload_buffer(256).expect("upload buffer");
         let probe_explicit = buf_explicit.clone();
         let (buf_drop, _) = host.upload_buffer(256).expect("upload buffer");
@@ -914,16 +929,103 @@ mod retire_batch_tests {
                 // Intentionally exit without flush_retired() to exercise RetiredBatch::drop.
             });
         });
+        let stamp_after = STARTED.load(Ordering::Acquire) + crate::queue::queued();
 
         // Both resources must remain alive in RETIRED before their stamped submission finishes.
-        bury(stamp.saturating_sub(1).saturating_add(bury_lag()));
+        bury(stamp_before.saturating_sub(1).saturating_add(bury_lag()));
         assert!(references(&probe_explicit) >= 2, "explicitly flushed resource dropped before bury");
         assert!(references(&probe_drop) >= 2, "drop-flushed resource dropped before bury");
 
         // Once the stamped submission plus bury_lag finishes, both must be released.
-        bury(stamp.saturating_add(bury_lag()));
+        bury(stamp_after.saturating_add(bury_lag()));
         assert_eq!(references(&probe_explicit), 1, "explicitly flushed resource leaked after bury");
         assert_eq!(references(&probe_drop), 1, "drop-flushed resource leaked after bury");
+        assert_eq!(host.log_messages(), None);
+    }
+
+    #[test]
+    fn mixed_batched_and_direct_retirement_releases_older_resource_at_its_own_deadline_on_gpu() {
+        struct SendResource(ID3D12Resource);
+        // SAFETY: D3D12 resources are free-threaded (same invariant as `Retired`).
+        unsafe impl Send for SendResource {}
+
+        let Some(host) = host() else {
+            return;
+        };
+        let _lock = RETIRE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = host.log_messages();
+        let lag = bury_lag();
+
+        for (batch_on, explicit_flush) in [(false, true), (true, true), (true, false)] {
+            let (buf_n, _) = host.upload_buffer(256).expect("upload buffer");
+            let probe_n = buf_n.clone();
+            let (buf_n1, _) = host.upload_buffer(256).expect("upload buffer");
+            let probe_n1 = buf_n1.clone();
+            assert_eq!(references(&probe_n), 2);
+            assert_eq!(references(&probe_n1), 2);
+            let send_n = SendResource(buf_n);
+            let send_n1 = SendResource(buf_n1);
+
+            let (stamp_before_n, stamp_after_n, stamp_after_n1) = std::thread::scope(|s| {
+                s.spawn(move || {
+                    let SendResource(buf_n) = send_n;
+                    let SendResource(buf_n1) = send_n1;
+                    retire_in_batches();
+
+                    let before_n = STARTED.fetch_add(1, Ordering::AcqRel) + 1 + crate::queue::queued();
+                    retire_resource_with(buf_n, batch_on);
+                    let after_n = STARTED.load(Ordering::Acquire) + crate::queue::queued();
+
+                    // Advance stamp strictly past `after_n`, then push direct retirements on the
+                    // same thread before handing over the older batched resource.
+                    STARTED.fetch_add(1, Ordering::AcqRel);
+                    retire(());
+                    retire(buf_n1);
+                    let after_n1 = STARTED.load(Ordering::Acquire) + crate::queue::queued();
+
+                    if explicit_flush {
+                        flush_retired();
+                    }
+                    // When `explicit_flush == false`, thread exit exercises `RetiredBatch::drop`.
+                    (before_n, after_n, after_n1)
+                })
+                .join()
+                .expect("mixed retirement worker")
+            });
+
+            // Neither resource may drop before `buf_n`'s fence deadline.
+            bury(stamp_before_n.saturating_sub(1).saturating_add(lag));
+            assert!(
+                references(&probe_n) >= 2,
+                "batch_on={batch_on} explicit={explicit_flush}: older resource dropped before its deadline"
+            );
+            assert!(
+                references(&probe_n1) >= 2,
+                "batch_on={batch_on} explicit={explicit_flush}: newer resource dropped before older deadline"
+            );
+
+            // At `buf_n`'s own fence deadline, `buf_n` must drop to refcount 1 immediately
+            // (not stalled behind the newer direct `retire(())`/`buf_n1` entries), while
+            // `buf_n1` remains alive until its own deadline.
+            bury(stamp_after_n.saturating_add(lag));
+            assert_eq!(
+                references(&probe_n),
+                1,
+                "batch_on={batch_on} explicit={explicit_flush}: older resource stuck behind newer direct entry"
+            );
+            assert!(
+                references(&probe_n1) >= 2,
+                "batch_on={batch_on} explicit={explicit_flush}: newer resource dropped at older deadline"
+            );
+
+            // Once `buf_n1`'s deadline passes, it releases cleanly too.
+            bury(stamp_after_n1.saturating_add(lag));
+            assert_eq!(
+                references(&probe_n1),
+                1,
+                "batch_on={batch_on} explicit={explicit_flush}: newer resource leaked after its deadline"
+            );
+        }
         assert_eq!(host.log_messages(), None);
     }
 }

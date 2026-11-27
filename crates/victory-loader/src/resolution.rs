@@ -381,6 +381,19 @@ unsafe fn put(at: usize, bytes: &[u8]) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// [`write_all`] for patches given by image offset (`rva`), `Err` as text
+/// naming the site that stopped it. All or nothing, rolled back on a failed
+/// write part way.
+///
+/// # Safety
+/// The image stays mapped and no thread runs its code yet.
+#[cfg(windows)]
+pub unsafe fn write_all_checked(base: usize, size: usize, patches: &[(u32, Vec<u8>, Vec<u8>)]) -> Result<(), String> {
+    let sites: Vec<(usize, &[u8], &[u8])> = patches.iter().map(|(rva, old, new)| (*rva as usize, &old[..], &new[..])).collect();
+    // SAFETY: the caller's promise.
+    unsafe { write_all(base, size, &sites) }.map_err(|(i, why)| format!("+{:#x}: {why:?}", patches[i].0))
+}
+
 /// Applies what the switches ask for; a line each in the log and on
 /// standard output.
 ///
@@ -580,6 +593,40 @@ mod tests {
         let before = image.clone();
         assert_eq!(write_pair(&mut image, Some(2)), Err((1, Patched::Failed("refused"))));
         assert_eq!(image, before);
+    }
+
+    /// The step patch's four sites (victory-game's `step::patches`) written
+    /// all or nothing: a site that cannot be written after the first ones
+    /// leaves every site with its old bytes.
+    #[test]
+    fn a_failed_step_site_after_the_first_rolls_all_back() {
+        // Four sites at small offsets standing for the real ones.
+        let olds: [Vec<u8>; 4] = [vec![0xcc; 4], vec![0xc5, 0xfa, 0x10, 0x1d, 1, 2, 3, 4], vec![0xc5, 0xfa, 0x10, 0x05, 5, 6, 7, 8], vec![0xc5, 0xfa, 0x10, 0x05, 9, 10, 11, 12]];
+        let news: [Vec<u8>; 4] = [0.1f32.to_le_bytes().to_vec(), vec![0xc5, 0xfa, 0x10, 0x1d, 0xa, 0, 0, 0], vec![0xc5, 0xfa, 0x10, 0x05, 0xb, 0, 0, 0], vec![0xc5, 0xfa, 0x10, 0x05, 0xc, 0, 0, 0]];
+        let at = [0x10usize, 0x40, 0x80, 0xc0];
+        let mut image = vec![0u8; 0x100];
+        for i in 0..4 {
+            image[at[i]..at[i] + olds[i].len()].copy_from_slice(&olds[i]);
+        }
+        let before = image.clone();
+        let sites: Vec<(usize, &[u8], &[u8])> = (0..4).map(|i| (at[i], &olds[i][..], &news[i][..])).collect();
+        for fail in 2..=4 {
+            let base = image.as_mut_ptr() as usize;
+            let mut calls = 0;
+            // SAFETY: `image` is ours; the writer stays inside it.
+            let done = unsafe {
+                write_all_with(base, image.len(), &sites, |p, bytes| {
+                    calls += 1;
+                    if calls == fail {
+                        return Err("refused");
+                    }
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), p as *mut u8, bytes.len());
+                    Ok(())
+                })
+            };
+            assert_eq!(done, Err((fail - 1, Patched::Failed("refused"))), "failing write {fail}");
+            assert_eq!(image, before, "every site back after failing write {fail}");
+        }
     }
 
     #[cfg(windows)]

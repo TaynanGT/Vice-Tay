@@ -420,6 +420,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
         // A new host list is open, and stays so: the title's next call on
         // its list is a reset, which closes a recording that is discarded
         // (see `detach`).
+        fresh.left_open();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
@@ -498,6 +499,7 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
         // reset runs on the thread that translates the title's calls. A list the title
         // submits again without a reset gives this one, open: closed when
         // it is taken (`close_if_open`).
+        fresh.left_open();
         let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
@@ -2446,6 +2448,57 @@ mod tests {
         assert_eq!(reset(list, allocator, null), S_OK);
         // SAFETY: the list is ours.
         assert!(unsafe { &(*list.cast::<List>()).uploads }.lock().unwrap().is_empty());
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    /// The host lists of a title's list reach execution closed: the one it
+    /// records into after the Reset that follows a submission, and the one
+    /// a second submission with no Reset in between takes. Through the
+    /// title's own calls, with the lists run by a real submission.
+    #[cfg(windows)]
+    #[test]
+    fn host_lists_reach_execution_closed_after_a_reset_and_when_submitted_twice() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("skipping: no D3D12 device");
+            return;
+        };
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        let mut list = null;
+        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+        let open = |list: This| !host_list(list).expect("a host list").is_closed();
+        // The first recording: closed by the title, taken by a submission.
+        assert_eq!(close(list), S_OK);
+        let first = detach(&[list]);
+        assert!(first.0[0].host().is_closed());
+        assert!(open(list), "the host list given in its place is left open");
+        // The title's next Reset, a command, its Close, and the submission.
+        assert_eq!(reset(list, allocator, null), S_OK);
+        assert!(open(list), "open for recording after the Reset");
+        state::stencil_ref(list, 1);
+        assert_eq!(close(list), S_OK);
+        let second = detach(&[list]);
+        assert!(second.0[0].host().is_closed(), "the recording after the Reset");
+        // Submitted again with no Reset in between: the list left open by
+        // the second submission is taken, and closed for it.
+        assert!(open(list));
+        let third = detach(&[list]);
+        assert!(third.0[0].host().is_closed(), "the list taken with no Reset before");
+        // Where lists go to the queue none of them is open, and they run.
+        for (taken, order) in [first, second, third] {
+            assert_eq!(order, [0]);
+            {
+                let runs: Vec<&crate::host::HostList> = order.iter().map(|&i| taken[i].host()).collect();
+                assert_eq!(crate::host::closed_for_execution(&runs), 0);
+                host.execute(&runs);
+            }
+            // SAFETY: a plain query of the device.
+            assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+            recycle(taken, &order);
+        }
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);

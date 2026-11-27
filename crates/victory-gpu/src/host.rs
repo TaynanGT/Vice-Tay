@@ -1288,13 +1288,287 @@ mod tests {
 /// ([`HostList::batch_place`]).
 const BATCHES: u32 = 8;
 
+/// How a host list that was open is closed ([`Recording::close`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Closing {
+    /// With what was recorded into it: the title's Close, a cut at a wait,
+    /// a list of ours.
+    Recorded,
+    /// Taken for a submission while open (`HostList::close_if_open`).
+    Taken,
+    /// Still open where the lists go to the queue ([`closed_for_execution`]).
+    AtExecution,
+}
+
+/// What became of the host lists that were left open
+/// ([`Recording::left_open`]), and of lists that came to a submission open.
+#[derive(Default)]
+pub(crate) struct OpenLists {
+    /// Left open: handed to a title's list in place of the recording a
+    /// submission took (`crate::list::detach`).
+    pub(crate) left: std::sync::atomic::AtomicU64,
+    /// Of those: closed by the title's next Reset of its list.
+    pub(crate) by_reset: std::sync::atomic::AtomicU64,
+    /// Of those: closed when the title's list was submitted again with no
+    /// Reset in between.
+    pub(crate) taken_again: std::sync::atomic::AtomicU64,
+    /// Of those: closed with something recorded and no Reset before it.
+    pub(crate) otherwise: std::sync::atomic::AtomicU64,
+    /// Recordings begun by a Reset that the title submitted without a
+    /// Close: closed when taken.
+    pub(crate) unclosed: std::sync::atomic::AtomicU64,
+    /// Open where the lists go to the queue, and closed there. No path is
+    /// known to lead here.
+    pub(crate) at_execution: std::sync::atomic::AtomicU64,
+}
+
+impl OpenLists {
+    const fn new() -> Self {
+        OpenLists {
+            left: std::sync::atomic::AtomicU64::new(0),
+            by_reset: std::sync::atomic::AtomicU64::new(0),
+            taken_again: std::sync::atomic::AtomicU64::new(0),
+            otherwise: std::sync::atomic::AtomicU64::new(0),
+            unclosed: std::sync::atomic::AtomicU64::new(0),
+            at_execution: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// The six counts, in the order of the fields.
+    #[cfg(any(test, feature = "diagnostics"))]
+    pub(crate) fn counts(&self) -> [u64; 6] {
+        [&self.left, &self.by_reset, &self.taken_again, &self.otherwise, &self.unclosed, &self.at_execution]
+            .map(|count| count.load(Ordering::Relaxed))
+    }
+}
+
+/// Of every host list of the process.
+pub(crate) static OPEN_LISTS: OpenLists = OpenLists::new();
+
+/// For the lines every five seconds: what became of the host lists left
+/// open, since the start.
+#[cfg(feature = "diagnostics")]
+fn open_lists_line() {
+    let [left, by_reset, taken_again, otherwise, unclosed, at_execution] = OPEN_LISTS.counts();
+    tracing::info!(
+        "host lists left open when their recording was taken, since the start: {left}; closed by the title's next Reset \
+         {by_reset}, when submitted again without a Reset {taken_again}, with something recorded and no Reset {otherwise}; \
+         recordings submitted without a Close and closed when taken {unclosed}; found open where lists go to the queue \
+         {at_execution} (none is expected)"
+    );
+}
+
+/// Whether a host list is open for recording, apart from the D3D12 calls:
+/// [`HostList`] asks it what to do with its native list and tells it what
+/// it did. A list is open when made and after a reset, and closed by a
+/// close; only a closed list may go to a queue.
+pub(crate) struct Recording(std::sync::atomic::AtomicU8);
+
+impl Recording {
+    const CLOSED: u8 = 0;
+    const OPEN: u8 = 1;
+    /// Open, and handed to a title's list in place of the recording a
+    /// submission took: the title has not reset it yet.
+    const LEFT_OPEN: u8 = 2;
+
+    /// Of a list just made or reset.
+    pub(crate) const fn open() -> Self {
+        Recording(std::sync::atomic::AtomicU8::new(Self::OPEN))
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.0.load(Ordering::Relaxed) == Self::CLOSED
+    }
+
+    /// The open list is handed to a title's list whose recording was taken,
+    /// and is not closed for it.
+    pub(crate) fn left_open(&self, lists: &OpenLists) {
+        if self.0.compare_exchange(Self::OPEN, Self::LEFT_OPEN, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+            lists.left.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The list is to be closed: whether it was open, so that its native
+    /// list has to be closed. It counts as closed from here on.
+    pub(crate) fn close(&self, how: Closing, lists: &OpenLists) -> bool {
+        let count = match (self.0.swap(Self::CLOSED, Ordering::Relaxed), how) {
+            (Self::CLOSED, _) => return false,
+            (_, Closing::AtExecution) => &lists.at_execution,
+            (Self::LEFT_OPEN, Closing::Taken) => &lists.taken_again,
+            (Self::LEFT_OPEN, Closing::Recorded) => &lists.otherwise,
+            (_, Closing::Taken) => &lists.unclosed,
+            (_, Closing::Recorded) => return true,
+        };
+        count.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// The list is reset: whether it was open, so that its native list has
+    /// to be closed first, as a recording that is discarded. It is open
+    /// from here on.
+    pub(crate) fn reset(&self, lists: &OpenLists) -> bool {
+        match self.0.swap(Self::OPEN, Ordering::Relaxed) {
+            Self::CLOSED => false,
+            Self::LEFT_OPEN => {
+                lists.by_reset.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            _ => true,
+        }
+    }
+}
+
+#[cfg(test)]
+mod recording_tests {
+    use super::{Closing, OPEN_LISTS, OpenLists, Recording, host};
+
+    /// A title's list through a submission, its next Reset and a second
+    /// submission: the host list it was left open is closed by the Reset
+    /// (its native list has to be, before its allocator is reset), records,
+    /// is closed by the title, and has nothing left to close where the
+    /// lists go to the queue.
+    #[test]
+    fn a_list_left_open_is_closed_by_the_next_reset_and_closed_when_submitted() {
+        let lists = OpenLists::default();
+        // The first recording: closed by the title, taken by the submission.
+        let first = Recording::open();
+        assert!(first.close(Closing::Recorded, &lists));
+        assert!(first.is_closed());
+        // In its place a new host list, left open.
+        let second = Recording::open();
+        second.left_open(&lists);
+        assert!(!second.is_closed());
+        // The title's Reset.
+        assert!(second.reset(&lists), "the open native list must be closed before the reset");
+        assert!(!second.is_closed());
+        // Recorded into, closed by the title, taken by the second submission.
+        assert!(second.close(Closing::Recorded, &lists));
+        assert!(second.is_closed());
+        for taken in [&first, &second] {
+            assert!(!taken.close(Closing::AtExecution, &lists), "open where the lists go to the queue");
+        }
+        assert_eq!(lists.counts(), [1, 1, 0, 0, 0, 0]);
+    }
+
+    /// A title's list submitted twice with no Reset in between: the second
+    /// submission takes the host list that was left open, which is closed
+    /// when it is taken.
+    #[test]
+    fn a_list_submitted_twice_without_a_reset_is_closed_when_taken() {
+        let lists = OpenLists::default();
+        let first = Recording::open();
+        assert!(first.close(Closing::Recorded, &lists));
+        let second = Recording::open();
+        second.left_open(&lists);
+        // (`HostList::close_if_open`: open, so it is closed as taken.)
+        assert!(!second.is_closed());
+        assert!(second.close(Closing::Taken, &lists));
+        assert!(second.is_closed());
+        // The title's list has a third, left open; that one is not submitted.
+        let third = Recording::open();
+        third.left_open(&lists);
+        for taken in [&first, &second] {
+            assert!(!taken.close(Closing::AtExecution, &lists), "open where the lists go to the queue");
+        }
+        assert_eq!(lists.counts(), [2, 0, 1, 0, 0, 0]);
+    }
+
+    /// An open list where the lists go to the queue is closed there and
+    /// counted, once.
+    #[test]
+    fn a_list_open_at_the_queue_is_closed_there_and_counted() {
+        let lists = OpenLists::default();
+        for left in [false, true] {
+            let list = Recording::open();
+            if left {
+                list.left_open(&lists);
+            }
+            assert!(list.close(Closing::AtExecution, &lists));
+            assert!(list.is_closed());
+            assert!(!list.close(Closing::AtExecution, &lists));
+        }
+        assert_eq!(lists.counts(), [1, 0, 0, 0, 0, 2]);
+    }
+
+    /// Every list left open is counted once, by what closed it; a recording
+    /// the title discards or closes itself is none of them.
+    #[test]
+    fn what_closes_an_open_list_is_counted_once() {
+        let lists = OpenLists::default();
+        // Left open, then closed with something recorded and no Reset.
+        let list = Recording::open();
+        list.left_open(&lists);
+        list.left_open(&lists);
+        assert!(list.close(Closing::Recorded, &lists));
+        assert!(!list.close(Closing::Recorded, &lists));
+        assert_eq!(lists.counts(), [1, 0, 0, 1, 0, 0]);
+        // A closed list is reset: nothing to close first. Its recording is
+        // discarded by another Reset: closed first, not counted.
+        assert!(!list.reset(&lists));
+        assert!(list.reset(&lists));
+        // Submitted without a Close: closed when taken.
+        assert!(list.close(Closing::Taken, &lists));
+        assert!(!list.close(Closing::Taken, &lists));
+        assert_eq!(lists.counts(), [1, 0, 0, 1, 1, 0]);
+        // A closed list is not left open.
+        list.left_open(&lists);
+        assert!(list.is_closed());
+        assert_eq!(lists.counts(), [1, 0, 0, 1, 1, 0]);
+    }
+
+    /// The check where lists go to the queue, with a real list: one given
+    /// to a submission open is closed there, counted, and runs.
+    #[test]
+    fn an_open_host_list_given_to_a_submission_is_closed_and_runs() {
+        let Some(host) = host() else {
+            eprintln!("skipping: no D3D12 device");
+            return;
+        };
+        let list = host.new_list().unwrap();
+        assert!(!list.is_closed());
+        let before = OPEN_LISTS.counts()[5];
+        host.execute(&[&list]);
+        assert!(list.is_closed());
+        assert!(OPEN_LISTS.counts()[5] > before);
+        // SAFETY: a plain query of the device.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+}
+
+/// Where host lists go to a queue: only closed lists may. Every path closes
+/// them before (the title's Close, `HostList::close_if_open` when a list is
+/// taken open); one that is open still is closed here, with what it holds,
+/// counted and logged (the first four, then every one that doubles the
+/// count). How many were open.
+pub(crate) fn closed_for_execution(runs: &[&HostList]) -> usize {
+    let mut found = 0;
+    for list in runs {
+        if !list.recording.is_closed() {
+            list.close_as(Closing::AtExecution);
+            found += 1;
+        }
+    }
+    if found != 0 {
+        let so_far = OPEN_LISTS.at_execution.load(Ordering::Relaxed);
+        if (so_far - found as u64..so_far).any(|n| n < 4 || (n + 1).is_power_of_two()) {
+            tracing::warn!(
+                found,
+                so_far,
+                lists = runs.len(),
+                "host lists were still open where they go to the queue: closed there"
+            );
+        }
+    }
+    found
+}
+
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
     /// With barriers held and joined (`rec`).
     pub(crate) list: rec::Rec,
-    /// Whether the underlying D3D12 list has been closed since its last reset.
-    closed: std::sync::atomic::AtomicBool,
+    /// Whether the underlying D3D12 list is open for recording.
+    recording: Recording,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -4938,7 +5212,7 @@ impl Host {
             Ok(HostList {
                 allocator,
                 list: rec::Rec::new(list),
-                closed: std::sync::atomic::AtomicBool::new(false),
+                recording: Recording::open(),
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
@@ -6030,6 +6304,9 @@ impl Host {
         late_threads();
         if let Some(cut) = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
+            // (Before the lists' steps are looked at for a cut; `submit`
+            // checks again, which costs a load for each list.)
+            closed_for_execution(&runs);
             card_steps::cut_for(&runs)
         } {
             match split(lists, order, cut) {
@@ -6351,6 +6628,9 @@ impl Host {
     /// ([`joins`]): those go to the queue in calls of their own, one after the
     /// other, as they would have.
     fn submit<'a>(&'a self, runs: &[&HostList], parts: &[usize], late: bool) -> Submission<'a> {
+        // Before anything looks at the lists' steps: a list is whole only
+        // when it is closed.
+        closed_for_execution(runs);
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -7197,6 +7477,22 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        self.close_as(Closing::Recorded);
+    }
+
+    /// Whether the list is closed: only then may it go to a queue.
+    #[cfg(test)]
+    pub(crate) fn is_closed(&self) -> bool {
+        self.recording.is_closed()
+    }
+
+    /// The list, new or reset and open, is handed to a title's list whose
+    /// recording a submission took, and stays open (`crate::list::detach`).
+    pub(crate) fn left_open(&self) {
+        self.recording.left_open(&OPEN_LISTS);
+    }
+
+    fn close_as(&self, how: Closing) {
         let _closing = crate::timeline::span("closing a host list");
         self.twins_to_depth();
         self.textures_back();
@@ -7222,15 +7518,15 @@ impl HostList {
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
         }
-        self.closed.store(true, Ordering::Relaxed);
+        self.recording.close(how, &OPEN_LISTS);
     }
 
     /// Closes a list that is open still, before it goes to a queue: the one
     /// a title's list was given when its recording was taken
     /// (`crate::list::detach`), submitted again with no reset in between.
     pub(crate) fn close_if_open(&self) {
-        if !self.closed.load(Ordering::Relaxed) {
-            self.close();
+        if !self.recording.is_closed() {
+            self.close_as(Closing::Taken);
         }
     }
 
@@ -7264,8 +7560,9 @@ impl HostList {
         let started = std::time::Instant::now();
         let _resetting = crate::timeline::span("resetting a host list");
         self._alive.used();
-        if !self.closed.load(Ordering::Relaxed) {
-            // SAFETY: the title is discarding an unsubmitted recording. Its
+        if self.recording.reset(&OPEN_LISTS) {
+            // SAFETY: the title is discarding an unsubmitted recording, or
+            // resets the list it was left open (`crate::list::detach`). Its
             // native list must close before its allocator can be reset.
             if let Err(e) = unsafe { self.list.close_discarded() } {
                 fail(format_args!("a discarded host command list did not close ({e})"));
@@ -7303,7 +7600,6 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
-        self.closed.store(false, Ordering::Relaxed);
         // Reuse only after the old native commands have been discarded.
         drop(texture_backs);
         self.prelude.recycle(&prelude_pool::IDLE);
@@ -10252,6 +10548,8 @@ impl Meter {
             if !five {
                 return;
             }
+            #[cfg(feature = "diagnostics")]
+            open_lists_line();
                 tracing::info!(
                     "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                     crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)

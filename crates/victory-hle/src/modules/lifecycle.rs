@@ -163,7 +163,7 @@ fn place(
     width: i32,
     height: i32,
 ) -> (Windowed, Option<WindowState>) {
-    if !placeable(ex_style, style, !parent.is_null()) || width == 0 || height == 0 {
+    if !placeable(ex_style, style, !parent.is_null()) || zero_sized(width, height) {
         return ((ex_style, style, (x, y, width, height)), None);
     }
     // Use the chosen monitor's work area for the windowed size and its
@@ -185,6 +185,13 @@ fn place(
         tracing::info!(width = screen.0, height = screen.1, left = origin.0, top = origin.1, "title window made full screen");
     }
     (if full_screen { full } else { windowed }, Some(WindowState { windowed, full_screen }))
+}
+
+/// Whether a window asks for no area of its own (a hidden helper keeps what it asked for). A
+/// width of `CW_USEDEFAULT` leaves the size to Windows, which then ignores the height: a height
+/// of 0 there is a normal default-sized window, not a zero-sized one.
+fn zero_sized(width: i32, height: i32) -> bool {
+    width != wm::CW_USEDEFAULT && (width == 0 || height == 0)
 }
 
 /// The styles and place the title's top-level window had (or would have
@@ -773,6 +780,20 @@ mod tests {
         let (placed, state) = place(wm::WS_EX_TOOLWINDOW, wm::WS_POPUP, parent, 25, 60, 3000, 2000);
         assert_eq!(placed, (wm::WS_EX_TOOLWINDOW, wm::WS_POPUP, (25, 60, 3000, 2000)));
         assert!(state.is_none(), "the tool window keeps its placement");
+    }
+
+    /// A default-sized window (`CW_USEDEFAULT` width; Windows ignores the height, here 0) is
+    /// a normal window: placed, and kept for full screen and its toggle; a width of 0 is not.
+    #[test]
+    fn a_default_width_with_zero_height_is_not_a_zero_sized_helper() {
+        let default = wm::CW_USEDEFAULT;
+        assert!(!zero_sized(default, 0));
+        assert!(!zero_sized(default, default));
+        assert!(zero_sized(0, 0));
+        assert!(zero_sized(0, 600));
+        assert!(zero_sized(800, 0));
+        let (_, state) = place(wm::WS_EX_APPWINDOW, wm::WS_OVERLAPPEDWINDOW, std::ptr::null_mut(), default, 0, default, 0);
+        assert!(state.is_some(), "the default-sized window keeps its full-screen state");
     }
 
     /// `VICTORY_MONITOR`: a device name with or without its prefix, any

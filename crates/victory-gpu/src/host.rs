@@ -232,10 +232,37 @@ static RAM_GATE: [std::sync::atomic::AtomicU64; 6] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(u64::MAX),
 ];
-/// The second [`ram_wait_share`] is counted in, and the milliseconds spent
-/// of it.
-static RAM_SHARE: [std::sync::atomic::AtomicU64; 2] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// The second [`ram_wait_share`] is counted in (above [`SPENT_BITS`]) and
+/// the milliseconds spent of it (below), in one word: a new second and a
+/// charge to it are one operation ([`take_share`]).
+static RAM_SHARE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The bits of [`RAM_SHARE`] that hold the milliseconds spent (at most
+/// 1,000 of a second).
+const SPENT_BITS: u32 = 20;
+
+/// [`RAM_SHARE`]'s word after `step` ms are charged in `second`, or `None`
+/// when that would spend more than `share` ms of it. A second later than the
+/// word's starts at 0; an earlier one (a thread that read the clock before
+/// another moved the word on) is charged to the word's own second, so the
+/// word never goes back and no charge is lost.
+fn charged(word: u64, second: u64, step: u64, share: u64) -> Option<u64> {
+    let at = (word >> SPENT_BITS).max(second);
+    let spent = if word >> SPENT_BITS == at {
+        word & ((1 << SPENT_BITS) - 1)
+    } else {
+        0
+    };
+    (spent + step <= share).then_some((at << SPENT_BITS) | (spent + step))
+}
+
+/// Charges `step` ms of `second` to `slot` if the share has room for them.
+fn take_share(slot: &std::sync::atomic::AtomicU64, second: u64, step: u64, share: u64) -> bool {
+    slot.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |word| {
+        charged(word, second, step, share)
+    })
+    .is_ok()
+}
 
 /// Whether the RAM throttle holds back a buffer of `size` bytes about to be
 /// made in the PC's memory, with `free` bytes of RAM free and `floor` the
@@ -281,11 +308,7 @@ pub(crate) fn ram_gate(size: u64) {
             break;
         }
         // The second's share, for all threads together.
-        let second = now / 1000;
-        if RAM_SHARE[0].swap(second, Ordering::Relaxed) != second {
-            RAM_SHARE[1].store(0, Ordering::Relaxed);
-        }
-        if RAM_SHARE[1].fetch_add(10, Ordering::Relaxed) + 10 > share {
+        if !take_share(&RAM_SHARE, now / 1000, 10, share) {
             RAM_GATE[2].fetch_add(1, Ordering::Relaxed);
             break;
         }
@@ -11799,6 +11822,49 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!((ms, bytes), (5_000, 5 * gib));
         assert_eq!(vram_keep(100 * gib, 120 * gib), (1_500, 35 * gib));
         assert_eq!(vram_keep(0, 7).0, 5_000);
+    }
+
+    /// The share of a second is spent once over all threads, across the
+    /// turn of a second too: no charge is lost and none is given twice.
+    #[test]
+    fn the_ram_throttle_share_holds_across_a_second_with_concurrent_callers() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, Barrier};
+        assert_eq!(super::charged(0, 5, 10, 30), Some((5 << super::SPENT_BITS) | 10));
+        let full = (5 << super::SPENT_BITS) | 30;
+        assert_eq!(super::charged(full, 5, 10, 30), None);
+        // A new second starts at 0; an earlier one is charged to the word's.
+        assert_eq!(super::charged(full, 6, 10, 30), Some((6 << super::SPENT_BITS) | 10));
+        assert_eq!(super::charged((6 << super::SPENT_BITS) | 10, 5, 10, 30), Some((6 << super::SPENT_BITS) | 20));
+        let (share, step, threads, tries) = (900u64, 10u64, 8usize, 400usize);
+        let slot = Arc::new(AtomicU64::new(0));
+        let counts: Arc<[AtomicU64; 2]> = Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
+        let barrier = Arc::new(Barrier::new(threads));
+        let workers: Vec<_> = (0..threads)
+            .map(|t| {
+                let (slot, counts, barrier) = (slot.clone(), counts.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    for (i, second) in [(0usize, 7u64), (1, 8)] {
+                        barrier.wait();
+                        for n in 0..tries {
+                            // Half of the threads read the clock late: the
+                            // second before, once the word has moved on.
+                            let asked = if i == 1 && t % 2 == 1 && n % 3 == 0 { 7 } else { second };
+                            if super::take_share(&slot, asked, step, share) {
+                                counts[i].fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap();
+        }
+        // Far more asked than the share has room for: exactly the share each second.
+        assert_eq!(counts[0].load(Ordering::Relaxed), share / step);
+        assert_eq!(counts[1].load(Ordering::Relaxed), share / step);
+        assert_eq!(slot.load(Ordering::Relaxed), (8 << super::SPENT_BITS) | share);
     }
 
     #[test]

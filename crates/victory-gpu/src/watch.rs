@@ -4969,7 +4969,9 @@ mod tests {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
         for &view in views {
-            title_memory_remapped(view, bytes);
+            // As the runtime does before an unmapping: the views are forgotten,
+            // or the next private allocation at this address counts as one.
+            title_memory_unmapping(view, bytes);
             // SAFETY: a view of the section mapped by `two_views`.
             unsafe {
                 UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {

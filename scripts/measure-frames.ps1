@@ -15,26 +15,19 @@ if ($hasFrom -and $hasUntil -and $Until -le $From) {
 
 $file = (Get-Item -LiteralPath $Path -ErrorAction Stop).FullName
 $culture = [Globalization.CultureInfo]::InvariantCulture
-$pattern = [regex]'(?<time>\d{4}-\d\d-\d\dT\S+)\s+INFO\s+victory_gpu::host:\s+(?<fps>\d+(?:\.\d+)?) fps, (?<ms>\d+(?:\.\d+)?) ms/frame \(.*?\), (?<draws>\d+) draws/frame'
-$recordStart = [regex]'^\s*\d{4}-\d\d-\d\dT\S+\s+(?:TRACE|DEBUG|INFO|WARN|ERROR)\s+'
+$pattern = [regex]'^\s*(?<time>\d{4}-\d\d-\d\dT\S+)\s+INFO\s+victory_gpu::host:\s+(?<fps>\d+(?:\.\d+)?) fps, (?<ms>\d+(?:\.\d+)?) ms/frame \(.*?\), (?<draws>\d+) draws/frame'
+$recordStart = [regex]'^\s*\d{4}-\d\d-\d\dT\S+(?=\s|$)'
 $rates = [Collections.Generic.List[double]]::new()
 $times = [Collections.Generic.List[double]]::new()
 $report = ''
 foreach ($line in [IO.File]::ReadLines($file)) {
-    if ($line.Contains('victory_gpu::host:') -and $line.Contains(' ms/frame')) {
-        $report = $line -replace '\x1b\[[0-9;]*m', ''
-    } elseif ($report) {
-        $part = $line -replace '\x1b\[[0-9;]*m', ''
-        if ($recordStart.IsMatch($part)) {
-            $report = ''
-            continue
-        }
-        if (-not [string]::IsNullOrWhiteSpace($part)) {
-            $report = $report.TrimEnd() + ' ' + $part.TrimStart()
-        }
-    } else {
-        continue
+    $part = $line -replace '\x1b\[[0-9;]*m', ''
+    if ($recordStart.IsMatch($part)) {
+        $report = $part
+    } elseif ($report -and -not [string]::IsNullOrWhiteSpace($part)) {
+        $report = $report.TrimEnd() + ' ' + $part.TrimStart()
     }
+    if (!$report) { continue }
 
     if (-not $report.Contains(' draws/frame')) {
         # A copied console report can wrap. Bound the incomplete record.

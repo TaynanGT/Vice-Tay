@@ -12,8 +12,8 @@ The start is included and the end is excluded. All three filters are optional.
 The script counts periodic rendered-frame reports and gives each one equal
 weight. P10 is the nearest-rank 10th percentile of their rendered FPS. A draw
 threshold can exclude menu samples. Keep the same scene and check the sample
-count in both runs. The script also handles frame details that wrap across
-lines in a copied console log.
+count in both runs. The script reads console reports copied with line breaks
+between fields, including in the header.
 
 In the diagnostics memory report, the private-byte delta near the host-list
 counts sums process-wide changes sampled during list creation. Concurrent

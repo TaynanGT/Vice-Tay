@@ -1168,6 +1168,8 @@ pub(crate) fn log_removal_context() {
         return;
     }
     tracing::error!("when the host device went: {}", removal_context());
+    #[cfg(feature = "diagnostics")]
+    crumbs::report("the host device was removed");
     if dred_any() {
         let data = host().map(|h| h.removal_data(&[])).unwrap_or_default();
         tracing::error!("device-removed data{}", if data.is_empty() { "; none" } else { &data });
@@ -4902,6 +4904,8 @@ pub(crate) mod indirects;
 mod panel;
 mod place;
 pub(crate) mod rec;
+#[cfg(feature = "diagnostics")]
+pub(crate) mod crumbs;
 mod send;
 mod upq;
 pub(crate) use send::{goes_as_words, words_under};
@@ -7130,6 +7134,27 @@ impl Host {
         for (_i, &(group, _kind)) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
+            // Our own breadcrumbs: which group the card is given, waited
+            // for alone with `VICTORY_GPU_TIMING`.
+            #[cfg(feature = "diagnostics")]
+            if crumbs::on() {
+                let list = match _kind {
+                    crate::copystat::Timed::Title(run) => runs.get(run).copied(),
+                    _ => None,
+                };
+                let named = list.map(|l| format!(" (host list {:#x})", std::ptr::from_ref(l) as usize));
+                crumbs::sending(
+                    format!(
+                        "{_kind:?}{} group {} of {}, {} lists, submission {}",
+                        named.unwrap_or_default(),
+                        _i + 1,
+                        groups.len(),
+                        group.len(),
+                        *submitted
+                    ),
+                    list,
+                );
+            }
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
@@ -7643,6 +7668,8 @@ impl HostList {
         self.card_budget_out();
         self.take_coming();
         #[cfg(feature = "diagnostics")]
+        crumbs::closing(self, &self.list);
+        #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
             // SAFETY: an open list, our heap and read-back buffer.
@@ -7711,6 +7738,8 @@ impl HostList {
         self.indirects.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        crumbs::reset(self);
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
@@ -8141,6 +8170,18 @@ impl HostList {
 
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
+        // Our own breadcrumbs (`VICTORY_GPU_CRUMBS=1`): the text once, for
+        // them and for what follows.
+        if crumbs::on() {
+            let text = what();
+            crumbs::mark(self, &self.list, &text);
+            return self.noted(move || text, range);
+        }
+        self.noted(what, range);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn noted(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
         if !dred_on() {
             crate::capture::op(std::ptr::from_ref(self) as usize, what);
             return;

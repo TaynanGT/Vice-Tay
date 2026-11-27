@@ -150,5 +150,12 @@ Compare it alongside the number of joined submissions in the same interval.
   ones still queued are written before the process exits.
 - Diagnostics builds: `VICTORY_WALLS_TRACE=1` logs the source of each read-back;
   a placed texture view that gets no host view says why once per kind.
+- Diagnostics builds: `VICTORY_GPU_CRUMBS=1` writes our own GPU breadcrumbs
+  around every command a host list notes, for hosts whose runtime keeps none
+  (vkd3d-proton). When no frame is presented for 3 s (and every 10 s after
+  that while none is), or the device is removed, the log names the commands
+  the card was in the middle of. Add `VICTORY_GPU_TIMING=1` to send and wait
+  for each list alone, so the report names a single command
+  ([#221](https://github.com/TaynanGT/Vice-Tay/issues/221)).
 - [VIctory-NVIDIA changes](victory-nvidia.md) covers the source revisions,
   graphics fixes, optional settings and fault capture reader.

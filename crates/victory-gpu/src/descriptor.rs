@@ -957,9 +957,14 @@ pub(crate) fn constant_slot(
 impl Drop for Heap {
     fn drop(&mut self) {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
-        let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
-        heaps.retain(|&(_, _, h)| h != at);
+        {
+            let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
+            heaps.retain(|&(_, _, h)| h != at);
+        }
         crate::port_descriptors::let_go(self.start);
+        if let Some(Some(host)) = self.host.get() {
+            crate::memory::release_heap(std::ptr::from_ref(host) as usize);
+        }
     }
 }
 
@@ -1733,10 +1738,11 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
 
 /// Device method.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
-    if let Some([lo, hi, size, _]) = words(desc) {
-        let address = u64::from(lo) | u64::from(hi) << 32;
-        record(handle, View::Constant(address, size));
-    }
+    let view = match words(desc) {
+        Some([lo, hi, size, _]) => View::Constant(u64::from(lo) | u64::from(hi) << 32, size),
+        None => View::Constant(0, 0),
+    };
+    record(handle, view);
 }
 
 /// Device method.
@@ -2039,6 +2045,136 @@ static FUNCTIONS: Table<24> = {
     f[10] = start as *const (); // 0x50 GPU
     Table(f)
 };
+
+#[cfg(test)]
+mod safety_tests {
+    use super::*;
+    use crate::object::S_OK;
+
+    #[test]
+    fn null_cbv_clears_a_stale_view() {
+        let mut slot = [0u32; 8];
+        let handle = slot.as_mut_ptr() as u64;
+        let null = std::ptr::null();
+
+        let cbv = [0x1000, 1, 256, 0];
+        create_cbv(null, &cbv, handle);
+        assert_eq!(view(handle), Some(View::Constant(0x1_0000_1000, 256)));
+
+        create_cbv(null, std::ptr::null(), handle);
+        assert_eq!(view(handle), Some(View::Constant(0, 0)));
+
+        let srv = [28, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0];
+        create_srv(null, null, &srv, handle);
+        assert_eq!(view(handle), Some(View::Shader(0, Some(srv))));
+
+        create_cbv(null, std::ptr::null(), handle);
+        assert_eq!(view(handle), Some(View::Constant(0, 0)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn null_cbv_make_at_does_not_allocate_shadow_and_clears_kept() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let Some(host_heap) = host::HostHeap::new(false, 4) else {
+            return;
+        };
+        let Some((buffer, _)) = host.upload_buffer(256) else {
+            return;
+        };
+        // SAFETY: a live upload buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let has_shadow_at = |addr: u64| {
+            crate::shadow::spans()
+                .into_iter()
+                .any(|(start, len, _)| addr >= start && addr < start.saturating_add(len))
+        };
+
+        for (addr, size) in [(0u64, 0u32), (0x1000, 0)] {
+            host_heap.constant_at(0, &buffer, gpu, 256);
+            assert!(host_heap.kept_in(0).is_some());
+            #[cfg(feature = "diagnostics")]
+            assert_eq!(host_heap.shows(0, &buffer), Some(true));
+
+            let had_shadow = has_shadow_at(addr);
+            host_heap.make_at(0, &View::Constant(addr, size));
+
+            assert!(host_heap.kept_in(0).is_none());
+            #[cfg(feature = "diagnostics")]
+            assert!(host_heap.shows(0, &buffer).is_none());
+            assert_eq!(has_shadow_at(addr), had_shadow);
+        }
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn released_view_heap_evicts_memory_heap_entry() {
+        #[repr(C)]
+        struct Extended(HeapDesc, Placement);
+
+        struct HeapGuard(This);
+        impl HeapGuard {
+            fn release_now(&mut self) -> u32 {
+                let ptr = std::mem::replace(&mut self.0, std::ptr::null());
+                if ptr.is_null() { 0 } else { release(ptr) }
+            }
+        }
+        impl Drop for HeapGuard {
+            fn drop(&mut self) {
+                let _ = self.release_now();
+            }
+        }
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let extended = Extended(
+            HeapDesc {
+                kind: VIEWS_KIND,
+                count: 64,
+                flags: SHADER_VISIBLE,
+                nodes: 1,
+            },
+            Placement {
+                address: 0,
+                size: 0,
+            },
+        );
+        let mut raw = std::ptr::null();
+        assert_eq!(
+            create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], &mut raw),
+            S_OK
+        );
+        let mut h = HeapGuard(raw);
+        let Some(host_heap) = heap(h.0).host() else {
+            return;
+        };
+        let key = std::ptr::from_ref(host_heap) as usize;
+        if crate::memory::ready(
+            &list,
+            host_heap,
+            &[],
+            &[],
+            &[],
+            crate::memory::Use::Reads,
+            None,
+        )
+        .is_none()
+        {
+            return;
+        }
+        assert!(crate::memory::has_heap(key));
+        assert_eq!(h.release_now(), 0);
+        assert!(!crate::memory::has_heap(key));
+    }
+}
 
 #[cfg(test)]
 mod tests {

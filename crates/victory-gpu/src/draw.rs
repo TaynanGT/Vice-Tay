@@ -4204,6 +4204,10 @@ impl State {
                 let used = group.entry(k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        if address == 0 || size == 0 {
+                            host.make_at(index, &View::Constant(0, 0));
+                            continue;
+                        }
                         // Renderer port 5: title memory in place is the
                         // card's to read where it is; nothing is copied.
                         if crate::port_cbv::in_place_on() {
@@ -5086,7 +5090,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).
             let aliased = crate::resource::alias_of(*resource as This)
-                .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+                .is_some_and(|source| crate::texture::alias(list, *resource as This, source.get()));
             if !aliased
                 && let Some(t) = crate::resource::host_copy(*resource as This)
                 && t.flags() & 0x7 == 0

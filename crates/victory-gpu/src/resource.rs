@@ -1429,6 +1429,23 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
     TEXTURES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+#[cfg(windows)]
+pub(crate) struct Held(This);
+
+#[cfg(windows)]
+impl Held {
+    pub(crate) fn get(&self) -> This {
+        self.0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Held {
+    fn drop(&mut self) {
+        crate::object::release_boxed::<Resource>(self.0);
+    }
+}
+
 /// The title textures the host renders to or writes (targets, depth,
 /// unordered access), by the address of their memory: what a view the
 /// title places in that memory in another format shows ([`alias_of`]). A
@@ -1458,7 +1475,28 @@ static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
 /// `VICTORY_ALIAS_COPY=0`: none is found, as before; `=1`: only textures
 /// of one level and one layer, as at first.
 #[cfg(windows)]
-pub(crate) fn alias_of(this: This) -> Option<This> {
+pub(crate) fn alias_of(this: This) -> Option<Held> {
+    let (_targets, other) = find_alias(this)?;
+    if !crate::object::add_ref_alive(other) {
+        return None;
+    }
+    Some(Held(other))
+}
+
+/// Whether [`alias_of`] would find a live source texture for `this`,
+/// without bumping or dropping its reference count.
+#[cfg(windows)]
+pub(crate) fn has_alias(this: This) -> bool {
+    find_alias(this).is_some_and(|(_targets, other)| crate::object::is_alive(other))
+}
+
+#[cfg(windows)]
+fn find_alias(
+    this: This,
+) -> Option<(
+    std::sync::MutexGuard<'static, std::collections::BTreeMap<u64, usize>>,
+    This,
+)> {
     use std::sync::atomic::Ordering::Relaxed;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if this.is_null()
@@ -1519,7 +1557,10 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
             );
         }
     }
-    same.then_some(other)
+    if !same {
+        return None;
+    }
+    Some((targets, other))
 }
 
 /// Whether host copies are made on first use. On by default;
@@ -1632,7 +1673,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         // pick by index among them.
         let mut base = 0;
         let mut prefill = None;
-        if shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
+        if shape_fits && r.host.placed.load(Relaxed) && held_only() && !has_alias(this) {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
             let first = wanted.min(viewed);
@@ -3975,7 +4016,10 @@ mod tests {
             S_OK
         );
         resource(view).host.placed.store(true, Relaxed);
-        assert_eq!(alias_of(view), Some(source));
+        {
+            let held = alias_of(view).expect("placed view should alias the GPU-written source");
+            assert_eq!(held.get(), source);
+        }
         let written = host_resource(source).unwrap();
         let sampled = host_resource(view).unwrap();
         let (upload, data) = host.upload_buffer(1024).unwrap();
@@ -4033,6 +4077,77 @@ mod tests {
         resource_release(view);
         resource_release(source);
         assert_eq!(actual, packed_light, "the sampled texture kept the CPU upload instead of the GPU atlas");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_alias_source_is_held_after_the_title_releases_it() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        struct ResourceGuard(This);
+        impl ResourceGuard {
+            fn release_now(&mut self) -> u32 {
+                let ptr = std::mem::replace(&mut self.0, std::ptr::null());
+                if ptr.is_null() { 0 } else { resource_release(ptr) }
+            }
+        }
+        impl Drop for ResourceGuard {
+            fn drop(&mut self) {
+                let _ = self.release_now();
+            }
+        }
+
+        if crate::host::host().is_none() {
+            return;
+        }
+        let null = std::ptr::null();
+        let mut raw_source = null;
+        let mut raw_view = null;
+        let source_desc = ResourceDesc {
+            flags: 4,
+            ..texture(4, 4, 42, 1)
+        };
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &source_desc,
+                0,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut raw_source,
+            ),
+            S_OK
+        );
+        let mut source = ResourceGuard(raw_source);
+        assert_eq!(
+            create_at_address(
+                null,
+                resource(source.0).data() as u64,
+                &texture(4, 4, 67, 1),
+                0,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut raw_view,
+            ),
+            S_OK
+        );
+        let mut view = ResourceGuard(raw_view);
+        resource(view.0).host.placed.store(true, Relaxed);
+        assert!(has_alias(view.0));
+        let held = alias_of(view.0).expect("placed view should pin its alias source");
+        assert_eq!(held.get(), source.0);
+        let source_addr = source.0 as usize;
+        assert_eq!(source.release_now(), 1);
+        assert!(has_alias(view.0));
+        assert!(host_resource(held.get()).is_some());
+        assert!(textures().contains(&source_addr));
+        drop(held);
+        assert!(!textures().contains(&source_addr));
+        assert!(!has_alias(view.0));
+        assert!(alias_of(view.0).is_none());
+        assert_eq!(view.release_now(), 0);
     }
 
     /// A 16-bit depth texture the title also asks unordered access for gets

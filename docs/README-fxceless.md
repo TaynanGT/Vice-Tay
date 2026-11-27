@@ -296,6 +296,13 @@ has focus:
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
 
+Mouse camera control is on by default (`VICTORY_MOUSE_LOOK=0` turns it off).
+Moving the mouse drives the right stick; LMB, RMB and MMB press RT, LT and R3.
+While the game window has focus the cursor is locked at the client centre and
+hidden. **F2** toggles the lock; **Esc** or **P** releases it for menus.
+`VICTORY_MOUSE_SENS` (default `1.0`) scales the movement, and
+`VICTORY_MOUSE_INVERT_Y=1` flips the vertical axis.
+
 ## Commands
 
 ```
@@ -341,7 +348,8 @@ A release build has no debugging aids. Build them in with
 cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
 ```
 
-The on/off switches below (`...=1`) are off when unset or set to `0`.
+The on/off switches below (`...=1`) are off when unset or set to `0`;
+`VICTORY_MOUSE_LOOK` is the exception, on by default.
 
 | Variable | Effect |
 |----------|--------|
@@ -350,6 +358,9 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
 | `VICTORY_POKE=<rva>:<byte>,...` | writes a title byte twice a second (a hang watchdog's tick, say) |
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
+| `VICTORY_MOUSE_LOOK=0` | turns off mouse camera control (on by default) |
+| `VICTORY_MOUSE_SENS=<n>` | mouse-look sensitivity (default `1.0`) |
+| `VICTORY_MOUSE_INVERT_Y=1` | invert the mouse vertical axis |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |

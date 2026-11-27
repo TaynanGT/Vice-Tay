@@ -6469,6 +6469,8 @@ impl Host {
         } {
             match split(lists, order, cut) {
                 Ok([(lists, order), (more, behind)]) => {
+                    #[cfg(feature = "diagnostics")]
+                    card_steps::note_cut();
                     let first: Vec<usize> = parts.iter().copied().filter(|&p| p < cut).collect();
                     let second: Vec<usize> = parts.iter().filter(|&&p| p > cut).map(|p| p - cut).collect();
                     self.execute_parts(lists, order, &first);

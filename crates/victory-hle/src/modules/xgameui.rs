@@ -198,6 +198,8 @@ mod dialog {
             .map(|c| u32::from(c[0]) | u32::from(c.get(1).copied().unwrap_or(0)) << 16)
             .collect();
         let mut entry = Entry { max, typed: None };
+        #[cfg(windows)]
+        let _overlay = super::super::gameinput::mouse::OverlayGuard::enter();
         // SAFETY: a complete template and our dialog procedure; `entry`
         // outlives the modal dialog.
         unsafe {

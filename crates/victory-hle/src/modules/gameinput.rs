@@ -14,7 +14,7 @@ use std::ffi::c_void;
 use std::ops::Deref;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
@@ -63,10 +63,12 @@ const PADS: usize = 4;
 const FALLBACK: usize = PADS;
 const KEYBOARD: usize = PADS + 1;
 const MOUSE: usize = PADS + 2;
-const DEVICES: usize = MOUSE + 1;
+pub(super) const DEVICES: usize = MOUSE + 1;
 
 /// Readings kept per device for next/previous lookups.
 const HISTORY: usize = 256;
+/// Extended history depth for high-rate (1000-8000 Hz) raw mouse readings.
+const MOUSE_HISTORY: usize = 1024;
 const POLL: Duration = Duration::from_millis(8);
 
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
@@ -126,6 +128,49 @@ struct MouseState {
 const _: () =
     assert!(size_of::<MouseState>() == 40 && std::mem::offset_of!(MouseState, position_x) == 8);
 
+/// One microsecond-timestamped mouse reading sample from the raw input ring.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct MouseSample {
+    timestamp: u64,
+    state: MouseState,
+}
+
+/// Drained raw mouse batch for one poll or read synchronization.
+#[derive(Debug, PartialEq)]
+enum MouseBatch {
+    Disconnected,
+    Connected(Vec<MouseSample>),
+}
+
+/// Four-channel gamepad rumble/trigger vibration levels (`0.0..=1.0`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Rumble {
+    low: f32,
+    high: f32,
+    left_trigger: f32,
+    right_trigger: f32,
+}
+
+impl Rumble {
+    fn from_params(params: [f32; 4]) -> Self {
+        let clamp = |v: f32| if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 };
+        Self {
+            low: clamp(params[0]),
+            high: clamp(params[1]),
+            left_trigger: clamp(params[2]),
+            right_trigger: clamp(params[3]),
+        }
+    }
+
+    fn low_u16(self) -> u16 {
+        (self.low * f32::from(u16::MAX)) as u16
+    }
+
+    fn high_u16(self) -> u16 {
+        (self.high * f32::from(u16::MAX)) as u16
+    }
+}
+
 /// Host input, or a fake in tests.
 trait Source: Send {
     /// The pad in host slot `slot`, `None` when the slot is empty.
@@ -137,8 +182,18 @@ trait Source: Send {
     fn mouse(&mut self) -> Option<MouseState> {
         None
     }
-    /// Motor speeds: low frequency (left), high frequency (right).
-    fn rumble(&mut self, slot: usize, low: u16, high: u16);
+    /// Drains timestamped mouse samples (defaults to wrapping `mouse()`).
+    fn mouse_batch(&mut self) -> MouseBatch {
+        match self.mouse() {
+            Some(state) => MouseBatch::Connected(vec![MouseSample {
+                timestamp: now(),
+                state,
+            }]),
+            None => MouseBatch::Disconnected,
+        }
+    }
+    /// Four-channel vibration: low/high main motors and left/right trigger motors.
+    fn rumble(&mut self, slot: usize, rumble: Rumble);
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
@@ -176,6 +231,45 @@ fn merged(a: PadState, b: PadState) -> PadState {
         right_x: further(a.right_x, b.right_x),
         right_y: further(a.right_y, b.right_y),
     }
+}
+
+/// Independent opt-in switches for native input and haptics features.
+/// All four default to `false` (`0`) so baseline behavior stays unchanged
+/// unless a subsystem is explicitly enabled for testing or use.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct InputSwitches {
+    /// `VICTORY_RAW_MOUSE=1`: event-driven 8 kHz `WM_INPUT`/`GetRawInputBuffer` mouse ring.
+    pub(super) raw_mouse: bool,
+    /// `VICTORY_CURSOR_CAPTURE=1`: `ClipCursor` + balanced `ShowCursor` focus/minimize ownership.
+    pub(super) cursor_capture: bool,
+    /// `VICTORY_KBM_PAD=1`: bind logical mouse, keyboard, and pads simultaneously to local XUID.
+    pub(super) kbm_pad: bool,
+    /// `VICTORY_HAPTICS=1`: four-channel trigger haptics (`Windows.Gaming.Input` + DualSense HID).
+    pub(super) haptics: bool,
+}
+
+impl InputSwitches {
+    pub(super) fn from_lookup<F>(get: F) -> Self
+    where
+        F: Fn(&str) -> Option<std::ffi::OsString>,
+    {
+        let on = |name: &str| get(name).is_some_and(|v| v == "1");
+        Self {
+            raw_mouse: on("VICTORY_RAW_MOUSE"),
+            cursor_capture: on("VICTORY_CURSOR_CAPTURE"),
+            kbm_pad: on("VICTORY_KBM_PAD"),
+            haptics: on("VICTORY_HAPTICS"),
+        }
+    }
+
+    pub(super) fn from_env() -> Self {
+        Self::from_lookup(|name| std::env::var_os(name))
+    }
+}
+
+pub(super) fn switches() -> InputSwitches {
+    static SWITCHES: LazyLock<InputSwitches> = LazyLock::new(InputSwitches::from_env);
+    *SWITCHES
 }
 
 /// Whether the title sees one pad that is always there, fed by the keyboard
@@ -243,18 +337,43 @@ fn kind(index: usize) -> u32 {
     }
 }
 
+/// Canonical 32-byte `APP_LOCAL_DEVICE_ID` for logical device `index`
+/// (`PAD[0..4]`, stand-in pad, `KEYBOARD`, `MOUSE`).
+pub(super) const fn device_id(index: usize) -> [u8; 32] {
+    let mut id = [0u8; 32];
+    id[0] = b'v';
+    id[1] = b'i';
+    id[2] = b'c';
+    id[3] = b't';
+    id[4] = b'o';
+    id[5] = b'r';
+    id[6] = b'y';
+    id[31] = index as u8 + 1;
+    id
+}
+
+/// Whether `id` matches one of our logical GameInput devices (`PAD[0..4]`,
+/// stand-in pad, `KEYBOARD`, or `MOUSE`), used by `xuser::find_for_device`.
+pub(super) fn is_known_device_id(id: &[u8; 32]) -> bool {
+    id[..7] == *b"victory"
+        && id[7..31].iter().all(|&b| b == 0)
+        && (1..=(DEVICES as u8)).contains(&id[31])
+}
+
 impl Device {
-    fn new(index: usize) -> Device {
-        let mut id = [0; 32];
-        id[..7].copy_from_slice(b"victory");
-        id[31] = index as u8 + 1;
+    fn new(index: usize, haptics: bool) -> Device {
+        let id = device_id(index);
         let info = DeviceInfo {
             size: size_of::<DeviceInfo>() as u32,
             id,
             root_id: id,
             supported_input: kind(index),
-            // Low and high frequency.
-            rumble_motors: if index <= FALLBACK { 0x3 } else { 0 },
+            // Low and high frequency by default; add left/right triggers when `VICTORY_HAPTICS=1`.
+            rumble_motors: if index <= FALLBACK {
+                if haptics { 0xF } else { 0x3 }
+            } else {
+                0
+            },
             ..Default::default()
         };
         Device {
@@ -387,11 +506,18 @@ pub struct Hub {
     /// Apart from the state: XInput can be slow, and the title reads
     /// readings every frame.
     source: Mutex<Box<dyn Source>>,
+    /// Lock-free raw mouse ring drained directly on read/poll without blocking on `source`.
+    #[cfg(windows)]
+    mouse_ring: Option<Arc<mouse::MouseRing>>,
     /// The title sees one pad ([`one_pad`]).
     one_pad: bool,
+    /// `VICTORY_HAPTICS=1`: forward trigger channels (`params[2..4]`) alongside main rumble.
+    haptics: bool,
     state: Mutex<State>,
     /// A device callback returned.
     returned: Condvar,
+    /// Wakes the background poll loop immediately on event-driven mouse status changes.
+    poll_wake: (Mutex<u64>, Condvar),
 }
 
 fn lock<T: ?Sized>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -412,15 +538,35 @@ fn now() -> u64 {
 }
 
 impl Hub {
-    fn new(source: Box<dyn Source>, one_pad: bool) -> &'static Hub {
+    #[cfg(any(test, not(windows)))]
+    fn new_with_options(source: Box<dyn Source>, one_pad: bool, haptics: bool) -> &'static Hub {
+        #[cfg(windows)]
+        {
+            Self::new_with_mouse_ring(source, one_pad, haptics, None)
+        }
+        #[cfg(not(windows))]
+        {
+            Self::new_inner(source, one_pad, haptics)
+        }
+    }
+
+    #[cfg(windows)]
+    fn new_with_mouse_ring(
+        source: Box<dyn Source>,
+        one_pad: bool,
+        haptics: bool,
+        mouse_ring: Option<Arc<mouse::MouseRing>>,
+    ) -> &'static Hub {
         let hub = Box::into_raw(Box::new(Hub {
             object: Object {
                 vtable: &INPUT,
                 hub: std::ptr::null(),
             },
-            devices: std::array::from_fn(Device::new),
+            devices: std::array::from_fn(|index| Device::new(index, haptics)),
             source: Mutex::new(source),
+            mouse_ring,
             one_pad,
+            haptics,
             state: Mutex::new(State {
                 slots: Default::default(),
                 callbacks: Vec::new(),
@@ -428,6 +574,41 @@ impl Hub {
                 running: Vec::new(),
             }),
             returned: Condvar::new(),
+            poll_wake: (Mutex::new(0), Condvar::new()),
+        }));
+        // SAFETY: just allocated and never freed; nothing else sees it yet.
+        let hub = unsafe {
+            (*hub).object.hub = hub;
+            for device in &mut (*hub).devices {
+                device.hub = hub;
+            }
+            &*hub
+        };
+        if let Some(ring) = &hub.mouse_ring {
+            ring.set_wake(Arc::new(move || hub.wake_poll()));
+        }
+        hub
+    }
+
+    #[cfg(not(windows))]
+    fn new_inner(source: Box<dyn Source>, one_pad: bool, haptics: bool) -> &'static Hub {
+        let hub = Box::into_raw(Box::new(Hub {
+            object: Object {
+                vtable: &INPUT,
+                hub: std::ptr::null(),
+            },
+            devices: std::array::from_fn(|index| Device::new(index, haptics)),
+            source: Mutex::new(source),
+            one_pad,
+            haptics,
+            state: Mutex::new(State {
+                slots: Default::default(),
+                callbacks: Vec::new(),
+                pending: Vec::new(),
+                running: Vec::new(),
+            }),
+            returned: Condvar::new(),
+            poll_wake: (Mutex::new(0), Condvar::new()),
         }));
         // SAFETY: just allocated and never freed; nothing else sees it yet.
         unsafe {
@@ -439,13 +620,75 @@ impl Hub {
         }
     }
 
-    /// A hub over the host's input, polled from now on.
+    fn wake_poll(&self) {
+        let mut seq = lock(&self.poll_wake.0);
+        *seq = seq.wrapping_add(1);
+        self.poll_wake.1.notify_all();
+    }
+
+    fn has_mouse_ring(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.mouse_ring.is_some()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
+    /// Drains event-driven raw mouse samples directly into `state.slots[MOUSE]`
+    /// without touching `self.source`. When `deliver_now` is false (read paths),
+    /// connect/disconnect callbacks are deferred to `state.pending` so title read
+    /// calls never invoke callbacks re-entrantly.
+    fn sync_mouse_locked(&self, state: &mut State, deliver_now: bool) -> Vec<Event> {
+        #[cfg(windows)]
+        {
+            let Some(ring) = &self.mouse_ring else {
+                return Vec::new();
+            };
+            let batch = ring.drain();
+            let mut events = Vec::new();
+            state.update_mouse_batch(&self.devices, batch, now(), &mut events);
+            if !deliver_now && !events.is_empty() {
+                state.pending.append(&mut events);
+                self.wake_poll();
+            }
+            events
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (state, deliver_now);
+            Vec::new()
+        }
+    }
+
+    /// A hub over the host's input, polled on pad/keyboard cadence and woken
+    /// immediately on event-driven mouse status transitions when `VICTORY_RAW_MOUSE=1`.
     fn start(source: Box<dyn Source>) -> &'static Hub {
-        let hub = Hub::new(source, one_pad());
+        let sw = switches();
+        #[cfg(windows)]
+        let hub = Hub::new_with_mouse_ring(
+            source,
+            one_pad(),
+            sw.haptics,
+            sw.raw_mouse.then(mouse::global_ring),
+        );
+        #[cfg(not(windows))]
+        let hub = Hub::new_with_options(source, one_pad(), sw.haptics);
         hub.poll();
         std::thread::spawn(move || {
+            let mut seen = *lock(&hub.poll_wake.0);
             loop {
-                std::thread::sleep(POLL);
+                {
+                    let guard = lock(&hub.poll_wake.0);
+                    let (guard, _) = hub
+                        .poll_wake
+                        .1
+                        .wait_timeout_while(guard, POLL, |s| *s == seen)
+                        .unwrap_or_else(PoisonError::into_inner);
+                    seen = *guard;
+                }
                 hub.poll();
             }
         });
@@ -458,14 +701,18 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys, mouse) = {
+        let (pads, keys, fallback_mouse) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys(), source.mouse())
+            let mouse = (!self.has_mouse_ring()).then(|| source.mouse_batch());
+            (pads, source.keys(), mouse)
         };
-        let events = self
-            .state()
-            .poll(&self.devices, self.one_pad, pads, keys, mouse);
+        let events = {
+            let mut state = self.state();
+            let mut events = self.sync_mouse_locked(&mut state, true);
+            events.extend(state.poll(&self.devices, self.one_pad, pads, keys, fallback_mouse));
+            events
+        };
         self.deliver(events);
     }
 
@@ -511,11 +758,13 @@ impl State {
         one_pad: bool,
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
-        mouse: Option<MouseState>,
+        mouse: Option<MouseBatch>,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
-        self.update(devices, MOUSE, mouse.map(Value::Mouse), now, &mut events);
+        if let Some(mouse) = mouse {
+            self.update_mouse_batch(devices, mouse, now, &mut events);
+        }
         if one_pad {
             let pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
@@ -530,6 +779,60 @@ impl State {
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
+    }
+
+    /// Appends every microsecond-timestamped mouse sample into `slots[MOUSE]`
+    /// without dropping fast click edges or coalescing across ring entries.
+    fn update_mouse_batch(
+        &mut self,
+        devices: &[Device; DEVICES],
+        batch: MouseBatch,
+        now: u64,
+        events: &mut Vec<Event>,
+    ) {
+        let slot = &mut self.slots[MOUSE];
+        let was = slot.connected;
+        match batch {
+            MouseBatch::Disconnected => {
+                slot.connected = false;
+            }
+            MouseBatch::Connected(samples) => {
+                slot.connected = true;
+                let mut had_initial = was;
+                for sample in samples {
+                    let value = Value::Mouse(sample.state);
+                    if !had_initial || slot.history.back().is_none_or(|r| r.value != value) {
+                        slot.sequence += 1;
+                        if slot.history.len() == MOUSE_HISTORY {
+                            slot.history.pop_front();
+                        }
+                        slot.history.push_back(Ref::new(Reading {
+                            vtable: &READING,
+                            refs: AtomicU32::new(1),
+                            device: &devices[MOUSE],
+                            sequence: slot.sequence,
+                            timestamp: sample.timestamp,
+                            value,
+                        }));
+                        had_initial = true;
+                    }
+                }
+            }
+        }
+        if was != slot.connected {
+            tracing::info!(device = MOUSE, connected = !was, "input device");
+            let (current, previous) = if was {
+                (0, STATUS_CONNECTED)
+            } else {
+                (STATUS_CONNECTED, 0)
+            };
+            events.extend(
+                self.callbacks
+                    .iter()
+                    .filter(|r| r.matches(devices, MOUSE) && r.status & STATUS_CONNECTED != 0)
+                    .map(|r| r.event(MOUSE, now, current, previous)),
+            );
+        }
     }
 
     /// Records a device's state: a reading when it changed, callbacks when
@@ -593,7 +896,7 @@ fn host() -> Box<dyn Source> {
         fn keys(&mut self) -> Vec<KeyState> {
             Vec::new()
         }
-        fn rumble(&mut self, _: usize, _: u16, _: u16) {}
+        fn rumble(&mut self, _: usize, _: Rumble) {}
     }
     Box::new(Nothing)
 }
@@ -661,7 +964,8 @@ extern "system" fn current_reading(
     out: Out,
 ) -> HRESULT {
     let hub = hub(this);
-    let state = hub.state();
+    let mut state = hub.state();
+    hub.sync_mouse_locked(&mut state, false);
     let newest = |i: usize| {
         state.slots[i]
             .history
@@ -713,7 +1017,10 @@ fn relative(
     if !device.is_null() && !std::ptr::eq(device, reference.device) {
         return fail(out, E_INVALIDARG);
     }
-    let state = hub.state();
+    let mut state = hub.state();
+    if index == MOUSE {
+        hub.sync_mouse_locked(&mut state, false);
+    }
     let history = &state.slots[index].history;
     if history
         .front()
@@ -765,7 +1072,10 @@ extern "system" fn temporal_reading(
     let Some(index) = hub.index(device) else {
         return fail(out, E_INVALIDARG);
     };
-    let state = hub.state();
+    let mut state = hub.state();
+    if index == MOUSE {
+        hub.sync_mouse_locked(&mut state, false);
+    }
     let history = &state.slots[index].history;
     hand(out, history.iter().rev().find(|r| r.timestamp <= time))
 }
@@ -824,6 +1134,7 @@ extern "system" fn register_device(
     let mut found = Vec::new();
     {
         let mut state = hub.state();
+        hub.sync_mouse_locked(&mut state, false);
         if enumeration != 0 && status & STATUS_CONNECTED != 0 {
             let now = now();
             found = (0..DEVICES)
@@ -917,8 +1228,13 @@ extern "system" fn find_by_id(this: This, id: *const [u8; 32], out: Out) -> HRES
     // SAFETY: checked non-null; the title passes a device id.
     let id = unsafe { &*id };
     let hub = hub(this);
+    let mouse_connected = {
+        let mut state = hub.state();
+        hub.sync_mouse_locked(&mut state, false);
+        state.slots[MOUSE].connected
+    };
     match hub.devices.iter().find(|d| {
-        d.info.id == *id && (d.index != MOUSE || hub.state().slots[MOUSE].connected)
+        d.info.id == *id && (d.index != MOUSE || mouse_connected)
     }) {
         Some(device) => {
             // SAFETY: checked non-null.
@@ -976,16 +1292,19 @@ extern "system" fn device_info(this: *const Device) -> *const DeviceInfo {
 extern "system" fn device_status(this: *const Device) -> u32 {
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
-    if device.hub().state().slots[device.index].connected {
+    let mut state = device.hub().state();
+    if device.index == MOUSE {
+        device.hub().sync_mouse_locked(&mut state, false);
+    }
+    if state.slots[device.index].connected {
         STATUS_CONNECTED
     } else {
         0
     }
 }
-// shortcut: trigger motors are dropped (XInput has none). The host API that
-// drives them without a redistributable is Windows.Gaming.Input (WinRT
-// `Gamepad.Vibration`), which needs WinRT bindings this crate lacks outside
-// diagnostics builds; the title sends trigger levels in slot 0x50.
+/// Routes all four motor channels (low/high + left/right triggers) to the
+/// active host backend (DualSense HID output report, `Windows.Gaming.Input`
+/// trigger vibration, or XInput fallback).
 extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
@@ -993,23 +1312,27 @@ extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     if device.index >= PADS && !(one_pad && device.index == FALLBACK) {
         return;
     }
-    let [low, high, ..] = if params.is_null() {
+    let raw = if params.is_null() {
         [0.0; 4]
     } else {
         // SAFETY: checked non-null; four motor levels.
         unsafe { *params }
     };
-    let speed = |level: f32| (level.clamp(0.0, 1.0) * f32::from(u16::MAX)) as u16;
+    let mut rumble = Rumble::from_params(raw);
+    if !device.hub().haptics {
+        rumble.left_trigger = 0.0;
+        rumble.right_trigger = 0.0;
+    }
     let mut source = lock(&device.hub().source);
     if one_pad {
         // The one pad is every host pad.
         for slot in 0..PADS {
             if source.pad(slot).is_some() {
-                source.rumble(slot, speed(low), speed(high));
+                source.rumble(slot, rumble);
             }
         }
     } else {
-        source.rumble(device.index, speed(low), speed(high));
+        source.rumble(device.index, rumble);
     }
 }
 extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
@@ -1170,14 +1493,21 @@ pub(crate) fn module() -> HleModule {
     }
 }
 
-/// Host input: XInput pads, then PS5 pads, plus focused keyboard and mouse.
+/// Host input: XInput pads, then DualSense HID pads, plus focused keyboard and mouse.
 #[cfg(windows)]
 mod host {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Condvar, LazyLock, Mutex, PoisonError};
     use std::time::{Duration, Instant};
 
+    use windows::Gaming::Input::{Gamepad, GamepadVibration};
+    use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize};
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW,
+        GetAsyncKeyState, GetKeyState, GetKeyboardLayout, HKL, KLF_NOTELLSHELL,
+        LoadKeyboardLayoutW, MAPVK_VK_TO_VSC_EX, MapVirtualKeyExW, ToUnicodeEx, VK_CAPITAL,
+        VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU, VK_NUMLOCK, VK_RCONTROL, VK_RMENU,
+        VK_RSHIFT, VK_SHIFT,
     };
     use windows_sys::Win32::UI::Input::XboxController::{
         XINPUT_GAMEPAD, XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_BACK,
@@ -1190,11 +1520,18 @@ mod host {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         GetForegroundWindow, GetWindowThreadProcessId,
     };
+    use windows_sys::core::w;
 
     use super::*;
 
     /// Asking XInput about an empty slot is slow; look again this often.
     const EMPTY_SLOT_RECHECK: Duration = Duration::from_secs(1);
+
+    /// Windows 10 1607+ flag telling `ToUnicodeEx` not to alter kernel dead-key state.
+    const TOUNICODE_NO_STATE_CHANGE: u32 = 0x04;
+
+    /// Fallback US-English HKL when `LoadKeyboardLayoutW` is unavailable.
+    const US_ENGLISH_HKL_FALLBACK: usize = 0x0409_0409;
 
     const BUTTONS: [(u16, u32); 14] = [
         (XINPUT_GAMEPAD_START, MENU),
@@ -1212,6 +1549,260 @@ mod host {
         (XINPUT_GAMEPAD_LEFT_THUMB, LEFT_STICK),
         (XINPUT_GAMEPAD_RIGHT_THUMB, RIGHT_STICK),
     ];
+
+    /// Builds a 256-byte Win32 keyboard-state table from currently held virtual
+    /// keys and lock toggles (`GetKeyboardState` is thread-queue local, so the
+    /// poll thread synthesizes the modifier table directly).
+    pub(super) fn build_keyboard_state(down: &[u8], caps_lock: bool, num_lock: bool) -> [u8; 256] {
+        let mut state = [0u8; 256];
+        for &vk in down {
+            state[usize::from(vk)] |= 0x80;
+        }
+        if (state[usize::from(VK_LSHIFT)] | state[usize::from(VK_RSHIFT)]) & 0x80 != 0 {
+            state[usize::from(VK_SHIFT)] |= 0x80;
+        }
+        if (state[usize::from(VK_LCONTROL)] | state[usize::from(VK_RCONTROL)]) & 0x80 != 0 {
+            state[usize::from(VK_CONTROL)] |= 0x80;
+        }
+        if (state[usize::from(VK_LMENU)] | state[usize::from(VK_RMENU)]) & 0x80 != 0 {
+            state[usize::from(VK_MENU)] |= 0x80;
+        }
+        if caps_lock {
+            state[usize::from(VK_CAPITAL)] |= 0x01;
+        }
+        if num_lock {
+            state[usize::from(VK_NUMLOCK)] |= 0x01;
+        }
+        state
+    }
+
+    /// Interprets the return code and UTF-16 output buffer from `ToUnicodeEx`
+    /// into `(code_point, dead_key)`, supporting BMP characters, UTF-16
+    /// surrogate pairs, and dead keys.
+    pub(super) fn decode_to_unicode_result(rc: i32, buf: &[u16]) -> (u32, bool) {
+        if rc < 0 {
+            let dead_char = buf.first().copied().unwrap_or(0);
+            return (u32::from(dead_char), true);
+        }
+        if rc == 0 {
+            return (0, false);
+        }
+        let len = (rc as usize).min(buf.len());
+        let code_point = char::decode_utf16(buf[..len].iter().copied())
+            .find_map(Result::ok)
+            .map_or(0, |c| c as u32);
+        (code_point, false)
+    }
+
+    fn ime_english_enabled() -> bool {
+        static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+            std::env::var_os("VICTORY_IME_ENGLISH").is_some_and(|v| v == "1")
+        });
+        *ENABLED
+    }
+
+    fn english_layout() -> HKL {
+        static HKL_US: LazyLock<usize> = LazyLock::new(|| {
+            // SAFETY: constant NUL-terminated US-English layout id; KLF_NOTELLSHELL
+            // avoids altering the user's taskbar language indicator.
+            let loaded = unsafe { LoadKeyboardLayoutW(w!("00000409"), KLF_NOTELLSHELL) };
+            if loaded.is_null() {
+                US_ENGLISH_HKL_FALLBACK
+            } else {
+                loaded as usize
+            }
+        });
+        *HKL_US as HKL
+    }
+
+    fn active_keyboard_layout(ime_english: bool) -> HKL {
+        if ime_english {
+            return english_layout();
+        }
+        // SAFETY: plain queries of the foreground window's thread and its keyboard layout.
+        unsafe {
+            let fg = GetForegroundWindow();
+            let thread = if fg.is_null() {
+                0
+            } else {
+                GetWindowThreadProcessId(fg, std::ptr::null_mut())
+            };
+            let hkl = GetKeyboardLayout(thread);
+            if hkl.is_null() {
+                GetKeyboardLayout(0)
+            } else {
+                hkl
+            }
+        }
+    }
+
+    fn translate_key(vk: u8, key_state: &[u8; 256], hkl: HKL) -> KeyState {
+        // SAFETY: plain layout-aware scan code query.
+        let scan_code = unsafe { MapVirtualKeyExW(u32::from(vk), MAPVK_VK_TO_VSC_EX, hkl) };
+        let mut buf = [0u16; 8];
+        // Mask scan_code to low 8 bits so extended 0xE0xx codes never set bit 15 (key-up).
+        // SAFETY: valid 256-byte key state, writable 8-code-unit UTF-16 buffer, and
+        // `TOUNICODE_NO_STATE_CHANGE` so kernel dead-key state is untouched.
+        let rc = unsafe {
+            ToUnicodeEx(
+                u32::from(vk),
+                scan_code & 0xFF,
+                key_state.as_ptr(),
+                buf.as_mut_ptr(),
+                buf.len() as i32,
+                TOUNICODE_NO_STATE_CHANGE,
+                hkl,
+            )
+        };
+        let (code_point, dead_key) = decode_to_unicode_result(rc, &buf);
+        KeyState {
+            scan_code,
+            code_point,
+            virtual_key: vk,
+            dead_key,
+        }
+    }
+
+    /// Dedicated MTA worker routing four-channel gamepad vibration (including
+    /// impulse trigger motors) through `Windows.Gaming.Input` without altering
+    /// any title thread's COM apartment or blocking indefinitely on WinRT.
+    mod wgi {
+        use super::*;
+
+        const CALL_TIMEOUT: Duration = Duration::from_millis(15);
+
+        struct Request {
+            seq: u64,
+            slot: usize,
+            rumble: Rumble,
+            done_seq: u64,
+            handled: bool,
+        }
+
+        struct Worker {
+            available: AtomicBool,
+            mailbox: Mutex<Request>,
+            wake_worker: Condvar,
+            wake_caller: Condvar,
+        }
+
+        pub(super) fn to_vibration(rumble: Rumble) -> GamepadVibration {
+            GamepadVibration {
+                LeftMotor: f64::from(rumble.low),
+                RightMotor: f64::from(rumble.high),
+                LeftTrigger: f64::from(rumble.left_trigger),
+                RightTrigger: f64::from(rumble.right_trigger),
+            }
+        }
+
+        static WORKER: LazyLock<Worker> = LazyLock::new(|| {
+            let worker = Worker {
+                available: AtomicBool::new(true),
+                mailbox: Mutex::new(Request {
+                    seq: 0,
+                    slot: 0,
+                    rumble: Rumble::default(),
+                    done_seq: 0,
+                    handled: false,
+                }),
+                wake_worker: Condvar::new(),
+                wake_caller: Condvar::new(),
+            };
+            if let Err(error) = std::thread::Builder::new()
+                .name("WGI haptics".into())
+                .spawn(run_worker)
+            {
+                tracing::debug!(%error, "could not spawn Windows.Gaming.Input worker");
+                worker.available.store(false, Ordering::Release);
+            }
+            worker
+        });
+
+        fn run_worker() {
+            // SAFETY: initializing WinRT MTA exclusively on our dedicated worker thread.
+            let _ = unsafe { RoInitialize(RO_INIT_MULTITHREADED) };
+            // Probe activation once; if WinRT/WGI is absent (e.g., Wine), disable cleanly.
+            if Gamepad::Gamepads().is_err() {
+                WORKER.available.store(false, Ordering::Release);
+                let mut req = WORKER.mailbox.lock().unwrap_or_else(PoisonError::into_inner);
+                req.done_seq = req.seq;
+                req.handled = false;
+                WORKER.wake_caller.notify_all();
+                return;
+            }
+            let mut processed = 0u64;
+            loop {
+                let (seq, slot, rumble) = {
+                    let mut req = WORKER.mailbox.lock().unwrap_or_else(PoisonError::into_inner);
+                    while req.seq == processed {
+                        req = WORKER
+                            .wake_worker
+                            .wait(req)
+                            .unwrap_or_else(PoisonError::into_inner);
+                    }
+                    (req.seq, req.slot, req.rumble)
+                };
+                let handled = apply_vibration(slot, rumble);
+                processed = seq;
+                let mut req = WORKER.mailbox.lock().unwrap_or_else(PoisonError::into_inner);
+                req.done_seq = seq;
+                req.handled = handled;
+                WORKER.wake_caller.notify_all();
+            }
+        }
+
+        fn apply_vibration(slot: usize, rumble: Rumble) -> bool {
+            let Ok(pads) = Gamepad::Gamepads() else {
+                return false;
+            };
+            let Ok(count) = pads.Size() else {
+                return false;
+            };
+            let Ok(index) = u32::try_from(slot) else {
+                return false;
+            };
+            if index >= count {
+                return false;
+            }
+            let Ok(pad) = pads.GetAt(index) else {
+                return false;
+            };
+            pad.SetVibration(to_vibration(rumble)).is_ok()
+        }
+
+        /// Starts WinRT gamepad discovery early when a host XInput pad appears.
+        pub(super) fn warm_up() {
+            LazyLock::force(&WORKER);
+        }
+
+        /// Attempts to drive all four vibration motors via `Windows.Gaming.Input`.
+        /// Returns `true` if handled; `false` instructs the caller to fall back to XInput.
+        pub(super) fn try_set_rumble(slot: usize, rumble: Rumble) -> bool {
+            let worker = &*WORKER;
+            if !worker.available.load(Ordering::Acquire) {
+                return false;
+            }
+            let mut req = worker.mailbox.lock().unwrap_or_else(PoisonError::into_inner);
+            let target = req.seq.wrapping_add(1).max(1);
+            req.seq = target;
+            req.slot = slot;
+            req.rumble = rumble;
+            worker.wake_worker.notify_one();
+
+            let deadline = Instant::now() + CALL_TIMEOUT;
+            while (req.done_seq.wrapping_sub(target) as i64) < 0 {
+                if !worker.available.load(Ordering::Acquire) {
+                    return false;
+                }
+                let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                    return false;
+                };
+                let waited = worker.wake_caller.wait_timeout(req, left);
+                req = waited.unwrap_or_else(PoisonError::into_inner).0;
+            }
+            req.handled
+        }
+    }
 
     /// Raw values, no dead zone: titles apply their own.
     pub(super) fn convert(pad: &XINPUT_GAMEPAD) -> PadState {
@@ -1250,6 +1841,9 @@ mod host {
                 return None;
             }
             self.empty_until[slot] = None;
+            if switches().haptics {
+                wgi::warm_up();
+            }
             Some(convert(&state.Gamepad))
         }
     }
@@ -1298,32 +1892,55 @@ mod host {
                     .collect();
                 down.extend(held);
             }
+            if down.is_empty() {
+                return Vec::new();
+            }
+            // SAFETY: plain queries of lock toggle states.
+            let caps_lock = unsafe { GetKeyState(i32::from(VK_CAPITAL)) & 1 != 0 };
+            let num_lock = unsafe { GetKeyState(i32::from(VK_NUMLOCK)) & 1 != 0 };
+            let key_state = build_keyboard_state(&down, caps_lock, num_lock);
+            let hkl = active_keyboard_layout(ime_english_enabled());
             down.into_iter()
-                .map(|vk| KeyState {
-                    // SAFETY: plain query.
-                    scan_code: unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) },
-                    virtual_key: vk,
-                    // shortcut: no characters (code point 0);
-                    // the title reads scan codes and virtual keys only.
-                    ..Default::default()
-                })
+                .map(|vk| translate_key(vk, &key_state, hkl))
                 .collect()
         }
 
-        fn mouse(&mut self) -> Option<MouseState> {
-            super::mouse::sample()
+        fn mouse_batch(&mut self) -> MouseBatch {
+            if switches().raw_mouse {
+                super::mouse::global_ring().drain()
+            } else {
+                match super::mouse::legacy_sample() {
+                    Some(state) => MouseBatch::Connected(vec![MouseSample {
+                        timestamp: now(),
+                        state,
+                    }]),
+                    None => MouseBatch::Disconnected,
+                }
+            }
         }
 
-        fn rumble(&mut self, slot: usize, low: u16, high: u16) {
-            // A pad read over HID takes its rumble over HID too: XInput
-            // does not know it.
-            if let Some(id) = self.hid_slots[slot] {
-                super::dualsense::set_motors(id, low, high);
-                return;
+        fn rumble(&mut self, slot: usize, rumble: Rumble) {
+            if let Some(hid_id) = self.hid_slots.get(slot).copied().flatten() {
+                if switches().haptics {
+                    if super::dualsense::set_rumble(hid_id, rumble) {
+                        return;
+                    }
+                } else {
+                    // Preserve #314 default USB DualSense HID rumble when VICTORY_HAPTICS=0.
+                    super::dualsense::set_motors(hid_id, rumble.low_u16(), rumble.high_u16());
+                    return;
+                }
+            }
+            if switches().haptics {
+                // Route impulse trigger + main motors through Windows.Gaming.Input when available;
+                // avoid calling XInputSetState afterward as XInput overwrites trigger rumble with zero.
+                if wgi::try_set_rumble(slot, rumble) {
+                    return;
+                }
             }
             let speeds = XINPUT_VIBRATION {
-                wLeftMotorSpeed: low,
-                wRightMotorSpeed: high,
+                wLeftMotorSpeed: rumble.low_u16(),
+                wRightMotorSpeed: rumble.high_u16(),
             };
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };
@@ -1501,6 +2118,67 @@ mod host {
         );
     }
 
+    #[test]
+    fn to_unicode_ex_populates_code_points_modifiers_dead_keys_and_ime_english() {
+        // Modifier propagation and lock toggles.
+        let ks = build_keyboard_state(&[VK_LSHIFT as u8, b'A'], false, true);
+        assert_eq!(ks[usize::from(VK_SHIFT)] & 0x80, 0x80);
+        assert_eq!(ks[usize::from(VK_CAPITAL)] & 0x01, 0);
+        assert_eq!(ks[usize::from(VK_NUMLOCK)] & 0x01, 1);
+
+        // Surrogate pair decoding (U+1F600 = D83D DE00), dead key, and non-char.
+        assert_eq!(decode_to_unicode_result(2, &[0xD83D, 0xDE00]), (0x1F600, false));
+        assert_eq!(decode_to_unicode_result(-1, &[b'^' as u16]), (b'^' as u32, true));
+        assert_eq!(decode_to_unicode_result(0, &[b'x' as u16]), (0, false));
+
+        // Real Windows ToUnicodeEx using US-English layout (`VICTORY_IME_ENGLISH` path).
+        let hkl = active_keyboard_layout(true);
+        let plain = build_keyboard_state(b"A", false, false);
+        let key_a = translate_key(b'A', &plain, hkl);
+        assert_eq!(key_a.virtual_key, b'A');
+        assert_eq!(key_a.code_point, u32::from(b'a'));
+        assert!(!key_a.dead_key);
+        assert_ne!(key_a.scan_code, 0);
+
+        let shifted = build_keyboard_state(&[VK_LSHIFT as u8, b'A', b'1'], false, false);
+        assert_eq!(translate_key(b'A', &shifted, hkl).code_point, u32::from(b'A'));
+        assert_eq!(translate_key(b'1', &shifted, hkl).code_point, u32::from(b'!'));
+
+        let caps = build_keyboard_state(b"A", true, false);
+        assert_eq!(translate_key(b'A', &caps, hkl).code_point, u32::from(b'A'));
+
+        // Extended non-character key (VK_UP -> 0xE048): must not misread bit 15 or emit garbage.
+        let arrow = build_keyboard_state(&[0x26], false, false);
+        let up = translate_key(0x26, &arrow, hkl);
+        assert_eq!(up.code_point, 0);
+        assert!(!up.dead_key);
+    }
+
+    #[test]
+    fn wgi_vibration_mapping_and_missing_pad_fallback_are_safe() {
+        let r = Rumble::from_params([0.25, 0.75, 0.5, 1.0]);
+        let vib = wgi::to_vibration(r);
+        assert!((vib.LeftMotor - 0.25).abs() < 1e-6);
+        assert!((vib.RightMotor - 0.75).abs() < 1e-6);
+        assert!((vib.LeftTrigger - 0.5).abs() < 1e-6);
+        assert!((vib.RightTrigger - 1.0).abs() < 1e-6);
+
+        // Non-finite and out-of-range rumble values clamp safely.
+        let clamped = Rumble::from_params([f32::NAN, -1.0, 2.0, f32::INFINITY]);
+        assert_eq!(
+            clamped,
+            Rumble {
+                low: 0.0,
+                high: 0.0,
+                left_trigger: 1.0,
+                right_trigger: 0.0,
+            }
+        );
+
+        // High slot index must safely report unhandled (falling back to XInput) without panicking.
+        assert!(!wgi::try_set_rumble(99, r));
+    }
+
     /// Hardware probe, not a check: prints what each host slot holds
     /// whenever that changes, for `VICTORY_PROBE_SECS` (default 60), so a
     /// pad can be unplugged, switched to Bluetooth or put behind a remapper
@@ -1558,7 +2236,7 @@ mod tests {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
         mouse: Option<MouseState>,
-        rumble: Vec<(usize, u16, u16)>,
+        rumble: Vec<(usize, Rumble)>,
     }
 
     struct Fake(Arc<Mutex<FakeHost>>);
@@ -1573,8 +2251,8 @@ mod tests {
         fn mouse(&mut self) -> Option<MouseState> {
             self.0.lock().unwrap().mouse
         }
-        fn rumble(&mut self, slot: usize, low: u16, high: u16) {
-            self.0.lock().unwrap().rumble.push((slot, low, high));
+        fn rumble(&mut self, slot: usize, rumble: Rumble) {
+            self.0.lock().unwrap().rumble.push((slot, rumble));
         }
     }
 
@@ -1584,7 +2262,7 @@ mod tests {
 
     fn fake_with(one_pad: bool) -> (&'static Hub, Arc<Mutex<FakeHost>>) {
         let host = Arc::new(Mutex::new(FakeHost::default()));
-        let hub = Hub::new(Box::new(Fake(Arc::clone(&host))), one_pad);
+        let hub = Hub::new_with_options(Box::new(Fake(Arc::clone(&host))), one_pad, false);
         hub.poll();
         (hub, host)
     }
@@ -1871,8 +2549,20 @@ mod tests {
         let p = pad(hub);
         assert_eq!((p.buttons, p.left_x, p.left_y), (A, 1.0, -0.5));
         let device: *const Device = &hub.devices[FALLBACK];
-        set_rumble(device, &[1.0, 0.0, 0.0, 0.0]);
-        assert_eq!(host.lock().unwrap().rumble, [(2, u16::MAX, 0)]);
+        set_rumble(device, &[1.0, 0.0, 0.5, 0.25]);
+        // Default `VICTORY_HAPTICS=0` preserves baseline 2-motor rumble (triggers zeroed).
+        assert_eq!(
+            host.lock().unwrap().rumble,
+            [(
+                2,
+                Rumble {
+                    low: 1.0,
+                    high: 0.0,
+                    left_trigger: 0.0,
+                    right_trigger: 0.0,
+                }
+            )]
+        );
         // And off again.
         host.lock().unwrap().pads[2] = None;
         host.lock().unwrap().keys.clear();
@@ -1990,11 +2680,184 @@ mod tests {
         assert_eq!(find(&hub.object, &[1; 32], &mut out), DEVICE_NOT_FOUND);
         assert!(out.is_null());
 
-        type Rumble = extern "system" fn(*const Device, *const [f32; 4]);
-        let rumble = slot::<Rumble, _>(device, 0x50);
-        rumble(device, &[0.5, 1.0, 1.0, 1.0]);
+        type RumbleFn = extern "system" fn(*const Device, *const [f32; 4]);
+        let rumble = slot::<RumbleFn, _>(device, 0x50);
+        // Baseline default (`VICTORY_HAPTICS=0`): advertises low/high (0x3) and zeroes triggers.
+        // SAFETY: `device` is our valid Device struct.
+        assert_eq!(unsafe { (*device).info.rumble_motors }, 0x3);
+        rumble(device, &[0.5, 1.0, 0.4, 0.8]);
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
-        assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+        let recorded = host.lock().unwrap().rumble.clone();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0].0, 2);
+        assert_eq!((recorded[0].1.low_u16(), recorded[0].1.high_u16()), (32767, 65535));
+        assert_eq!((recorded[0].1.left_trigger, recorded[0].1.right_trigger), (0.0, 0.0));
+        assert_eq!(recorded[1], (2, Rumble::default()));
+
+        // Opted in (`VICTORY_HAPTICS=1`): advertises all 4 motors (0xF) and forwards triggers.
+        let host_haptics = Arc::new(Mutex::new(FakeHost::default()));
+        let hub_haptics = Hub::new_with_options(Box::new(Fake(Arc::clone(&host_haptics))), false, true);
+        host_haptics.lock().unwrap().pads[2] = Some(PadState::default());
+        hub_haptics.poll();
+        let hdev = &hub_haptics.devices[2] as *const Device;
+        // SAFETY: `hdev` is our valid Device struct.
+        assert_eq!(unsafe { (*hdev).info.rumble_motors }, 0xF);
+        let hrumble = slot::<RumbleFn, _>(hdev, 0x50);
+        hrumble(hdev, &[0.5, 1.0, 0.4, 0.8]);
+        hrumble(hdev, std::ptr::null());
+        let hrec = host_haptics.lock().unwrap().rumble.clone();
+        assert_eq!(hrec.len(), 2);
+        assert_eq!(hrec[0].0, 2);
+        assert_eq!((hrec[0].1.low_u16(), hrec[0].1.high_u16()), (32767, 65535));
+        assert_eq!((hrec[0].1.left_trigger, hrec[0].1.right_trigger), (0.4, 0.8));
+        assert_eq!(hrec[1], (2, Rumble::default()));
+    }
+
+    #[test]
+    fn all_four_input_switches_default_off_and_toggle_independently() {
+        let none = InputSwitches::from_lookup(|_| None);
+        assert_eq!(none, InputSwitches::default());
+        assert!(!none.raw_mouse && !none.cursor_capture && !none.kbm_pad && !none.haptics);
+
+        let zeros = InputSwitches::from_lookup(|_| Some(std::ffi::OsString::from("0")));
+        assert_eq!(zeros, InputSwitches::default());
+
+        let invalid = InputSwitches::from_lookup(|_| Some(std::ffi::OsString::from("true")));
+        assert_eq!(invalid, InputSwitches::default());
+
+        let only_raw = InputSwitches::from_lookup(|k| (k == "VICTORY_RAW_MOUSE").then(|| "1".into()));
+        assert_eq!(
+            only_raw,
+            InputSwitches {
+                raw_mouse: true,
+                cursor_capture: false,
+                kbm_pad: false,
+                haptics: false,
+            }
+        );
+
+        let only_cursor =
+            InputSwitches::from_lookup(|k| (k == "VICTORY_CURSOR_CAPTURE").then(|| "1".into()));
+        assert_eq!(
+            only_cursor,
+            InputSwitches {
+                raw_mouse: false,
+                cursor_capture: true,
+                kbm_pad: false,
+                haptics: false,
+            }
+        );
+
+        let only_kbm = InputSwitches::from_lookup(|k| (k == "VICTORY_KBM_PAD").then(|| "1".into()));
+        assert_eq!(
+            only_kbm,
+            InputSwitches {
+                raw_mouse: false,
+                cursor_capture: false,
+                kbm_pad: true,
+                haptics: false,
+            }
+        );
+
+        let only_haptics =
+            InputSwitches::from_lookup(|k| (k == "VICTORY_HAPTICS").then(|| "1".into()));
+        assert_eq!(
+            only_haptics,
+            InputSwitches {
+                raw_mouse: false,
+                cursor_capture: false,
+                kbm_pad: false,
+                haptics: true,
+            }
+        );
+
+        let all = InputSwitches::from_lookup(|_| Some("1".into()));
+        assert!(all.raw_mouse && all.cursor_capture && all.kbm_pad && all.haptics);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn event_driven_mouse_ring_delivers_high_rate_edges_without_poll_delay() {
+        let ring = Arc::new(mouse::MouseRing::new());
+        let host = Arc::new(Mutex::new(FakeHost::default()));
+        let hub = Hub::new_with_mouse_ring(
+            Box::new(Fake(Arc::clone(&host))),
+            true,
+            false,
+            Some(Arc::clone(&ring)),
+        );
+        hub.poll();
+        assert_eq!(current(hub, MOUSE_KIND, MOUSE), Err(DEVICE_DISCONNECTED));
+
+        // Push a baseline + fast sub-millisecond tap directly into the ring WITHOUT calling hub.poll().
+        ring.set_connected(true);
+        let s0 = MouseSample {
+            timestamp: 50_000,
+            state: MouseState {
+                buttons: 0,
+                position_x: 10,
+                position_y: -5,
+                wheel_x: 0,
+                wheel_y: 0,
+            },
+        };
+        let s1 = MouseSample {
+            timestamp: 50_125,
+            state: MouseState {
+                buttons: 0x1, // left down
+                position_x: 14,
+                position_y: -7,
+                wheel_x: 0,
+                wheel_y: 0,
+            },
+        };
+        let s2 = MouseSample {
+            timestamp: 50_250,
+            state: MouseState {
+                buttons: 0x0, // left up 125 us later
+                position_x: 17,
+                position_y: -8,
+                wheel_x: 0,
+                wheel_y: 120,
+            },
+        };
+        assert!(ring.push(s0));
+        assert!(ring.push(s1));
+        assert!(ring.push(s2));
+
+        // Immediately readable via GameInput vtable with zero 8 ms poll wait.
+        let latest = current(hub, MOUSE_KIND, MOUSE).unwrap();
+        let read_mouse = |r: *const Reading| -> (u64, MouseState) {
+            let mut st = MouseState::default();
+            let get = slot::<extern "system" fn(*const Reading, *mut MouseState) -> bool, _>(r, 0x80);
+            assert!(get(r, &mut st));
+            let ts = slot::<extern "system" fn(*const Reading) -> u64, _>(r, 0x28)(r);
+            (ts, st)
+        };
+        assert_eq!(read_mouse(latest), (50_250, s2.state));
+
+        // Walk backward to prove the 125 us button-down edge was never dropped.
+        type Walk = extern "system" fn(This, *const Reading, u32, *const Device, Out) -> HRESULT;
+        let prev_fn = slot::<Walk, _>(&hub.object, 0x30);
+        let mut prev_out = std::ptr::null();
+        assert_eq!(
+            prev_fn(&hub.object, latest, MOUSE_KIND, &hub.devices[MOUSE], &mut prev_out),
+            S_OK
+        );
+        let r1: *const Reading = prev_out.cast();
+        assert_eq!(read_mouse(r1), (50_125, s1.state));
+
+        let mut prev0_out = std::ptr::null();
+        assert_eq!(
+            prev_fn(&hub.object, r1, MOUSE_KIND, &hub.devices[MOUSE], &mut prev0_out),
+            S_OK
+        );
+        let r0: *const Reading = prev0_out.cast();
+        assert_eq!(read_mouse(r0), (50_000, s0.state));
+
+        for r in [r0, r1, latest] {
+            release(r);
+        }
     }
 }

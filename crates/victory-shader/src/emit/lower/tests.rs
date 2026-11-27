@@ -823,6 +823,7 @@ fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
             root_srvs: l.root_srvs,
             root_uavs: l.root_uavs,
             root_indexed_views: Vec::new(),
+            half_views: l.half_views,
         }
     };
 

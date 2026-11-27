@@ -1,7 +1,9 @@
 //! XUser: one offline local user, signed in, never a guest, with every
 //! privilege. Served as the user provider's objects from `QueryApiImpl`;
-//! adding a user completes through `xasync` like any other async call. No
-//! input device is associated with the user (there are none, `gameinput`).
+//! adding a user completes through `xasync` like any other async call. All
+//! logical `gameinput` devices (mouse, keyboard, and gamepads) bind
+//! simultaneously to this active local user so keyboard+mouse and controller
+//! coexist without modal reconnect dialogs.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::{c_char, c_void};
@@ -86,6 +88,7 @@ pub const INTERFACES: &[Interface] = &[
     (PROVIDER, PROVIDER, &OBJECT),
     (PROVIDER, GAMERTAG_IID, &GAMERTAG_OBJECT),
     (DEVICE_PROVIDER, DEVICE_IID, &DEVICE_OBJECT),
+    (DEVICE_PROVIDER, DEVICE_PROVIDER, &DEVICE_OBJECT),
 ];
 
 type This = *const Object;
@@ -262,9 +265,35 @@ extern "system" fn unregister(_: This, _token: u64, _wait: bool) -> bool {
     true
 }
 
-/// No input device belongs to a user.
-extern "system" fn find_for_device(_: This, _device: *const c_void, _: *mut Handle) -> HRESULT {
-    USER_NOT_FOUND
+/// Binds all logical GameInput devices (`PAD[0..4]`, stand-in pad, `KEYBOARD`,
+/// and `MOUSE`) simultaneously to the single active local user (`XUID`) when
+/// `VICTORY_KBM_PAD=1` is opted in; defaults off (`USER_NOT_FOUND`) to keep
+/// baseline behavior unchanged unless explicitly enabled.
+fn find_for_device_with(enabled: bool, device: *const c_void, out: *mut Handle) -> HRESULT {
+    if !enabled {
+        return USER_NOT_FOUND;
+    }
+    if out.is_null() {
+        return xasync::E_INVALIDARG;
+    }
+    if device.is_null() {
+        // SAFETY: `out` is checked non-null.
+        unsafe { out.write(std::ptr::null()) };
+        return xasync::E_INVALIDARG;
+    }
+    // SAFETY: checked non-null; runtime callers pass a 32-byte `APP_LOCAL_DEVICE_ID`.
+    let id = unsafe { &*(device as *const [u8; 32]) };
+    if super::gameinput::is_known_device_id(id) {
+        put(out, user())
+    } else {
+        // SAFETY: `out` is checked non-null.
+        unsafe { out.write(std::ptr::null()) };
+        USER_NOT_FOUND
+    }
+}
+
+extern "system" fn find_for_device(_: This, device: *const c_void, out: *mut Handle) -> HRESULT {
+    find_for_device_with(super::gameinput::switches().kbm_pad, device, out)
 }
 
 // Unset slots (no title seen calls them): maximum users, gamer pictures,
@@ -420,6 +449,78 @@ mod tests {
         assert_eq!(
             xasync::XAsyncGetStatus(&mut block, true),
             FAILED_TO_GET_TOKEN
+        );
+    }
+
+    #[test]
+    fn find_for_device_defaults_off_and_binds_kbm_and_pads_when_opted_in() {
+        type FindForDevice = extern "system" fn(This, *const c_void, *mut Handle) -> HRESULT;
+        type GetId = extern "system" fn(This, Handle, *mut u64) -> HRESULT;
+        type Compare = extern "system" fn(This, Handle, Handle) -> i32;
+
+        let find_vtable = slot::<FindForDevice>(&DEVICE_OBJECT, 0x18);
+        let get_id = slot::<GetId>(&OBJECT, 0x58);
+        let compare = slot::<Compare>(&OBJECT, 0x28);
+
+        // Baseline default (VICTORY_KBM_PAD unset/0): returns USER_NOT_FOUND without mutating out.
+        let pad0 = crate::modules::gameinput::device_id(0);
+        let mut baseline_handle: Handle = std::ptr::null();
+        assert_eq!(
+            find_for_device_with(false, (&raw const pad0).cast(), &mut baseline_handle),
+            USER_NOT_FOUND
+        );
+        assert!(baseline_handle.is_null());
+        if !crate::modules::gameinput::switches().kbm_pad {
+            assert_eq!(
+                find_vtable(&DEVICE_OBJECT, (&raw const pad0).cast(), &mut baseline_handle),
+                USER_NOT_FOUND
+            );
+        }
+
+        let mut handles = Vec::new();
+        // Opted in (VICTORY_KBM_PAD=1): PAD[0..4], FALLBACK (4), KEYBOARD (5), MOUSE (6)
+        // all coexist on the active local XUID.
+        for index in 0..crate::modules::gameinput::DEVICES {
+            let id = crate::modules::gameinput::device_id(index);
+            let mut handle: Handle = std::ptr::null();
+            let hr = find_for_device_with(true, (&raw const id).cast(), &mut handle);
+            assert_eq!(hr, S_OK, "device index {index} should bind to local user");
+            assert!(!handle.is_null());
+            let mut xuid = 0;
+            assert_eq!(get_id(&OBJECT, handle, &mut xuid), S_OK);
+            assert_eq!(xuid, XUID);
+            handles.push(handle);
+        }
+        // Every logical device (pads + keyboard + mouse) resolves to the exact same user handle.
+        for &h in &handles[1..] {
+            assert_eq!(compare(&OBJECT, handles[0], h), 0);
+        }
+
+        // Unknown / zeroed IDs return USER_NOT_FOUND and clear the out handle.
+        for bogus in [[0u8; 32], [0xFFu8; 32], {
+            let mut bad = crate::modules::gameinput::device_id(0);
+            bad[31] = (crate::modules::gameinput::DEVICES as u8) + 1;
+            bad
+        }] {
+            let mut handle: Handle = handles[0];
+            assert_eq!(
+                find_for_device_with(true, (&raw const bogus).cast(), &mut handle),
+                USER_NOT_FOUND
+            );
+            assert!(handle.is_null());
+        }
+
+        // Null device or null out pointer returns E_INVALIDARG.
+        let mut handle: Handle = handles[0];
+        assert_eq!(
+            find_for_device_with(true, std::ptr::null(), &mut handle),
+            xasync::E_INVALIDARG
+        );
+        assert!(handle.is_null());
+        let id = crate::modules::gameinput::device_id(0);
+        assert_eq!(
+            find_for_device_with(true, (&raw const id).cast(), std::ptr::null_mut()),
+            xasync::E_INVALIDARG
         );
     }
 }

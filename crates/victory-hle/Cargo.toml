@@ -40,8 +40,10 @@ windows-sys = { workspace = true, features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 windows = { workspace = true, features = [
+    "Gaming_Input",
     "Win32_Graphics_Direct3D12",
     "Win32_Graphics_Dxgi_Common",
+    "Win32_System_WinRT",
 ] }
 # `#[implement]` names it.
 windows-core = { workspace = true, optional = true }

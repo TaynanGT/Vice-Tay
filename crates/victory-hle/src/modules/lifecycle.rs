@@ -246,6 +246,7 @@ fn toggle_full_screen(hwnd: HWND) {
     if let Some(saved) = WINDOWS.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&(hwnd as usize)) {
         *saved = state;
     }
+    super::gameinput::mouse::on_geometry_change(hwnd, Some(false));
     tracing::info!(full_screen = state.full_screen, "the title's window switched");
 }
 
@@ -544,8 +545,35 @@ extern "system" fn window_proc(
         toggle_full_screen(hwnd);
         return 0;
     }
-    if title_window && message == wm::WM_INPUT {
-        super::gameinput::mouse::receive(hwnd, wparam, lparam);
+    if title_window {
+        match message {
+            wm::WM_INPUT => super::gameinput::mouse::receive(hwnd, wparam, lparam),
+            wm::WM_SETFOCUS => super::gameinput::mouse::on_focus(hwnd, true),
+            wm::WM_KILLFOCUS => super::gameinput::mouse::on_focus(hwnd, false),
+            wm::WM_ACTIVATE => {
+                super::gameinput::mouse::on_focus(hwnd, (wparam & 0xFFFF) != wm::WA_INACTIVE as usize);
+            }
+            wm::WM_ACTIVATEAPP => super::gameinput::mouse::on_focus(hwnd, wparam != 0),
+            wm::WM_ENTERSIZEMOVE => super::gameinput::mouse::on_size_move(hwnd, true),
+            wm::WM_EXITSIZEMOVE => super::gameinput::mouse::on_size_move(hwnd, false),
+            wm::WM_SIZE => {
+                super::gameinput::mouse::on_geometry_change(
+                    hwnd,
+                    Some(wparam == wm::SIZE_MINIMIZED as usize),
+                );
+            }
+            wm::WM_MOVE => super::gameinput::mouse::on_geometry_change(hwnd, None),
+            wm::WM_SETCURSOR | wm::WM_NULL => super::gameinput::mouse::sync_cursor(hwnd),
+            wm::WM_SYSCOMMAND => {
+                let cmd = (wparam & 0xFFF0) as u32;
+                if cmd == wm::SC_MINIMIZE {
+                    super::gameinput::mouse::on_geometry_change(hwnd, Some(true));
+                } else if cmd == wm::SC_RESTORE || cmd == wm::SC_MAXIMIZE {
+                    super::gameinput::mouse::on_geometry_change(hwnd, Some(false));
+                }
+            }
+            _ => {}
+        }
     }
     if message == wm::WM_NCDESTROY {
         WINDOWS.lock().unwrap_or_else(|e| e.into_inner()).remove(&(hwnd as usize));
@@ -616,6 +644,7 @@ pub(crate) fn end_title(why: &'static str, then: Box<dyn FnOnce() + Send>) {
     if ENDING.swap(true, Ordering::SeqCst) {
         return;
     }
+    super::gameinput::mouse::set_paused(true);
     let constrain = constrained().clone();
     let suspend = routines().clone();
     tracing::info!(

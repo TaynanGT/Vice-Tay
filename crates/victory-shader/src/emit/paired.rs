@@ -8,7 +8,25 @@ pub(in super::super) fn accesses_lds(inst: &Inst) -> bool {
 }
 
 pub(in super::super) fn supports_paired_lds(name: &str) -> bool {
-    matches!(name, "ds_read_b32" | "ds_write_b32" | "ds_read2_b32" | "ds_write2_b32" | "ds_min_u32" | "ds_max_u32")
+    matches!(name, "ds_read_b32" | "ds_write_b32" | "ds_read2_b32" | "ds_write2_b32") || paired_rmw(name).is_some()
+}
+
+/// The LDS atomics without a returned value the paired form takes: each lane's is a host
+/// atomic of its own, and these integer operations give the same dword in any order
+/// (`ds_add_u32`: the depth scan's counters, CS_ScanMip0..3).
+fn paired_rmw(name: &str) -> Option<Rmw> {
+    Some(match name {
+        "ds_min_u32" => Rmw::UMin,
+        "ds_max_u32" => Rmw::UMax,
+        "ds_min_i32" => Rmw::Min,
+        "ds_max_i32" => Rmw::Max,
+        "ds_add_u32" => Rmw::Add,
+        "ds_sub_u32" => Rmw::Sub,
+        "ds_and_b32" => Rmw::And,
+        "ds_or_b32" => Rmw::Or,
+        "ds_xor_b32" => Rmw::Xor,
+        _ => return None,
+    })
 }
 
 impl<'a> Lower<'a> {
@@ -27,11 +45,7 @@ impl<'a> Lower<'a> {
             [u32::from(*offset0) | u32::from(*offset1) << 8, 0]
         };
         let read = name.starts_with("ds_read");
-        let rmw = match name {
-            "ds_min_u32" => Some(Rmw::UMin),
-            "ds_max_u32" => Some(Rmw::UMax),
-            _ => None,
-        };
+        let rmw = paired_rmw(name);
         let dst = if read {
             let Some(Operand::Vector { reg, .. }) = dst else {
                 return Err("an LDS result");
@@ -284,6 +298,34 @@ impl<'a> Lower<'a> {
                 true => self.sections[&b][&start].shapes.get(&w).copied(),
                 false => None,
             };
+            // A value that leaves the section with no shape but that nothing after it sees
+            // (a reduction's scratch partial sums, which the next tree overwrites in every
+            // lane before reading: [`super::paired_fp32::unseen_after`]): any value will do.
+            // This line's IR names a register's old value as read by every write to it, so
+            // without this the next section's replay reads a missing value (5dc3b25986622949:
+            // the FP64 count's partial sums in v2-v5, then the FP32 count s15).
+            if shape.is_none()
+                && self.section_out.contains(&w)
+                && let Some(&(reg, _)) = inst.writes.iter().find(|x| x.1 == w)
+                && super::paired_fp32::unseen_after(
+                    self.x.p,
+                    &self.sections,
+                    (b, start, self.sections[&b][&start].end),
+                    reg,
+                    w,
+                )
+            {
+                let z = self.s.m.i32(0);
+                self.put_lanes(w, Val::I32(z), Val::I32(z));
+                continue;
+            }
+            if shape.is_none() && self.section_out.contains(&w) && std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                eprintln!(
+                    "WAVE64-PAIRS {} at {:#x} leaves {w:?} unknown and seen later",
+                    inst.name(),
+                    inst.machine.offset
+                );
+            }
             let made = match shape {
                 None => Err(UNKNOWN),
                 Some(Shape::ActiveF64(lo, hi, mask, high)) => {

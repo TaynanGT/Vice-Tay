@@ -1593,6 +1593,29 @@ impl State {
     }
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
+    fn prepare_direct(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+        #[cfg(feature = "diagnostics")]
+        {
+            self.prepare_failure = crate::pipeline::PrepareFailure::default();
+        }
+        let ready = self.prepare_for(list, indexed, mesh);
+        #[cfg(feature = "diagnostics")]
+        if !ready {
+            let command = if mesh {
+                "mesh"
+            } else if indexed {
+                "indexed"
+            } else {
+                "draw"
+            };
+            let why = std::mem::take(&mut self.prepare_failure);
+            crate::capture::op(std::ptr::from_ref(list) as usize, || {
+                crate::pipeline::direct_prepare_text(self.pipeline as This, command, why)
+            });
+        }
+        ready
+    }
+
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
@@ -3768,7 +3791,7 @@ impl State {
         self.trace("mesh", x, 0);
         let ran = mesh_test() != 1
             && mesh_kept(self.pipeline)
-            && self.prepare_for(list, false, true)
+            && self.prepare_direct(list, false, true)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
@@ -4267,7 +4290,7 @@ impl State {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
-        let ready = self.prepare(list, false);
+        let ready = self.prepare_direct(list, false, false);
         // A pipeline with the rectangle geometry stage draws the title's
         // vertices as they are; any other gets its rectangles expanded.
         let rects = self.topology == RECTANGLES && !self.completes_rects();
@@ -4387,7 +4410,7 @@ impl State {
         if lost {
             once!("indexed rectangles not drawn");
         }
-        let ran = !lost && self.prepare(list, true);
+        let ran = !lost && self.prepare_direct(list, true, false);
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));

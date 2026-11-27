@@ -13469,10 +13469,25 @@ impl<'a> Lower<'a> {
         // 14-25 frames in, in a minimap or shadow mesh draw; with every
         // loop cut at 64 it ran 90 frames. Raise them again once shaders
         // stop reading data that is not there yet.)
+        // A program that walks the title's ray-tracing structures (it has the
+        // node test) is cut sooner: on the host some structures it walks
+        // are not right (dynamic ones overlap, a static one may not be
+        // unpacked), and a lane in one follows its parent links round in a
+        // circle until the limit; the title's own cap is 65,535. On an RTX
+        // 4070 Ti the screen probes' trace took 41 ms a frame at 4,096 and
+        // 4.9 ms at 512 (ray tracing on: about 3 fps to 16).
+        let traces = self
+            .x
+            .p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(|i| i.name().starts_with("image_bvh"));
         let limit = match super::loop_limit() {
             LOOP_LIMIT if self.s.pixel => 1 << 7,
             LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
-            LOOP_LIMIT => 1 << 12,
+            LOOP_LIMIT if traces => super::trace_loop_limit().min(super::compute_loop_limit()),
+            LOOP_LIMIT => super::compute_loop_limit(),
             named => named,
         };
         let limit = self.s.m.i32(limit);

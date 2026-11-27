@@ -1126,6 +1126,22 @@ mod trace {
         asked: Vec<(u64, u64, u64, u64)>,
         /// By structure, what its size was when last seen to change.
         sizes: HashMap<u64, (u64, u64)>,
+        /// By structure, its last compacted-size ask: where the size goes,
+        /// what title memory had there then, the frame.
+        slots: HashMap<u64, (u64, u64, u64)>,
+        /// Copies of an asked structure recorded while its slot still held
+        /// what it held before the ask (the title read that, a stale size),
+        /// and those recorded with something new there.
+        stale: u64,
+        fresh: u64,
+        /// Stale copies watched on: the slot, what it held, the copy's frame.
+        /// If the slot changes later the title used an outdated size
+        /// (`outdated`); if it stays, the size had not changed (`same`).
+        watched: Vec<(u64, u64, u64)>,
+        outdated: u64,
+        /// Of `outdated`, those smaller than the size that came later.
+        short: u64,
+        same: u64,
         said: u32,
     }
 
@@ -1168,6 +1184,38 @@ mod trace {
             for i in gone.into_iter().rev() {
                 self.asked.swap_remove(i);
             }
+            let (mut outdated, mut same, mut short) = (0, 0, 0);
+            self.watched.retain(|&(at, was, copied)| {
+                let now = value(at);
+                if now != was {
+                    outdated += 1;
+                    // Smaller than the structure: the copy ran past the place.
+                    short += u64::from(was < now);
+                    if outdated <= 3 {
+                        tracing::info!(frame, copied, at = format_args!("{at:#x}"), was = format_args!("{was:#x}"), now = format_args!("{now:#x}"), "bvh trace: a copy used an outdated size");
+                    }
+                    false
+                } else if frame > copied + 10 {
+                    same += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+            self.outdated += outdated;
+            self.same += same;
+            self.short += short;
+            if frame.is_multiple_of(300) && self.stale + self.fresh > 0 {
+                tracing::info!(
+                    frame,
+                    stale = self.stale,
+                    fresh = self.fresh,
+                    outdated = self.outdated,
+                    short = self.short,
+                    same = self.same,
+                    "bvh trace: copies of asked structures recorded with the slot still as before the ask (stale) or changed (fresh), so far"
+                );
+            }
         }
 
         pub(super) fn dispatch(
@@ -1196,13 +1244,30 @@ mod trace {
                 self.say(format!("frame {frame} list {list:x}: asks mode {mode} of {structure:#x} to {at:#x}, there {was:#x}"));
                 if mode == 1 {
                     self.asked.push((frame, at, structure, was));
+                    self.slots.insert(structure, (at, was, frame));
                 }
             } else if threads == Some([32, 1, 1])
                 && let [from, to] = *written
                 && [from, to].iter().all(|&a| a >= 1 << 32 && crate::shadow::in_buffer(a, 1).is_none())
             {
                 let known = self.sizes.get(&from).copied();
-                self.say(format!("frame {frame} list {list:x}: copies {from:#x} to {to:#x} constants {:x?}, its size was {known:x?}", &constants[..constants.len().min(4)]));
+                // The title read the size before it recorded this copy: a
+                // slot that still holds what it held before the ask now held
+                // it then too.
+                let slot = self.slots.remove(&from).map(|(at, was, asked)| {
+                    let now = value(at);
+                    if now == was {
+                        self.stale += 1;
+                        self.watched.push((at, was, frame));
+                    } else {
+                        self.fresh += 1;
+                    }
+                    (asked, was, now, now == was)
+                });
+                self.say(format!(
+                    "frame {frame} list {list:x}: copies {from:#x} to {to:#x} constants {:x?}, its size was {known:x?}, slot (asked, before, now, stale) {slot:x?}",
+                    &constants[..constants.len().min(4)]
+                ));
             }
         }
     }
@@ -1289,6 +1354,22 @@ mod dump {
                     let bytes = unsafe { std::slice::from_raw_parts(*data as *const u8, ARENA as usize) };
                     let _ = std::fs::write(folder.join(format!("arena-{n}.bin")), bytes);
                 }
+                // Title memory as the CPU holds it now, laid out like the
+                // arenas (`title-<n>.bin`), to compare each page's two copies.
+                let mut title: Vec<Vec<u8>> = (0..self.arenas.len()).map(|_| vec![0u8; ARENA as usize]).collect();
+                let mut unreadable = 0;
+                for (page, held) in &self.pages {
+                    let Some(arena) = self.arenas.iter().position(|a| a.0 == held.copy) else { continue };
+                    let at = held.at - self.arenas[arena].1;
+                    let Some(to) = title[arena].get_mut(at..at + PAGE as usize) else { continue };
+                    if !crate::host::read_into((page * PAGE) as *const u8, to) {
+                        unreadable += 1;
+                    }
+                }
+                for (n, bytes) in title.iter().enumerate() {
+                    let _ = std::fs::write(folder.join(format!("title-{n}.bin")), bytes);
+                }
+                tracing::info!(unreadable, "title memory by address: title memory written out beside the arenas");
                 tracing::info!(arenas = copies.len(), "title memory by address: the arenas are written out");
                 return;
             }

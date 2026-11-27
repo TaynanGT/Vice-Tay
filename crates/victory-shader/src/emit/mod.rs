@@ -150,6 +150,46 @@ pub fn loop_limit() -> u32 {
     })
 }
 
+/// The iteration count after which a compute program's loop is left when
+/// [`loop_limit`] is not overridden: 4,096.
+pub const DEFAULT_COMPUTE_LOOP_LIMIT: u32 = 1 << 12;
+
+/// The compute programs' own loop limit, without [`loop_limit`] set.
+///
+/// With the `diagnostics` feature, `VICTORY_SHADER_COMPUTE_LOOP_LIMIT`
+/// (decimal or `0x` hex, at least 1) sets it for compute programs alone, so
+/// a lower limit can be tried on the ray-tracing traversal without raising
+/// the pixel and mesh limits that `VICTORY_SHADER_LOOP_LIMIT` would also set.
+/// Part of the translation, keyed like every switch the translator reads.
+pub fn compute_loop_limit() -> u32 {
+    static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let asked = cfg!(feature = "diagnostics")
+            .then(|| std::env::var("VICTORY_SHADER_COMPUTE_LOOP_LIMIT").ok())
+            .flatten();
+        parse_set(asked.as_deref(), DEFAULT_COMPUTE_LOOP_LIMIT, u32::MAX).max(1)
+    })
+}
+
+/// The iteration count after which a loop of a program that walks the
+/// title's ray-tracing structures (one with `image_bvh*_intersect_ray`) is
+/// left when [`loop_limit`] is not overridden: 512.
+pub const DEFAULT_TRACE_LOOP_LIMIT: u32 = 1 << 9;
+
+/// The loop limit of programs that walk ray-tracing structures:
+/// `VICTORY_SHADER_TRACE_LOOP_LIMIT` (decimal or `0x` hex, at least 1) in any
+/// build, else [`DEFAULT_TRACE_LOOP_LIMIT`]. A lane in a structure the host
+/// got wrong goes round its parent links until this stops it; a lower value
+/// is cheaper and may end a long walk in a sound structure early (a miss
+/// there: a dark spot in the indirect light). Part of the translation.
+pub fn trace_loop_limit() -> u32 {
+    static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let asked = std::env::var("VICTORY_SHADER_TRACE_LOOP_LIMIT").ok();
+        parse_set(asked.as_deref(), DEFAULT_TRACE_LOOP_LIMIT, u32::MAX).max(1)
+    })
+}
+
 /// Whether a pixel shader's helper lane reads its own value where the console reads the first
 /// lane's (`lower.rs` `first_lane`); on unless `VICTORY_HELPER_OWN=0`. Part of the translation:
 /// the shader cache keys on it.

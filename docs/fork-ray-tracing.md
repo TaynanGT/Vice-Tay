@@ -95,11 +95,14 @@ after it was given them as an unordered access view.
 | `VICTORY_BVH_FENCES=0` | no fences around the builder's buffer atomics (beloooo's 72e748ea has them too) |
 | `VICTORY_BVH_SIZES_WAIT=1` | submissions that ask for structures' sizes are waited for (off: no help, slow) |
 | `VICTORY_BVH_BOUNDS=0` | the builder's accesses are not bounded |
-| `VICTORY_BVH_TRACE=1` | logs what sizes are asked, when they came, and the copies (diagnostics) |
+| `VICTORY_BVH_TRACE=1` | logs what sizes are asked, when they came, and the copies; every 300 frames, how many copies were recorded with the size slot still as before the ask (stale) and whether those sizes were too small (diagnostics) |
+| `VICTORY_SHADER_TRACE_LOOP_LIMIT=<n>` | iterations after which a loop of a program with the node test is left (512; other compute loops 4,096). Part of the translation |
+| `VICTORY_SHADER_COMPUTE_LOOP_LIMIT=<n>` | the same for every compute program (4,096; diagnostics) |
+| `VICTORY_PROBE_ROOT=<hash>,<user data>[,<table byte>]` | logs the first 256 bytes of the constant buffer a program's user data names, every 64th dispatch (diagnostics) |
 | `VICTORY_BVH_QUARANTINE=1` | nothing it stores comes back to title memory |
 | `VICTORY_BVH_FAULTS_ALL=<n>` | pages taken from faults in all (2048). Do not raise it: run rtf-2 (no bound) gave every committed page a copy, still had 110-730 faulted pages a frame of memory that is not the title's, and filled the 3 GiB of pages in 4 minutes (reports/RT-FLICKER.md) |
 | `VICTORY_MEMORY_CARD_MB` | the most of it on the card (4096) |
-| `VICTORY_MEMORY_DUMP=<folder>` | a file `go` there writes the arenas out (diagnostics) |
+| `VICTORY_MEMORY_DUMP=<folder>` | a file `go` there writes the arenas out, and title memory laid out like them (`title-<n>.bin`) (diagnostics) |
 | `VICTORY_UPLOAD_LOW=0`, `VICTORY_LENT_HEAP=0` | lists' upload memory above 2^40, no view heap for lists without one, as before |
 
 Every ten seconds the log has a line "title memory by address: ..." with pages,
@@ -107,6 +110,25 @@ dispatches, faults and what came.
 
 ## Known gaps
 
+- Traversal that never ends (RTX 4070 Ti 12 GB, Series S, 2026-11-27). Of the
+  card's time with the builder, `CS_ScreenProbes_TraceRays_RayBinning_BVH_Mixed`
+  (`f22a76fcb967ee59`) took 41 ms a frame and `RaytraceVBuffer`
+  (`6d7fe7745ab9c6d8`) 8.8 ms, and the time follows the loop limit (4.9 and 0.7
+  ms at 512): lanes go round until the limit stops them. The programs are
+  wave32 without barriers; their own cap (constant buffer at user data 5,
+  table byte 0x1c0, dword 0x78) is 65,535, so the title counts on sound
+  structures. A dump (`VICTORY_MEMORY_DUMP`) walked offline: of the structures
+  the trace was given, unpacked static ones (`0x8002`) are sound but for their
+  parent tables' index (not checked), built ones (`0x8000`, `0x8004`) have
+  thousands of nodes reached twice and children outside them, and a few static
+  ones were still packed on the card (byte for byte title memory) though named
+  by a builder dispatch. Not the cause: stale sizes (`VICTORY_BVH_TRACE`: 4 of
+  1,364 copies with a size too small in 2.5 min), pages missing (all 620 left
+  without a copy were not committed), streaming after the dispatch was
+  recorded, or the order of uploads (they go before the lists). Programs with
+  the node test now stop at 512 (`VICTORY_SHADER_TRACE_LOOP_LIMIT`): 12.1 to
+  13.9 fps median over the same unattended opening, 11.7 to 15.8 in the dorm
+  (GPU 72.8 to 41.5 ms), no difference seen in the light.
 - Dynamic structures overlap each other (8 of 65 good in run light-10, 48 of
   275 in light-15). Part of the cause, run light-11's trace (`VICTORY_BVH_TRACE=1`): the title asks for a new
   structure's compacted size, reads it one or two frames later without looking

@@ -600,7 +600,9 @@ pub fn emit(
         // A single guest wave can iterate an active-lane loop until both host
         // halves have finished. The precise latch and convergence conditions
         // for the driver compute route are checked by widen().
-        let driver_loop = wide_option.is_none()
+        // Also for a program VICTORY_WAVE_WIDE_ONLY leaves out: with the list it
+        // runs as with the switch unset (fsr4 passes 7-9 lost this route).
+        let driver_loop = (wide_option.is_none() || !wide_on)
             && c.part(FourCC::DXIL).is_none()
             && c.part(FourCC::ACCC).is_some()
             && matches!(&original, Err(ShaderError::Unsupported { what, .. })

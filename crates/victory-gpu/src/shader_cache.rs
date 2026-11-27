@@ -143,6 +143,13 @@ fn build() -> [u8; 32] {
         if victory_shader::emit::constants_raw() {
             bytes.extend_from_slice(b"VICTORY_PORT_CBV=1");
         }
+        // The wave-wide list: only when set, so the translations cached
+        // without it keep their key.
+        if let Some(list) = std::env::var_os("VICTORY_WAVE_WIDE_ONLY").filter(|v| !v.is_empty()) {
+            bytes.extend_from_slice(b"VICTORY_WAVE_WIDE_ONLY=");
+            bytes.extend_from_slice(list.as_encoded_bytes());
+            bytes.push(0);
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();
@@ -158,6 +165,15 @@ pub(crate) fn translation() -> [u8; 32] {
     build()
 }
 
+/// Translates `container` under the name a run's log gives it (the first
+/// 16 hex digits of its BLAKE3, as `pipeline` names shaders), so that
+/// `VICTORY_WAVE_WIDE_ONLY` can pick it.
+fn translate_named(container: &[u8]) -> Result<HostShader, String> {
+    let name = blake3::hash(container).to_hex();
+    victory_shader::emit::with_shader_name(&name[..16], || victory_shader::emit::translate(container))
+        .map_err(|e| e.to_string())
+}
+
 /// Puts the translation of `container` into the cache before any title asks
 /// for it (`victory shaders`): whether it was there already, or why it does
 /// not translate. The host is opened first, as a run does: what the card
@@ -165,7 +181,7 @@ pub(crate) fn translation() -> [u8; 32] {
 pub fn precompile(container: &[u8]) -> Result<bool, String> {
     let _ = crate::host::host();
     let misses = MISSES.load(Ordering::Relaxed);
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let translate = translate_named;
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate, true)?,
         None => translate(container)?,
@@ -177,7 +193,7 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let translate = translate_named;
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate, refresh_in_runs()),
         None => translate(container),

@@ -6,7 +6,7 @@
 # -NoPanel      without the performance panel (on by default, F3 hides it while playing)
 # -Console      series-x (the default) or series-s: the console the title takes this PC for
 # -Build        target\diag (the default, the build all measurements are of) or target\release
-# -Machine      auto (the default: by the graphics card), 7900xtx or 4090
+# -Machine      auto (the default: by the graphics card and the CPU), 7900xtx, 4090 or 7800x3d
 # -More         other settings: -More @{VICTORY_AMBIENT='1.0'}
 # On a smaller NVIDIA PC, compare the same Series S scene after a fresh start
 # with one override at a time, e.g. -More @{VICTORY_LAND_THREADS='3'} for
@@ -20,7 +20,7 @@ param(
     [switch]$NoPanel,
     [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x',
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
-    [ValidateSet('auto', '7900xtx', '4090')][string]$Machine = 'auto',
+    [ValidateSet('auto', '7900xtx', '4090', '7800x3d')][string]$Machine = 'auto',
     [hashtable]$More = @{}
 )
 $settings = @{
@@ -33,6 +33,10 @@ if ($Machine -eq 'auto') {
     # An NVIDIA card (PCI vendor 10DE) gets the 4090's settings, any other the 7900 XTX's.
     $cards = @(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | ForEach-Object { $_.PNPDeviceID })
     $Machine = if ($cards -match 'VEN_10DE') { '4090' } else { '7900xtx' }
+    # An NVIDIA card with an 8-core CPU (16 threads or fewer): the 4090's
+    # thread counts (12 + 8 + 6) are more workers than the CPU has threads.
+    $threads = (Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Measure-Object NumberOfLogicalProcessors -Sum).Sum
+    if ($Machine -eq '4090' -and $threads -and $threads -le 16) { $Machine = '7800x3d' }
 }
 if ($Machine -eq '7900xtx') {
     # i9-12900K, RX 7900 XTX, 64 GB: the page-mapping lock was fastest with one
@@ -57,7 +61,22 @@ if ($Machine -eq '7900xtx') {
     # minutes (the losses of runs 121-124 had the form on for every program).
     # Kept under -Safe too: without it those programs do not translate and
     # their draws are dropped, the picture -Safe is there to check.
-    $settings.VICTORY_WAVE_WIDE_ONLY = '6f225b641c5b0708,5dc3b25986622949,369cbe906ea72764,2cc4c197ee29e291'
+    # a10179ab7eda0dc3: a compute program first bound in the world on a
+    # 7800X3D / RTX 4080 PC (not yet run 30 minutes as the others were).
+    $settings.VICTORY_WAVE_WIDE_ONLY = '6f225b641c5b0708,5dc3b25986622949,369cbe906ea72764,2cc4c197ee29e291,a10179ab7eda0dc3'
+}
+if ($Machine -eq '7800x3d') {
+    # Ryzen 7 7800X3D (8 cores, 16 threads) with an NVIDIA card: the set
+    # AnyXboxX measured with Vice-Tay's newer play.ps1 -Machine 4070 (its
+    # 7800X3D profile; median about 20 fps in the world, RTX 4070 SUPER,
+    # 2026-11-26). Pages mapped by one thread; title buffers on the card down
+    # to 64 KiB. (VICTORY_CARD_RESERVE_BUDGETS of that set is not in this tree.)
+    $settings.VICTORY_THIN_THREADS = '8'; $settings.VICTORY_UNDER_THREADS = '6'; $settings.VICTORY_LAND_THREADS = '4'
+    $settings.VICTORY_MAP_THREADS = '1'; $settings.VICTORY_PIPELINE_WORKERS = '3'
+    if (-not $Safe) {
+        $settings.VICTORY_CARD_BUFFERS_MIN_KB = '64'; $settings.VICTORY_CARD_BUFFERS_MB = '1536'
+        $settings.VICTORY_CARD_WINDOWS_MB = '1024'
+    }
 }
 # -Safe leaves out every way still on trial, and the newest faster ones.
 if ($Safe) {
@@ -69,6 +88,8 @@ if ($Safe) {
     $settings.VICTORY_INDIRECT_BATCH = '2'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
+# (No smaller VICTORY_OUTPUT on Series S: the title's FSR4 tables are for
+# 1920x1080 only; 1664x936 with -RayTracing crashed the title within a minute.)
 # The whole screen, with no frame, as on the console.
 if (-not $Windowed) { $settings.VICTORY_FULLSCREEN = '1' }
 # The performance panel (FPS, frame times, GPU, CPU, VRAM, RAM) in the upper left
@@ -78,7 +99,7 @@ foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
 $ram = (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).TotalPhysicalMemory
 Write-Host "Settings for the $Machine$(if ($Safe) { ', safe' })$(if ($RayTracing) { ', with ray tracing' })."
-if ($Console -eq 'series-s' -and $Machine -eq '4090') {
+if ($Console -eq 'series-s' -and $Machine -ne '7900xtx') {
     Write-Host ("Series S requests {0} list translation threads, {1} for memory updates, and {2} for landing." -f
         $settings.VICTORY_THIN_THREADS, $settings.VICTORY_UNDER_THREADS, $settings.VICTORY_LAND_THREADS)
 }

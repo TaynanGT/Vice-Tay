@@ -384,6 +384,40 @@ pub struct UserData {
     pub dword: u32,
 }
 
+thread_local! {
+    /// The name a run's log gives the shader being translated on this
+    /// thread (the first 16 hex digits of its container's BLAKE3), when
+    /// the caller tells it ([`with_shader_name`]).
+    static SHADER_NAME: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f` with `name` as the shader being translated, for
+/// `VICTORY_WAVE_WIDE_ONLY` (`victory-gpu`'s shader cache passes it).
+pub fn with_shader_name<R>(name: &str, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<String>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            let before = self.0.take();
+            SHADER_NAME.with_borrow_mut(|n| *n = before);
+        }
+    }
+    let before = SHADER_NAME.with_borrow_mut(|n| n.replace(name.to_ascii_lowercase()));
+    let _reset = Reset(before);
+    f()
+}
+
+/// Whether `VICTORY_WAVE_WIDE_ONLY` (a comma-separated list of shader
+/// names) lists the shader being translated.
+fn wave_wide_listed() -> bool {
+    let Ok(list) = std::env::var("VICTORY_WAVE_WIDE_ONLY") else {
+        return false;
+    };
+    SHADER_NAME.with_borrow(|name| {
+        name.as_deref()
+            .is_some_and(|name| list.split(',').any(|h| h.trim().eq_ignore_ascii_case(name)))
+    })
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 ///
@@ -580,7 +614,10 @@ pub fn emit(
                 [0x58, 0x1d, 0xab, 0x2c, 0xd8, 0xbc, 0xf2, 0x2e, 0x5c, 0x96, 0x4b, 0x98, 0xe9, 0x03, 0x48, 0xd1]
                     | [0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c]
             );
-        let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1");
+        // `VICTORY_WAVE_WIDE_ONLY=<hash>,...`: the wave-wide form for these
+        // programs only (the 16 hex digits a run's log names a shader by),
+        // as for the two kernels above. `VICTORY_WAVE_WIDE` still wins.
+        let wide_on = wide_option.as_ref().map_or(scene_kernel || wave_wide_listed(), |v| v == "1");
         // A single guest wave can iterate an active-lane loop until both host
         // halves have finished. The precise latch and convergence conditions
         // for the driver compute route are checked by widen().

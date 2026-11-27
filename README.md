@@ -4,7 +4,7 @@
 
 Vice-Tay builds on [VIctory](https://github.com/Marvisak/VIctory) to run an Xbox Series title from your own files. The title's x86-64 code runs on the host CPU. The compatibility layer provides the console APIs it calls and translates its graphics work to Direct3D 12.
 
-[Quick start](#getting-started) · [Gameplay](#gameplay) · [Measurements](#measurements) · [Measurements on GitHub Pages](https://taynangt.github.io/Vice-Tay/)
+[Quick start](#getting-started) · [Measurements](#measurements) · [Measurements on GitHub Pages](https://taynangt.github.io/Vice-Tay/)
 
 ## Measurements
 
@@ -35,15 +35,7 @@ The playtest logged a 17.0 FPS 1% low, a measure of its slowest frames, and peak
 
 </details>
 
-## Gameplay
-
 Checkpoint retries worked after the boat ran aground. The HUD, minimap, mission prompts and pause menu were usable along the route.
-
-This clip shows the boat section with the diagnostics overlay. It displays frame times, draw counts, CPU and GPU load, and memory use. Press **F3** to toggle it in a diagnostics build.
-
-https://github.com/user-attachments/assets/bd07891c-c53f-4f46-9b7e-80463c379b84
-
-[Browse ten screenshots from the Series S playtest on build `672cf831`](https://github.com/TaynanGT/Vice-Tay-Screenshots#readme)
 
 ## Getting started
 

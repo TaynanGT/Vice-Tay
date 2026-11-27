@@ -7225,6 +7225,15 @@ impl HostList {
         self.closed.store(true, Ordering::Relaxed);
     }
 
+    /// Closes a list that is open still, before it goes to a queue: the one
+    /// a title's list was given when its recording was taken
+    /// (`crate::list::detach`), submitted again with no reset in between.
+    pub(crate) fn close_if_open(&self) {
+        if !self.closed.load(Ordering::Relaxed) {
+            self.close();
+        }
+    }
+
     /// `work` finds, on a thread of ours, refreshes that belong at this
     /// place among the list's steps; they are there when the list is closed.
     pub(crate) fn refreshes_coming(&self, work: impl FnOnce() -> Vec<aside::Refresh> + Send + 'static) {

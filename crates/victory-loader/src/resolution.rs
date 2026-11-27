@@ -35,8 +35,10 @@
 //!   in its padding (as pull request #53 did). That one is not safe: at 0.5
 //!   on Series S (run res-6) FidelityFX's jitter phase count came back 0 and
 //!   the title divided by it (+0x28f03e8) 49 s in.
-//! - **Upscaler.** `VICTORY_UPSCALER=<kind>` makes the picker return
-//!   `kind` (pull request #53): 6 the title's own, 7 FidelityFX.
+//! - **Upscaler.** `VICTORY_UPSCALER=<kind>` makes the picker and its
+//!   per-frame copy (+0x5400190) return `kind` (pull request #53): 6 the
+//!   title's own, 7 FidelityFX. On a Series S of the known build both return
+//!   6 without it (`VICTORY_TITLE_PATCHES=0` leaves them; `=1` on any console).
 
 use crate::frame_rate::Patched;
 
@@ -187,6 +189,27 @@ pub const PICKER: Site = Site {
     ],
 };
 
+/// The picker's per-frame copy, +0x5400190 (its first 32 bytes): the
+/// title asks it again every frame, so with only [`PICKER`] changed a
+/// Series S still switches to FidelityFX. (victory-fork #798, by KyleS98.)
+pub const PICKER_FRAME: Site = Site {
+    at: 0x540_0190,
+    what: "upscaler picker (the per-frame copy)",
+    bytes: &[
+        0x48, 0x83, 0xec, 0x28, 0x48, 0x8b, 0x05, 0xb5, 0xe2, 0x1d, 0x02, 0x48, 0x8d, 0x0d, 0x5e, 0x00, 0x00, 0x00, 0x48, 0x8b,
+        0x80, 0xa8, 0x00, 0x00, 0x00, 0x48, 0x39, 0xc8, 0x75, 0x3c, 0xe8, 0x4d,
+    ],
+};
+
+/// The upscaler both pickers are made to return: `VICTORY_UPSCALER` if set;
+/// else, on a Series S of the known build (`series_s_default`), 6, the
+/// title's own: FidelityFX's (7) output never reaches the screen here, and
+/// its DLL is refused by the host policy, so the world stays black.
+/// `VICTORY_TITLE_PATCHES=0` leaves the title's choice alone.
+pub fn upscaler_kind(asked: Option<u32>, series_s_default: bool) -> Option<u32> {
+    asked.or(series_s_default.then_some(6))
+}
+
 /// `rel32` from the end of an instruction at image offset `next` to `to`.
 fn rel(to: usize, next: usize) -> [u8; 4] {
     ((to as i64 - next as i64) as i32).to_le_bytes()
@@ -296,7 +319,7 @@ pub unsafe fn write(base: usize, size: usize, site: &Site, code: &[u8]) -> Patch
 /// The image of `size` bytes at `base` stays mapped and no thread runs its
 /// code yet.
 #[cfg(windows)]
-pub unsafe fn apply_asked(base: usize, size: usize) {
+pub unsafe fn apply_asked(base: usize, size: usize, series_s_default: bool) {
     let mut asked: Vec<(&Site, Vec<u8>, String)> = Vec::new();
     if let Some((w, h)) = asked_output() {
         asked.push((&OUTPUT, output_code(w, h), format!("{w}x{h}")));
@@ -310,8 +333,9 @@ pub unsafe fn apply_asked(base: usize, size: usize) {
     if let Some(s) = asked_ffx_scale() {
         asked.push((&FFX_SCALE, ffx_scale_code(s), format!("{s}")));
     }
-    if let Some(kind) = asked_upscaler() {
+    if let Some(kind) = upscaler_kind(asked_upscaler(), series_s_default) {
         asked.push((&PICKER, picker_code(kind), format!("returns {kind}")));
+        asked.push((&PICKER_FRAME, picker_code(kind), format!("returns {kind}")));
     }
     for (site, code, value) in asked {
         // SAFETY: the caller's promise.
@@ -402,7 +426,17 @@ mod tests {
         let changed: Vec<usize> = (0..ffx.len()).filter(|&i| ffx[i] != FFX_SCALE.bytes[i]).collect();
         assert!(changed.iter().all(|&i| (0x2c..0x30).contains(&i) || (0x36..0x3a).contains(&i) || (0x64..0x68).contains(&i)));
         assert_eq!(picker_code(7), [0xb8, 7, 0, 0, 0, 0xc3]);
+        assert!(picker_code(6).len() <= PICKER_FRAME.bytes.len());
+        assert_eq!(PICKER_FRAME.bytes[..6], [0x48, 0x83, 0xec, 0x28, 0x48, 0x8b]);
         assert_eq!(pool_check_code(), [0x48, 0x3d, 0xff, 0xff, 0x1f, 0x00, 0xeb, 0x01]);
+    }
+
+    #[test]
+    fn series_s_takes_the_titles_own_upscaler_unless_asked() {
+        assert_eq!(upscaler_kind(None, true), Some(6));
+        assert_eq!(upscaler_kind(None, false), None);
+        assert_eq!(upscaler_kind(Some(7), true), Some(7));
+        assert_eq!(upscaler_kind(Some(6), false), Some(6));
     }
 
     #[cfg(windows)]

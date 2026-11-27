@@ -679,7 +679,8 @@ struct Pass {
     place: ID3D12PipelineState,
     gather: ID3D12PipelineState,
     raise: ID3D12PipelineState,
-    flat: ID3D12PipelineState,
+    /// Optional: failure must not disable the existing depth-based passes.
+    flat: Option<ID3D12PipelineState>,
     air: ID3D12PipelineState,
     /// Made only while the hold of the reflections is on.
     hold: Option<ID3D12PipelineState>,
@@ -697,12 +698,25 @@ fn make(
     device: &ID3D12Device,
     buffer: impl Fn(u64) -> Option<ID3D12Resource>,
     reflection_hold: bool,
+    flat: bool,
+) -> windows::core::Result<Pass> {
+    make_with_compiler(device, buffer, reflection_hold, flat, |part, entry| {
+        crate::host::compile(&format!("#define {part}\n{SOURCE}"), entry, s!("cs_5_1"))
+    })
+}
+
+fn make_with_compiler(
+    device: &ID3D12Device,
+    buffer: impl Fn(u64) -> Option<ID3D12Resource>,
+    reflection_hold: bool,
+    flat: bool,
+    mut compile: impl FnMut(&str, windows::core::PCSTR) -> windows::core::Result<Vec<u8>>,
 ) -> windows::core::Result<Pass> {
     let mut root: Option<ID3D12RootSignature> = None;
     let mut resolve_root: Option<ID3D12RootSignature> = None;
     let mut indirect_root: Option<ID3D12RootSignature> = None;
     let mut pipeline = |part: &str, entry| -> windows::core::Result<ID3D12PipelineState> {
-        let code = crate::host::compile(&format!("#define {part}\n{SOURCE}"), entry, s!("cs_5_1"))?;
+        let code = compile(part, entry)?;
         let root = match part {
             "PLACE" | "GATHER" | "RAISE" => &mut resolve_root,
             "HOLD_INDIRECT" => &mut indirect_root,
@@ -726,7 +740,13 @@ fn make(
     let place = pipeline("PLACE", s!("place"))?;
     let gather = pipeline("GATHER", s!("gather"))?;
     let raise = pipeline("RAISE", s!("raise"))?;
-    let flat = pipeline("FLAT", s!("flat"))?;
+    let flat = if flat {
+        pipeline("FLAT", s!("flat"))
+            .inspect_err(|e| tracing::warn!(%e, "no depth-free ambient floor; other ambient passes remain available"))
+            .ok()
+    } else {
+        None
+    };
     let air = pipeline("AIR", s!("clear_air"))?;
     // Not made unless the hold is on, and on its own: without it the rest
     // of the stand-in still runs.
@@ -767,7 +787,7 @@ fn pass() -> Option<&'static Pass> {
     static PASS: OnceLock<Option<Pass>> = OnceLock::new();
     PASS.get_or_init(|| {
         let host = host()?;
-        make(&host.device, |bytes| host.uav_buffer(bytes), !reflect_in().is_empty())
+        make(&host.device, |bytes| host.uav_buffer(bytes), !reflect_in().is_empty(), flat_level().is_some())
             .inspect_err(|e| tracing::warn!(error = %e, "no stand-in for the indirect light"))
             .ok()
     })
@@ -930,6 +950,13 @@ pub(crate) fn after(
     let Some(pass) = pass() else {
         return false;
     };
+    // Reject an unavailable optional pass before recording or changing roots.
+    let depth_free = if role == Role::Resolve && views.depth.is_none() {
+        let Some(flat) = pass.flat.as_ref() else { return false };
+        Some(flat)
+    } else {
+        None
+    };
     let (mut level, mut constant) = match set() {
         Set::Off => return false,
         Set::Estimate(level) => (level, 0.0f32),
@@ -1032,8 +1059,8 @@ pub(crate) fn after(
                 }
             }
             Role::Resolve => {
-                if views.depth.is_none() {
-                    run(&pass.flat, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
+                if let Some(flat) = depth_free {
+                    run(flat, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
                     return true;
                 }
                 if constant == 0.0 {
@@ -1146,7 +1173,36 @@ mod tests {
         let Some(host) = host() else {
             return;
         };
-        make(&host.device, |bytes| host.uav_buffer(bytes), true).expect("the passes");
+        make(&host.device, |bytes| host.uav_buffer(bytes), true, false).expect("the passes");
+    }
+
+    #[test]
+    fn disabled_or_rejected_flat_pipeline_does_not_disable_existing_passes() {
+        use crate::indirect::tests::WarpHarness;
+
+        let gpu = WarpHarness::new().expect("a D3D12 WARP adapter");
+        for requested in [false, true] {
+            let mut flat_attempts = 0;
+            let pass = make_with_compiler(
+                &gpu.device,
+                |bytes| Some(gpu.default_uav(bytes)),
+                true,
+                requested,
+                |part, entry| {
+                    if part == "FLAT" {
+                        flat_attempts += 1;
+                        // A rejected optional shader takes the same error path
+                        // as a driver rejecting its pipeline state.
+                        return Err(windows::core::Error::empty());
+                    }
+                    crate::host::compile(&format!("#define {part}\n{SOURCE}"), entry, s!("cs_5_1"))
+                },
+            ).expect("existing ambient pipelines survive an optional failure");
+            assert_eq!(flat_attempts, usize::from(requested));
+            assert!(pass.flat.is_none());
+            assert!(pass.hold.is_some(), "other optional passes are still built");
+            assert!(pass.hold_indirect.is_some());
+        }
     }
 
     /// The hold of the reflections compiles with the system's compiler too
@@ -1164,7 +1220,7 @@ mod tests {
         use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_UINT, DXGI_SAMPLE_DESC};
 
         let mut gpu = WarpHarness::new().expect("a D3D12 WARP adapter");
-        let pass = make(&gpu.device, |bytes| Some(gpu.default_uav(bytes)), false).unwrap();
+        let pass = make(&gpu.device, |bytes| Some(gpu.default_uav(bytes)), false, true).unwrap();
         let (initial, initial_bytes, _) = gpu.shared_buffer(256);
         let (readback, readback_bytes, _) = gpu.shared_buffer(256);
         // Synthetic RGB9E5: ~0.6 gray, bright gray, saturated RGB and magenta.
@@ -1235,7 +1291,7 @@ mod tests {
             l.SetComputeRootUnorderedAccessView(2, pass.cells.GetGPUVirtualAddress());
             l.SetComputeRootUnorderedAccessView(3, pass.points.GetGPUVirtualAddress());
             l.SetComputeRootUnorderedAccessView(4, pass.stats.GetGPUVirtualAddress());
-            l.SetPipelineState(&pass.flat);
+            l.SetPipelineState(pass.flat.as_ref().expect("the requested flat pipeline"));
             l.Dispatch(1, 1, 1);
             l.ResourceBarrier(&[transition(&texture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
             l.CopyTextureRegion(&placed(&readback), 0, 0, 0, &image, None);
@@ -1280,7 +1336,7 @@ mod tests {
             }
         }
         let mut warp = WarpHarness::new().expect("a D3D12 WARP adapter");
-        let pass = make(&warp.device, |bytes| Some(warp.default_uav(bytes)), true).unwrap();
+        let pass = make(&warp.device, |bytes| Some(warp.default_uav(bytes)), true, false).unwrap();
         let (root, pso) = pass.hold_indirect.as_ref().expect("the guarded hold PSO");
         let (initial, initial_bytes, _) = warp.shared_buffer(256);
         let (readback, readback_bytes, _) = warp.shared_buffer(256);

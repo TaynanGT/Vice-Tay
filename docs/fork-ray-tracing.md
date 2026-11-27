@@ -138,10 +138,17 @@ dispatches, faults and what came.
   100 s of the unattended opening (cutscenes), 14.6 ms a frame closed, 11.2
   builder-named, 12.3 all open (run to run variation is about as large);
   in the dorm, played, 41.8 closed against 6.0 all open in another session,
-  not yet measured side by side. Still open: the non-compacted
-  built structures (`0x8000`; the walk may misread their layout), the static
-  ones left packed, and orange patches of light that look the same either
-  way. Not the cause: stale sizes (`VICTORY_BVH_TRACE`: 4 of
+  not yet measured side by side. The static structures left packed: a page
+  [`Memory::place`] took at a submission was left marked as never taken, so
+  the next look at it sent all of title memory's bytes up again over what
+  the card had unpacked there (`VICTORY_PLACE_TAKEN`, on by default: 0, 0
+  and 0 left packed in three dorm dumps, against 3, 3, 2 and 0 with it off).
+  Still open: about a third of compacted built structures with regions of
+  what reads as random pointers (11 to 43% from dump to dump, the same with
+  or without that change; of 16 whose source was still there, 11 were copied
+  from a sound one), the non-compacted built structures (`0x8000`; the walk
+  may misread their layout), and orange patches of light that look the same
+  either way. Not the cause: stale sizes (`VICTORY_BVH_TRACE`: 4 of
   1,364 copies with a size too small in 2.5 min), pages missing (all 620 left
   without a copy were not committed), streaming after the dispatch was
   recorded, or the order of uploads (they go before the lists). Programs with

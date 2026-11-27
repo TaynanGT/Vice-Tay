@@ -658,7 +658,22 @@ impl Memory {
         };
         self.hold(page, at, copy);
         crate::watch::wrote(self.entry(page) as usize, 8);
+        // Taken as of now: without the number a later [`Memory::bring`] took
+        // the page as never taken and sent all of title memory's bytes up
+        // again, over what the builder had made of them on the card (a
+        // structure unpacked there went back to its packed bytes, built
+        // nodes sharing the page to the title's bytes). (`VICTORY_PLACE_TAKEN=0`:
+        // as before.)
+        let now = place_taken()
+            .then(|| crate::watch::writes((page * PAGE) as usize, ((page + 1) * PAGE) as usize, true))
+            .flatten()
+            .map(|(now, _)| now);
         self.take(page, 0, PAGE as usize, true);
+        if let Some(now) = now
+            && let Some(held) = self.pages.get_mut(&page)
+        {
+            held.taken = now.max(1);
+        }
         true
     }
 
@@ -964,6 +979,13 @@ fn open_named() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_OPEN_NAMED").is_none_or(|v| v != "0"))
 }
 
+/// Whether a page [`Memory::place`] takes at a submission is marked taken
+/// as of then (`VICTORY_PLACE_TAKEN=0`: left as never taken, as before).
+fn place_taken() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACE_TAKEN").is_none_or(|v| v != "0"))
+}
+
 /// [`fill`] of a page stores by address do not reach.
 fn close(entry: *mut u32, n: usize, offset: u64) {
     fill(entry, n | MEMORY_READ_ONLY as usize, offset);
@@ -1257,8 +1279,13 @@ mod trace {
 
     impl Trace {
         fn say(&mut self, text: String) {
+            // `VICTORY_BVH_TRACE_LINES=<n>`: so many lines at most (6,000).
+            static MOST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+            let most = *MOST.get_or_init(|| {
+                std::env::var("VICTORY_BVH_TRACE_LINES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(6000)
+            });
             self.said += 1;
-            if self.said < 6000 {
+            if self.said < most {
                 tracing::info!("bvh trace: {text}");
             }
         }

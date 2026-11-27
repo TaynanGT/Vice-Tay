@@ -177,10 +177,15 @@ pub fn run(
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let mut prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
-    match victory_game::identify(&hash) {
+    let build = victory_game::identify(&hash);
+    match build {
         Some(build) => println!("build          {} ({hash})", build.label),
         None => println!("build          unknown ({hash})"),
     }
+    // The known build's Series S upscaler choice (victory-loader's
+    // `resolution`): both pickers return the title's own upscaler.
+    let upscaler_default = build.is_some()
+        && known_patches_on(console, std::env::var("VICTORY_TITLE_PATCHES").ok().as_deref());
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
@@ -410,7 +415,7 @@ pub fn run(
     if execute && profile.is_none() {
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped and nothing of it has run yet.
-        unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
+        unsafe { victory_loader::resolution::apply_asked(image.base(), size, upscaler_default) };
     }
     if !execute {
         println!("not executing (pass --execute to start the title)");
@@ -755,9 +760,32 @@ impl LoaderLock {
     }
 }
 
+/// Whether the known build's Series S upscaler choice applies, given
+/// `VICTORY_TITLE_PATCHES` (`var`): `0` never, `1` on any console; unset
+/// (or anything else), only with `--console series-s`. On a Series X the
+/// pickers already return what is written.
+fn known_patches_on(console: Console, var: Option<&str>) -> bool {
+    match var.map(str::trim) {
+        Some("0") => false,
+        Some("1") => true,
+        _ => matches!(console, Console::SeriesS),
+    }
+}
+
 #[cfg(test)]
 mod absent_tests {
     use super::absent_title_dlls;
+
+    /// The known build's upscaler choice: on with `--console series-s`, off
+    /// on a Series X unless asked for, and off everywhere with `0`.
+    #[test]
+    fn title_patches_follow_the_console_and_the_switch() {
+        use super::{Console, known_patches_on};
+        assert!(known_patches_on(Console::SeriesS, None));
+        assert!(!known_patches_on(Console::SeriesX, None));
+        assert!(!known_patches_on(Console::SeriesS, Some("0")));
+        assert!(known_patches_on(Console::SeriesX, Some("1")));
+    }
 
     #[test]
     fn title_dlls_missing_from_the_folder_are_named_once() {

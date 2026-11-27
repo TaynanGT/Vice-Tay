@@ -3161,12 +3161,26 @@ impl HostHeap {
         self.keep(index, kept.flatten());
     }
 
+    /// Starts a stack-buffered batch for [`HostHeap::make_listed_into`] copies.
+    pub(crate) fn list_copy_batch(&self) -> ListCopyBatch<'_> {
+        ListCopyBatch::new(self)
+    }
+
     /// Makes slot `index` (a dynamic one) the view the record `words` names,
     /// from this thread's descriptor of it if the recording `recording` has
     /// made one, else as [`HostHeap::make_at`] does, and keeps that
-    /// ([`ListViews`]). What is known of the record in this recording;
-    /// `None` (the slot is not made): not a view kept so.
-    pub(crate) fn make_listed(&self, recording: u64, words: [u32; 3], index: u32) -> Option<Listed> {
+    /// ([`ListViews`]). Copies are queued into `batch` rather than issued one
+    /// at a time. Each destination slot in an unflushed `batch` must be
+    /// distinct. What is known of the record in this recording; `None` (the
+    /// slot is not made): not a view kept so.
+    pub(crate) fn make_listed_into(
+        &self,
+        recording: u64,
+        words: [u32; 3],
+        index: u32,
+        batch: &mut ListCopyBatch<'_>,
+    ) -> Option<Listed> {
+        debug_assert!(std::ptr::eq(self, batch.heap));
         if self.sampler {
             return None;
         }
@@ -3177,53 +3191,64 @@ impl HostHeap {
             }
             let views = views.as_mut()?;
             if views.recording != recording {
+                // Flush before clearing: queued copies reference `views`'s slots
+                // from the previous recording.
+                batch.flush();
                 views.recording = recording;
                 views.made.clear();
             }
             let twins = self.twins.get(index as usize).is_some();
-            if !views.made.contains_key(&words) {
-                let view = super::view_at(words[1], words[2])?;
-                let at = 2 * views.made.len() as u32;
-                // (A constant buffer's bytes are copied for each draw.)
-                if at >= ListViews::SLOTS || matches!(view, View::Constant(..)) {
-                    return None;
+            let emit = |made: &ListView, views: &ListViews, batch: &mut ListCopyBatch<'_>| -> Listed {
+                if made.twin && twins {
+                    batch.push_pair(index, views.slot(made.at), self.raw + index, views.slot(made.at + 1));
+                    self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    batch.push(index, views.slot(made.at));
+                    self.clear_twin(index);
                 }
-                let twin = twinned(&view);
-                let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)))?;
-                let stride_word = view_stride_word(&view);
-                let address = view_address(&view).unwrap_or(0);
-                let listed = Listed {
-                    kind: crate::draw::view_kind(&view),
-                    texture: is_texture_view(&view),
-                    ready: (0, 0, false),
-                    tabled: None,
-                };
-                views.made.insert(words, ListView { view, at, twin, stride_word, address, kept, listed });
+                self.write_view_metadata(index, made.stride_word, made.address);
+                if let Some(old) = self.swap_kept_ref(index, made.kept.as_ref()) {
+                    batch.defer_retire(old);
+                }
+                made.listed
+            };
+            if let Some(made) = views.made.get(&words) {
+                return Some(emit(made, views, batch));
             }
-            let made = &views.made[&words];
-            self.copy_from(index, views.slot(made.at));
-            if made.twin && twins {
-                self.copy_from(self.raw + index, views.slot(made.at + 1));
-                self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
-            } else {
-                self.clear_twin(index);
+            let view = super::view_at(words[1], words[2])?;
+            let at = 2 * views.made.len() as u32;
+            // (A constant buffer's bytes are copied for each draw.)
+            if at >= ListViews::SLOTS || matches!(view, View::Constant(..)) {
+                return None;
             }
-            self.write_view_metadata(index, made.stride_word, made.address);
-            self.keep(index, made.kept.clone());
-            Some(made.listed)
+            let twin = twinned(&view);
+            let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)))?;
+            let stride_word = view_stride_word(&view);
+            let address = view_address(&view).unwrap_or(0);
+            let listed = Listed {
+                kind: crate::draw::view_kind(&view),
+                texture: is_texture_view(&view),
+                ready: (0, 0, false),
+                tabled: None,
+            };
+            let entry = ListView { view, at, twin, stride_word, address, kept, listed };
+            let result = emit(&entry, views, batch);
+            views.made.insert(words, entry);
+            Some(result)
         })
     }
 
-    /// As [`HostHeap::copy_to`], from the slot `from`, which the card does not
-    /// see.
-    fn copy_from(&self, to: u32, from: D3D12_CPU_DESCRIPTOR_HANDLE) {
-        #[cfg(feature = "diagnostics")]
-        if let Some(written) = self.written.get(to as usize) {
-            written.store(crate::host::coarse_ms() as u32, std::sync::atomic::Ordering::Relaxed);
-        }
-        let Some(host) = host() else { return };
-        // SAFETY: a slot of our heap, and one of this thread's heap.
-        unsafe { host.device.CopyDescriptorsSimple(1, self.cpu(to), from, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
+    /// Makes slot `index` (a dynamic one) the view the record `words` names,
+    /// from this thread's descriptor of it if the recording `recording` has
+    /// made one, else as [`HostHeap::make_at`] does, and keeps that
+    /// ([`ListViews`]). What is known of the record in this recording;
+    /// `None` (the slot is not made): not a view kept so.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn make_listed(&self, recording: u64, words: [u32; 3], index: u32) -> Option<Listed> {
+        let mut batch = self.list_copy_batch();
+        let listed = self.make_listed_into(recording, words, index, &mut batch);
+        batch.flush();
+        listed
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
@@ -3287,6 +3312,32 @@ impl HostHeap {
         }
     }
 
+    /// Replaces slot `index`'s kept COM resource without cloning when the slot
+    /// already holds the same object, returning any displaced resource so a
+    /// caller that batches descriptor copies can defer retirement until after
+    /// `CopyDescriptors` overwrites the slot.
+    fn swap_kept_ref(&self, index: u32, resource: Option<&ID3D12Resource>) -> Option<ID3D12Resource> {
+        let slot = self.kept.get(index as usize)?;
+        use windows::core::Interface;
+        let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+        // The same again: nothing to clone or retire.
+        if slot.as_ref().map(Interface::as_raw) == resource.map(Interface::as_raw) {
+            return None;
+        }
+        std::mem::replace(&mut *slot, resource.cloned())
+    }
+
+    /// As [`HostHeap::keep`], borrowing `resource` so a slot that already
+    /// holds the same COM object returns without cloning (`AddRef`/`Release`).
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn keep_ref(&self, index: u32, resource: Option<&ID3D12Resource>) {
+        // A running submission may still read the old resource through
+        // this slot.
+        if let Some(old) = self.swap_kept_ref(index, resource) {
+            crate::host::retire_resource(old);
+        }
+    }
+
     /// What slot `index` views.
     fn kept_in(&self, index: u32) -> Option<ID3D12Resource> {
         self.kept.get(index as usize)?.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -3321,7 +3372,7 @@ impl HostHeap {
         // (Bound by its handle, not read by index.)
         self.clear_twin(index);
         self.write_view_metadata(index, 1, 0);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_ref(index, Some(buffer));
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view that reads
@@ -3366,7 +3417,7 @@ impl HostHeap {
         self.put(index);
         self.clear_twin(index);
         self.write_view_metadata(index, 1, 0);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_ref(index, Some(buffer));
     }
 
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
@@ -3456,7 +3507,7 @@ impl HostHeap {
         self.write_view_metadata(index, 0, 0);
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
-        self.keep(index, holds.then(|| buffer.clone()));
+        self.keep_ref(index, holds.then_some(buffer));
     }
 
     /// Renderer port 5 (`crate::port_cbv`): makes slot `index` (a dynamic
@@ -3507,7 +3558,7 @@ impl HostHeap {
         // A constant buffer, as every other writer of a slot says: a slot
         // reused from a structured or typed view must not keep its word.
         self.write_view_metadata(index, 0, 0);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_ref(index, Some(buffer));
         true
     }
 
@@ -6774,6 +6825,578 @@ mod tests {
         assert!(heap.make_listed(0x1234, rec, s0 + 3).is_some());
         assert_eq!(read_stride(s0 + 3), 8 | VIEW_INTEGER);
         assert_eq!(read_address(s0 + 3), addr);
+    }
+}
+
+/// Stack-buffered batch of `ListViews` descriptor copies into a [`HostHeap`],
+/// flushed as a single `CopyDescriptors` call (or `CopyDescriptorsSimple` for
+/// one descriptor) instead of one driver call per slot.
+pub(crate) struct ListCopyBatch<'a> {
+    heap: &'a HostHeap,
+    dst: [D3D12_CPU_DESCRIPTOR_HANDLE; 64],
+    src: [D3D12_CPU_DESCRIPTOR_HANDLE; 64],
+    #[cfg(feature = "diagnostics")]
+    dst_slots: [u32; 64],
+    len: usize,
+    retire: [Option<ID3D12Resource>; 64],
+    retire_len: usize,
+    /// `src` handles point into thread-local `LIST_VIEWS`, so this batch must
+    /// stay on the recording thread (`!Send`, `!Sync`).
+    _not_send: std::marker::PhantomData<*mut ()>,
+}
+
+impl<'a> ListCopyBatch<'a> {
+    fn new(heap: &'a HostHeap) -> Self {
+        Self {
+            heap,
+            dst: [D3D12_CPU_DESCRIPTOR_HANDLE::default(); 64],
+            src: [D3D12_CPU_DESCRIPTOR_HANDLE::default(); 64],
+            #[cfg(feature = "diagnostics")]
+            dst_slots: [0; 64],
+            len: 0,
+            retire: [const { None }; 64],
+            retire_len: 0,
+            _not_send: std::marker::PhantomData,
+        }
+    }
+
+    fn push(&mut self, to: u32, from: D3D12_CPU_DESCRIPTOR_HANDLE) {
+        if self.len == self.dst.len() {
+            self.flush();
+        }
+        let handle = self.heap.cpu(to);
+        debug_assert!(!self.dst[..self.len].contains(&handle));
+        let i = self.len;
+        self.dst[i] = handle;
+        self.src[i] = from;
+        #[cfg(feature = "diagnostics")]
+        {
+            self.dst_slots[i] = to;
+        }
+        self.len = i + 1;
+    }
+
+    fn push_pair(
+        &mut self,
+        to0: u32,
+        from0: D3D12_CPU_DESCRIPTOR_HANDLE,
+        to1: u32,
+        from1: D3D12_CPU_DESCRIPTOR_HANDLE,
+    ) {
+        if self.len + 2 > self.dst.len() {
+            self.flush();
+        }
+        let handle0 = self.heap.cpu(to0);
+        let handle1 = self.heap.cpu(to1);
+        debug_assert!(handle0 != handle1);
+        debug_assert!(!self.dst[..self.len].contains(&handle0));
+        debug_assert!(!self.dst[..self.len].contains(&handle1));
+        let i = self.len;
+        self.dst[i] = handle0;
+        self.src[i] = from0;
+        self.dst[i + 1] = handle1;
+        self.src[i + 1] = from1;
+        #[cfg(feature = "diagnostics")]
+        {
+            self.dst_slots[i] = to0;
+            self.dst_slots[i + 1] = to1;
+        }
+        self.len = i + 2;
+    }
+
+    fn defer_retire(&mut self, old: ID3D12Resource) {
+        if self.retire_len == self.retire.len() {
+            // Belt-and-suspenders: flush queued copies first so the slot's
+            // descriptor is overwritten before retiring `old`.
+            self.flush();
+            crate::host::retire_resource(old);
+            return;
+        }
+        let i = self.retire_len;
+        self.retire[i] = Some(old);
+        self.retire_len = i + 1;
+    }
+
+    pub(crate) fn flush(&mut self) {
+        let len = self.len;
+        if len > 0 {
+            #[cfg(feature = "diagnostics")]
+            if !self.heap.written.is_empty() {
+                let now = crate::host::coarse_ms() as u32;
+                for &to in &self.dst_slots[..len] {
+                    if let Some(written) = self.heap.written.get(to as usize) {
+                        written.store(now, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+            if let Some(host) = host() {
+                if len == 1 {
+                    // SAFETY: a slot of our heap, and one of this thread's heap.
+                    unsafe {
+                        host.device.CopyDescriptorsSimple(
+                            1,
+                            self.dst[0],
+                            self.src[0],
+                            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        );
+                    }
+                } else {
+                    // SAFETY: `len` destination slots of our heap and `len` source slots
+                    // of this thread's CPU-only heap, each range of length 1 (`None`).
+                    unsafe {
+                        host.device.CopyDescriptors(
+                            len as u32,
+                            self.dst.as_ptr(),
+                            None,
+                            len as u32,
+                            self.src.as_ptr(),
+                            None,
+                            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        );
+                    }
+                }
+            }
+            self.len = 0;
+        }
+        // Retire displaced resources strictly AFTER `CopyDescriptors` has
+        // overwritten the slots (and still drain if `host()` is `None`).
+        let retire_len = self.retire_len;
+        if retire_len > 0 {
+            self.retire_len = 0;
+            for slot in &mut self.retire[..retire_len] {
+                if let Some(old) = slot.take() {
+                    crate::host::retire_resource(old);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ListCopyBatch<'_> {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod zero_alloc_tests {
+    use super::*;
+
+    /// Runs the live D3D12 48-descriptor `ListCopyBatch` vs unbatched
+    /// `CopyDescriptorsSimple(1, ...)` microbenchmark (`draw::zero_alloc_tests`).
+    pub(crate) fn bench_list_copy_batch_48() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let Some(heap) = HostHeap::new(false, 4) else {
+            println!("D3D12 48-desc ListViews copy: skipped (no host GPU)");
+            return;
+        };
+        const TABLE_SLOTS: u32 = 48;
+        const TABLES: usize = 20_000;
+        let s0 = heap.dynamic(TABLE_SLOTS).expect("48 dynamic slots");
+        let backing = vec![0u64; (TABLE_SLOTS as usize + 1) * 512];
+        let base = (backing.as_ptr() as u64).next_multiple_of(4096);
+        let mut slot_mem = vec![[0u32; 8]; TABLE_SLOTS as usize];
+        let mut records = Vec::with_capacity(TABLE_SLOTS as usize);
+        for (k, slot) in slot_mem.iter_mut().enumerate() {
+            let addr = base + (k as u64) * 256;
+            let resource: [u32; 14] = [1, 0, 0, 0, 256, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+            let mut desc = [0u32; 16];
+            desc[..10].copy_from_slice(&[12, 1, 5768, 0, 0, 0, 32, 0, 0, 0]);
+            (desc[10], desc[11]) = (addr as u32, (addr >> 32) as u32);
+            crate::descriptor::record(
+                slot.as_mut_ptr() as u64,
+                View::Placed(false, resource, desc),
+            );
+            records.push([slot[0], slot[1], slot[2]]);
+        }
+
+        // Warm `ListViews` cache for one recording.
+        const BENCH_REC: u64 = 0xbe4c_4001;
+        {
+            let mut warmup = heap.list_copy_batch();
+            for (k, &rec) in records.iter().enumerate() {
+                let listed = heap.make_listed_into(BENCH_REC, rec, s0 + k as u32, &mut warmup);
+                assert!(listed.is_some());
+            }
+            warmup.flush();
+        }
+
+        let t0 = Instant::now();
+        for _ in 0..TABLES {
+            for (k, &rec) in records.iter().enumerate() {
+                black_box(heap.make_listed(BENCH_REC, rec, s0 + k as u32));
+            }
+        }
+        let unbatched_ns = t0.elapsed().as_nanos() as f64;
+
+        let t1 = Instant::now();
+        for _ in 0..TABLES {
+            let mut batch = heap.list_copy_batch();
+            for (k, &rec) in records.iter().enumerate() {
+                black_box(heap.make_listed_into(BENCH_REC, rec, s0 + k as u32, &mut batch));
+            }
+            batch.flush();
+        }
+        let batched_ns = t1.elapsed().as_nanos() as f64;
+
+        let unbatched_per_table = unbatched_ns / TABLES as f64;
+        let batched_per_table = batched_ns / TABLES as f64;
+        let unbatched_per_desc = unbatched_per_table / f64::from(TABLE_SLOTS);
+        let batched_per_desc = batched_per_table / f64::from(TABLE_SLOTS);
+        println!(
+            "D3D12 48-desc ListViews copy ({TABLES} tables): unbatched={unbatched_per_table:.1} ns/table ({unbatched_per_desc:.1} ns/desc) | batched={batched_per_table:.1} ns/table ({batched_per_desc:.1} ns/desc) | speedup={:.2}x",
+            unbatched_ns / batched_ns
+        );
+
+        heap.release(heap.id(), s0, TABLE_SLOTS);
+    }
+
+    #[test]
+    fn list_copy_batch_flushes_across_boundary_with_twins_and_clear_twin() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use victory_shader::emit::{VIEW_ADDRESSES, VIEW_INTEGER, VIEW_SIGNED};
+        use windows::core::Interface;
+
+        let Some(mut heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let Some((_, _, data)) = heap.strides else {
+            panic!("view heap should allocate strides table");
+        };
+        let read_stride = |slot: u32| -> u32 {
+            // SAFETY: inside `SLOT_STRIDES_COUNT` mapping of `heap.strides`.
+            unsafe { *(data as *const u32).add(slot as usize) }
+        };
+        let read_address = |slot: u32| -> u64 {
+            let words = (data + VIEW_ADDRESSES as usize) as *const u32;
+            let index = 2 * slot as usize;
+            // SAFETY: both dwords are inside the heap's title-address table.
+            unsafe { u64::from(*words.add(index)) | (u64::from(*words.add(index + 1)) << 32) }
+        };
+
+        const SLOTS: u32 = 70;
+        let s0 = heap.dynamic(SLOTS).unwrap();
+        // Ensure raw twins are exercised even on adapters whose default view
+        // heap runs with `raw == 0` (e.g. 1M-descriptor cap).
+        let total = unsafe { heap.heap.GetDesc().NumDescriptors };
+        if heap.raw == 0 && total >= (s0 + SLOTS) * 2 {
+            heap.raw = s0 + SLOTS;
+            heap.twins = (0..(s0 + SLOTS) as usize)
+                .map(|_| AtomicBool::new(false))
+                .collect();
+        }
+        let has_twins = heap.twins.get((s0 + SLOTS - 1) as usize).is_some();
+
+        let mem_a = vec![0u64; 1 << 11];
+        let mem_b = vec![0u64; 1 << 11];
+        let tex_mem = vec![0u64; 1 << 11];
+        let addr_a = (mem_a.as_ptr() as u64).next_multiple_of(4096);
+        let addr_b = (mem_b.as_ptr() as u64).next_multiple_of(4096);
+        let addr_tex = (tex_mem.as_ptr() as u64).next_multiple_of(4096);
+
+        let placed_buffer = |uav: bool, dxgi_fmt: u32, addr: u64| {
+            let resource: [u32; 14] = [1, 0, 0, 0, 4096, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+            let mut desc = [0u32; 16];
+            let words = if uav {
+                [dxgi_fmt, 1, 0, 0, 64, 0, 0, 0, 0, 0]
+            } else {
+                [dxgi_fmt, 1, 5768, 0, 0, 0, 64, 0, 0, 0]
+            };
+            desc[..10].copy_from_slice(&words);
+            (desc[10], desc[11]) = (addr as u32, (addr >> 32) as u32);
+            View::Placed(uav, resource, desc)
+        };
+        let placed_tex2d = |addr: u64| {
+            let resource: [u32; 14] = [3, 0, 0, 0, 4, 0, 4, 0x1_0001, 28, 1, 0, 0x105, 0, 0];
+            let mut desc = [0u32; 16];
+            (desc[0], desc[1], desc[2], desc[4], desc[5]) = (28, 4, 5768, 0, 1);
+            (desc[10], desc[11]) = (addr as u32, (addr >> 32) as u32);
+            View::Placed(false, resource, desc)
+        };
+
+        let mut slot_a = [0u32; 8];
+        let mut slot_b = [0u32; 8];
+        let mut slot_tex = [0u32; 8];
+        let view_a = placed_buffer(true, 12, addr_a); // R16G16B16A16_UINT: 8 | VIEW_INTEGER
+        let view_b = placed_buffer(false, 59, addr_b); // R16_SINT: 2 | VIEW_INTEGER | VIEW_SIGNED
+        let view_tex = placed_tex2d(addr_tex); // Texture2D SRV: non-twinned
+        assert!(twinned(&view_a));
+        assert!(twinned(&view_b));
+        assert!(!twinned(&view_tex));
+
+        crate::descriptor::record(slot_a.as_mut_ptr() as u64, view_a);
+        crate::descriptor::record(slot_b.as_mut_ptr() as u64, view_b);
+        crate::descriptor::record(slot_tex.as_mut_ptr() as u64, view_tex);
+        let rec_a = [slot_a[0], slot_a[1], slot_a[2]];
+        let rec_b = [slot_b[0], slot_b[1], slot_b[2]];
+        let rec_tex = [slot_tex[0], slot_tex[1], slot_tex[2]];
+
+        const RECORDING: u64 = 0x55aa_0001;
+        {
+            let mut batch = heap.list_copy_batch();
+            for k in 0..SLOTS {
+                let rec = match k % 3 {
+                    0 => rec_a,
+                    1 => rec_b,
+                    _ => rec_tex,
+                };
+                let listed = heap
+                    .make_listed_into(RECORDING, rec, s0 + k, &mut batch)
+                    .expect("valid view should be listed");
+                assert_eq!(listed.texture, k % 3 == 2);
+            }
+            // More than 64 copies queued in total so auto-flush ran mid-loop,
+            // leaving a non-empty remainder flushed explicitly here.
+            assert!(batch.len > 0);
+            batch.flush();
+            assert_eq!(batch.len, 0);
+            assert_eq!(batch.retire_len, 0);
+        }
+
+        let res_a = heap.kept_in(s0).expect("buffer view A should keep a host resource");
+        let res_b = heap.kept_in(s0 + 1).expect("buffer view B should keep a host resource");
+        let res_tex = heap.kept_in(s0 + 2).expect("texture view should keep a host resource");
+
+        for k in 0..SLOTS {
+            let slot = s0 + k;
+            let (exp_stride, exp_addr, exp_twin, exp_res) = match k % 3 {
+                0 => (8 | VIEW_INTEGER, addr_a, true, &res_a),
+                1 => (2 | VIEW_INTEGER | VIEW_SIGNED, addr_b, true, &res_b),
+                _ => (0, 0, false, &res_tex),
+            };
+            assert_eq!(read_stride(slot), exp_stride, "stride mismatch at slot {slot}");
+            assert_eq!(read_address(slot), exp_addr, "address mismatch at slot {slot}");
+            if has_twins {
+                assert_eq!(
+                    heap.twins[slot as usize].load(Ordering::Relaxed),
+                    exp_twin,
+                    "twin state mismatch at slot {slot}"
+                );
+            }
+            assert_eq!(
+                heap.kept_in(slot).as_ref().map(Interface::as_raw),
+                Some(exp_res.as_raw()),
+                "kept resource mismatch at slot {slot}"
+            );
+            #[cfg(feature = "diagnostics")]
+            assert_eq!(heap.shows(slot, exp_res), Some(true));
+        }
+
+        // Directly exercise the `len == 63` `push_pair` flush boundary
+        // (`63 + 2 > 64`): 1 non-twinned slot (1 copy) + 31 twinned slots
+        // (62 copies) = 63 queued, then 1 twinned slot must auto-flush the 63
+        // (and drain deferred retirements) before queueing the new pair.
+        if has_twins {
+            let mut batch = heap.list_copy_batch();
+            heap.make_listed_into(RECORDING, rec_tex, s0, &mut batch)
+                .expect("non-twinned slot should list");
+            assert_eq!(batch.len, 1);
+            for k in 1..32u32 {
+                heap.make_listed_into(RECORDING, rec_a, s0 + k, &mut batch)
+                    .expect("twinned slot should list");
+            }
+            assert_eq!(batch.len, 63);
+            assert!(batch.retire_len > 0);
+            heap.make_listed_into(RECORDING, rec_b, s0 + 32, &mut batch)
+                .expect("boundary twinned slot should list");
+            assert_eq!(batch.len, 2);
+            // Auto-flush cleared the prefix's deferred retirements; slot `s0 + 32`
+            // replaced `res_tex` with `res_b`, queueing exactly 1 retirement.
+            assert_eq!(batch.retire_len, 1);
+            batch.flush();
+            assert_eq!(batch.len, 0);
+            assert_eq!(batch.retire_len, 0);
+
+            assert_eq!(read_stride(s0), 0);
+            assert!(!heap.twins[s0 as usize].load(Ordering::Relaxed));
+            for k in 1..32u32 {
+                assert_eq!(read_stride(s0 + k), 8 | VIEW_INTEGER);
+                assert_eq!(read_address(s0 + k), addr_a);
+                assert!(heap.twins[(s0 + k) as usize].load(Ordering::Relaxed));
+            }
+            assert_eq!(read_stride(s0 + 32), 2 | VIEW_INTEGER | VIEW_SIGNED);
+            assert_eq!(read_address(s0 + 32), addr_b);
+            assert!(heap.twins[(s0 + 32) as usize].load(Ordering::Relaxed));
+        }
+
+        // Reuse a twinned slot (`s0 + 1`) with the non-twinned texture view to
+        // verify `clear_twin` (`true -> false`) and Drop-driven flush.
+        if has_twins {
+            assert!(heap.twins[(s0 + 1) as usize].load(Ordering::Relaxed));
+        }
+        {
+            let mut batch = heap.list_copy_batch();
+            let listed = heap
+                .make_listed_into(RECORDING, rec_tex, s0 + 1, &mut batch)
+                .expect("texture reuse should succeed");
+            assert!(listed.texture);
+            assert_eq!(batch.len, 1);
+            // Drop flushes the single queued copy via CopyDescriptorsSimple.
+        }
+        assert_eq!(read_stride(s0 + 1), 0);
+        assert_eq!(read_address(s0 + 1), 0);
+        if has_twins {
+            assert!(!heap.twins[(s0 + 1) as usize].load(Ordering::Relaxed));
+        }
+        assert_eq!(
+            heap.kept_in(s0 + 1).as_ref().map(Interface::as_raw),
+            Some(res_tex.as_raw())
+        );
+        #[cfg(feature = "diagnostics")]
+        assert_eq!(heap.shows(s0 + 1, &res_tex), Some(true));
+
+        heap.release(heap.id(), s0, SLOTS);
+    }
+
+    #[test]
+    fn list_copy_batch_defers_retirement_until_flush() {
+        use windows::core::Interface;
+
+        let Some(h) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let s0 = heap.dynamic(2).unwrap();
+
+        let tex_mem = vec![0u64; 1 << 11];
+        let addr_tex = (tex_mem.as_ptr() as u64).next_multiple_of(4096);
+        let resource: [u32; 14] = [3, 0, 0, 0, 4, 0, 4, 0x1_0001, 28, 1, 0, 0x105, 0, 0];
+        let mut desc = [0u32; 16];
+        (desc[0], desc[1], desc[2], desc[4], desc[5]) = (28, 4, 5768, 0, 1);
+        (desc[10], desc[11]) = (addr_tex as u32, (addr_tex >> 32) as u32);
+        let mut slot_tex = [0u32; 8];
+        crate::descriptor::record(
+            slot_tex.as_mut_ptr() as u64,
+            View::Placed(false, resource, desc),
+        );
+        let rec_tex = [slot_tex[0], slot_tex[1], slot_tex[2]];
+
+        const RECORDING: u64 = 0x55aa_0002;
+        // Bind `s0 + 1` once so `res_tex` is known and `s0 + 1` already holds it.
+        assert!(heap.make_listed(RECORDING, rec_tex, s0 + 1).is_some());
+        let res_tex = heap.kept_in(s0 + 1).expect("texture view should keep a host resource");
+
+        let (old_a, _) = h.upload_buffer(256).expect("upload buffer A");
+        let (old_b, _) = h.upload_buffer(256).expect("upload buffer B");
+        assert_eq!(crate::host::references(&old_a), 1);
+        assert_eq!(crate::host::references(&old_b), 1);
+
+        // Seed `s0` with `old_a`; replacing it via `make_listed_into` must keep
+        // `old_a` buffered inside `batch.retire` until `batch.flush()` runs.
+        heap.keep_ref(s0, Some(&old_a));
+        assert_eq!(crate::host::references(&old_a), 2);
+        {
+            let mut batch = heap.list_copy_batch();
+            assert!(heap.make_listed_into(RECORDING, rec_tex, s0, &mut batch).is_some());
+            assert_eq!(batch.len, 1);
+            assert_eq!(batch.retire_len, 1);
+            assert_eq!(
+                batch.retire[0].as_ref().map(Interface::as_raw),
+                Some(old_a.as_raw())
+            );
+            assert_eq!(
+                heap.kept_in(s0).as_ref().map(Interface::as_raw),
+                Some(res_tex.as_raw())
+            );
+            // Still alive in `batch.retire[0]`, not retired before `CopyDescriptors`.
+            assert_eq!(crate::host::references(&old_a), 2);
+
+            // Re-binding `s0 + 1` to the same resource must not queue a retirement.
+            assert!(heap.make_listed_into(RECORDING, rec_tex, s0 + 1, &mut batch).is_some());
+            assert_eq!(batch.len, 2);
+            assert_eq!(batch.retire_len, 1);
+
+            batch.flush();
+            assert_eq!(batch.len, 0);
+            assert_eq!(batch.retire_len, 0);
+            assert!(batch.retire[0].is_none());
+            assert!(matches!(crate::host::references(&old_a), 1 | 2));
+        }
+
+        // Verify `Drop` also flushes queued copies and drains deferred retirement.
+        heap.keep_ref(s0, Some(&old_b));
+        assert_eq!(crate::host::references(&old_b), 2);
+        {
+            let mut batch = heap.list_copy_batch();
+            assert!(heap.make_listed_into(RECORDING, rec_tex, s0, &mut batch).is_some());
+            assert_eq!(batch.retire_len, 1);
+            assert_eq!(
+                batch.retire[0].as_ref().map(Interface::as_raw),
+                Some(old_b.as_raw())
+            );
+            assert_eq!(crate::host::references(&old_b), 2);
+        }
+        assert!(matches!(crate::host::references(&old_b), 1 | 2));
+
+        heap.release(heap.id(), s0, 2);
+    }
+
+    #[test]
+    fn keep_ref_skips_clone_on_identity_and_retires_on_replacement() {
+        use windows::core::Interface;
+
+        let Some(h) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let s0 = heap.dynamic(1).unwrap();
+        let (buf_a, _) = h.upload_buffer(256).expect("upload buffer A");
+        let (buf_b, _) = h.upload_buffer(256).expect("upload buffer B");
+
+        assert_eq!(crate::host::references(&buf_a), 1);
+        assert_eq!(crate::host::references(&buf_b), 1);
+
+        // First bind takes one COM reference into `kept[s0]`.
+        heap.keep_ref(s0, Some(&buf_a));
+        assert_eq!(crate::host::references(&buf_a), 2);
+        assert_eq!(
+            heap.kept_in(s0).as_ref().map(Interface::as_raw),
+            Some(buf_a.as_raw())
+        );
+        #[cfg(feature = "diagnostics")]
+        assert_eq!(heap.shows(s0, &buf_a), Some(true));
+
+        // Repeated binds of the same COM resource short-circuit without cloning
+        // or pushing duplicates into the retirement queue.
+        for _ in 0..16 {
+            heap.keep_ref(s0, Some(&buf_a));
+        }
+        assert_eq!(crate::host::references(&buf_a), 2);
+        assert_eq!(
+            heap.kept_in(s0).as_ref().map(Interface::as_raw),
+            Some(buf_a.as_raw())
+        );
+
+        // Replacing with `buf_b` swaps the slot and retires `buf_a`.
+        heap.keep_ref(s0, Some(&buf_b));
+        assert_eq!(
+            heap.kept_in(s0).as_ref().map(Interface::as_raw),
+            Some(buf_b.as_raw())
+        );
+        assert_eq!(crate::host::references(&buf_b), 2);
+        // `buf_a` is no longer held by the slot: refcount is 1 (dropped
+        // immediately if bury_lag == 0) or 2 (local + retirement queue).
+        assert!(matches!(crate::host::references(&buf_a), 1 | 2));
+        #[cfg(feature = "diagnostics")]
+        {
+            assert_eq!(heap.shows(s0, &buf_b), Some(true));
+            assert_eq!(heap.shows(s0, &buf_a), Some(false));
+        }
+
+        // Clearing to `None` retires `buf_b`; clearing again is a no-op.
+        heap.keep_ref(s0, None);
+        assert!(heap.kept_in(s0).is_none());
+        heap.keep_ref(s0, None);
+        assert!(heap.kept_in(s0).is_none());
+        assert!(matches!(crate::host::references(&buf_b), 1 | 2));
+
+        heap.release(heap.id(), s0, 1);
     }
 }
 

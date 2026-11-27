@@ -25,7 +25,7 @@ Vice-Tay builds on [VIctory](https://github.com/Marvisak/VIctory) to run an Xbox
    .\scripts\play.ps1 -Exe 'D:\victory-data\game\game.exe' -Console series-s -Machine laptop
    ```
 
-3. **Second A/B pair (`-Machine 4060` preset on `exp/perf-4060-16gb`):** Compare `-Machine laptop` vs `-Machine 4060` on the same branch to isolate the memory-budget, worker-count, and `VICTORY_PORT_*` preset changes:
+3. **Second A/B pair (`-Machine 4060` preset on `exp/perf-4060-16gb`):** Compare `-Machine laptop` vs `-Machine 4060` on the same branch to isolate the memory-budget, worker-count, and renderer port (`VICTORY_PORT_GUARD`, `VICTORY_PORT_JOURNAL`) preset changes:
 
    ```powershell
    .\scripts\play.ps1 -Exe 'D:\victory-data\game\game.exe' -Console series-s -Machine 4060

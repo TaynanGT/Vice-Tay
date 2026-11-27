@@ -49,6 +49,7 @@ pub(crate) struct Pending {
     scene_input: bool,
     /// The title dispatches this head blend-shape map only once.
     head_map: bool,
+    wait_for_head_map: bool,
     /// Why this pipeline is intentionally skipped (e.g. RT resolve without BVH).
     left_out: Option<&'static str>,
 }
@@ -106,12 +107,9 @@ fn scene_input(shaders: &[Arc<Shader>]) -> bool {
     })
 }
 
-/// Losing this producer leaves eyes and teeth without the surrounding skin.
-/// See avatarmanz/VIctory-7900XTX #166.
-fn head_map(shaders: &[Arc<Shader>]) -> bool {
+fn head_map_wait() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAD_MAP_WAIT").is_none_or(|value| value != "0"))
-        && matches!(shaders, [shader] if shader.stage == "compute" && shader.hash == "61e54e90adccaf6a")
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -122,13 +120,15 @@ unsafe impl Sync for Pending {}
 
 impl Pending {
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
-        Self::new_with_skip_hashes(shaders, graphics, super::skip_hashes())
+        let protect_head_map = graphics.is_none() && head_map_wait();
+        Self::new_with_policy(shaders, graphics, super::skip_hashes(), protect_head_map)
     }
 
-    fn new_with_skip_hashes(
+    fn new_with_policy(
         shaders: Vec<Arc<Shader>>,
         graphics: Option<Box<GraphicsState>>,
         skip_hashes: &[String],
+        protect_head_map: bool,
     ) -> Pending {
         let mut key = blake3::Hasher::new();
         for s in &shaders {
@@ -136,8 +136,12 @@ impl Pending {
             key.update(s.hash.as_bytes());
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
-        let head_map = graphics.is_none() && head_map(&shaders);
-        let scene_input = head_map || scene_input(&shaders);
+        // Losing this producer leaves eyes and teeth without the surrounding
+        // skin. See avatarmanz/VIctory-7900XTX #166.
+        let head_map = graphics.is_none()
+            && matches!(&shaders[..], [shader] if shader.stage == "compute" && shader.hash == "61e54e90adccaf6a");
+        let wait_for_head_map = head_map && protect_head_map;
+        let scene_input = wait_for_head_map || scene_input(&shaders);
         let screen = (graphics.as_ref().is_some_and(|g| g.screen_pass())
             && shaders.iter().all(|s| s.stage != "mesh"))
             || scene_input;
@@ -146,6 +150,7 @@ impl Pending {
             screen,
             scene_input,
             head_map,
+            wait_for_head_map,
             left_out,
             shaders,
             graphics,
@@ -268,30 +273,38 @@ fn ready_with(p: &Arc<Pending>, dispatch: bool, wait_for_frame: impl FnOnce(&Pen
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
     }
-    let already_ready = p.made.get().is_some();
-    if dispatch && p.head_map {
-        let began = Instant::now();
-        if !already_ready {
-            start(p, REQUESTED);
-        }
-        // start has released the queue lock. The worker publishes both failure
-        // and success through made, which wakes every caller waiting here.
-        let made = p.made.wait();
+    let mut made = p.made.get();
+    let already_ready = made.is_some();
+    // The same shader can be dispatched for many characters or instances.
+    // Record its first actual dispatch entry in both arms of the comparison.
+    static HEAD_MAP_REPORTED: AtomicBool = AtomicBool::new(false);
+    let first_head = dispatch && p.head_map && !HEAD_MAP_REPORTED.load(Ordering::Relaxed)
+        && !HEAD_MAP_REPORTED.swap(true, Ordering::Relaxed);
+    let began = first_head.then(|| (crate::frame::current(), Instant::now()));
+    if !already_ready {
+        start(p, REQUESTED);
+        made = if dispatch && p.wait_for_head_map {
+            // start has released the queue lock. The worker publishes both
+            // failure and success through made and wakes all callers.
+            Some(p.made.wait())
+        } else {
+            wait_for_frame(p);
+            p.made.get()
+        };
+    }
+    let host_pipeline = made.and_then(Option::as_ref);
+    if let Some((frame, began)) = began {
         tracing::info!(
-            frame = crate::frame::current(),
+            frame,
             key = p.key,
             already_ready,
-            host_pipeline = made.is_some(),
+            host_pipeline = host_pipeline.is_some(),
+            wait_enabled = p.wait_for_head_map,
             wait_ms = began.elapsed().as_secs_f64() * 1e3,
             "head blend-shape map pipeline at dispatch"
         );
-        return made.as_ref();
     }
-    if !already_ready {
-        start(p, REQUESTED);
-        wait_for_frame(p);
-    }
-    p.made.get()?.as_ref()
+    host_pipeline
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
@@ -455,7 +468,7 @@ impl Queue {
             return None;
         }
         p.queue_state.store(priority, Ordering::Relaxed);
-        if priority == REQUESTED && p.head_map {
+        if priority == REQUESTED && p.wait_for_head_map {
             self.screen.push_front(p.clone());
         } else if priority == REQUESTED && p.screen && screens_first() {
             self.screen.push_back(p.clone());
@@ -764,59 +777,76 @@ mod tests {
         let mut screen = Pending::new(Vec::new(), None);
         screen.screen = true;
         let screen = Arc::new(screen);
-        let mut head = Pending::new(Vec::new(), None);
-        head.head_map = true;
-        let head = Arc::new(head);
+        let head = Arc::new(head_map_pipeline(true));
+        assert!(head.head_map && head.wait_for_head_map && head.scene_input);
+        let control = Arc::new(head_map_pipeline(false));
+        assert!(control.head_map && !control.wait_for_head_map && !control.scene_input);
         let mut queue = Queue::new();
         assert_eq!(queue.push(&screen, REQUESTED), Some(true));
+        assert_eq!(queue.push(&control, REQUESTED), Some(true));
         assert_eq!(queue.push(&head, REQUESTED), Some(true));
         assert_eq!(queue.push(&head, REQUESTED), None);
         assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &head));
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &screen));
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &control));
     }
 
     #[test]
     fn head_map_dispatch_bypasses_the_frame_budget_and_wakes_on_driver_failure() {
-        let mut head = Pending::new(Vec::new(), None);
-        head.head_map = true;
-        head.queue_state.store(MAKING, Ordering::Relaxed);
-        head.used.store(true, Ordering::Relaxed);
-        let head = Arc::new(head);
+        for wait in [true, false] {
+            let head = Arc::new(head_map_pipeline(wait));
+            head.queue_state.store(MAKING, Ordering::Relaxed);
+            head.used.store(true, Ordering::Relaxed);
 
-        std::thread::scope(|scope| {
-            let (entered, began) = std::sync::mpsc::channel();
-            let (finished, result) = std::sync::mpsc::channel();
-            let pending = &head;
-            scope.spawn(move || {
-                entered.send(()).unwrap();
-                let ready = ready_with(pending, true, |_| panic!("ordinary frame budget used"));
-                finished.send(ready.is_none() && pending.made.get().is_some()).unwrap();
+            std::thread::scope(|scope| {
+                let (entered, began) = std::sync::mpsc::channel();
+                let (finished, result) = std::sync::mpsc::channel();
+                let pending = &head;
+                scope.spawn(move || {
+                    entered.send(()).unwrap();
+                    let mut used_budget = false;
+                    let ready = ready_with(pending, true, |_| used_budget = true);
+                    assert!(ready.is_none());
+                    finished.send((used_budget, pending.made.get().is_some())).unwrap();
+                });
+                began.recv().unwrap();
+                let deadline = if wait { Duration::from_millis(25) } else { Duration::from_secs(1) };
+                let first = result.recv_timeout(deadline);
+                head.make_with(|| None);
+                if wait {
+                    assert_eq!(first, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+                    assert_eq!(result.recv_timeout(Duration::from_secs(1)), Ok((false, true)));
+                } else {
+                    assert_eq!(first, Ok((true, false)));
+                }
             });
-            began.recv().unwrap();
-            let first = result.recv_timeout(Duration::from_millis(25));
-            head.make_with(|| None);
-            assert_eq!(first, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
-            assert_eq!(result.recv_timeout(Duration::from_secs(1)), Ok(true));
-        });
+        }
+    }
+
+    fn compute_shader(hash: &str) -> Arc<Shader> {
+        Arc::new(Shader {
+            stage: "compute",
+            hash: hash.to_owned(),
+            container: Vec::new(),
+            ambient: None,
+            probe: None,
+            translated: OnceLock::from(None),
+        })
+    }
+
+    fn head_map_pipeline(wait: bool) -> Pending {
+        Pending::new_with_policy(vec![compute_shader("61e54e90adccaf6a")], None, &[], wait)
     }
 
     #[test]
     fn skipped_hash_leaves_pipeline_unqueued_and_unmatched_queues_normally() {
-        let shader = |hash: &str| {
-            Arc::new(Shader {
-                stage: "compute",
-                hash: hash.to_owned(),
-                container: Vec::new(),
-                ambient: None,
-                probe: None,
-                translated: OnceLock::from(None),
-            })
-        };
         let skips = super::super::parse_skip_hashes("32ed072b9f845048");
 
-        let skipped = Arc::new(Pending::new_with_skip_hashes(
-            vec![shader("32ed072b9f845048")],
+        let skipped = Arc::new(Pending::new_with_policy(
+            vec![compute_shader("32ed072b9f845048")],
             None,
             &skips,
+            true,
         ));
         assert_eq!(skipped.left_out, Some("skipped by VICTORY_SKIP_PIPELINES"));
         early(&skipped);
@@ -829,11 +859,13 @@ mod tests {
             Some("skipped by VICTORY_SKIP_PIPELINES")
         );
 
-        let normal = Arc::new(Pending::new_with_skip_hashes(
-            vec![shader("0011223344556677")],
+        let normal = Arc::new(Pending::new_with_policy(
+            vec![compute_shader("0011223344556677")],
             None,
             &skips,
+            true,
         ));
+        assert!(!normal.head_map && !normal.wait_for_head_map);
         assert_eq!(normal.left_out, None);
         assert!(ready(&normal, false).is_none());
         assert_ne!(normal.queue_state.load(Ordering::Relaxed), NOT_QUEUED);

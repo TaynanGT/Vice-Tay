@@ -62,6 +62,8 @@ Checkpoint retries worked after the boat ran aground. The HUD, minimap, mission 
 
 Use [`Play-VIctory.cmd`](Play-VIctory.cmd) to pass the same options from Command Prompt. Double-click it to enter the executable's path at a prompt. The launcher defaults to full screen, the Series X profile and an automatic GPU preset. **F11** or **Alt+Enter** toggles full screen during play.
 
+For titles that use BCPack, set `VICTORY_BCPACK_TABLES` to the path of a local copy of the [format tables](docs/asset-policy.md#bcpack) you are authorised to use.
+
 If the title reaches the menu but stops at world load, verify your title files before changing graphics settings. Compare the full file hashes against a trusted manifest for the exact release you own, using the algorithm listed in that manifest. An archive with missing or zero-filled data can still have the expected size. Re-copy any mismatched files from your verified source and check the hashes again before launching.
 
 | Option | Use it to |
@@ -210,4 +212,4 @@ Vice-Tay grew out of codec-d's `cool_fox`, which brought NVIDIA work to avatarma
 
 ## License
 
-[GPL-3.0-or-later](LICENSE), inherited from VIctory. The [asset policy](docs/asset-policy.md#the-one-exception) records the separate BCPack format tables. Vice-Tay is independent of the title's developer and publisher.
+[GPL-3.0-or-later](LICENSE), inherited from VIctory. Vice-Tay is independent of the title's developer and publisher.

@@ -128,6 +128,104 @@ impl Made {
     }
 }
 
+/// Packed bitset of taken dynamic descriptor slots (16 KiB for 131,072 slots,
+/// fits in L1 cache and skips 64 occupied slots per cycle).
+struct DynamicBits {
+    words: Vec<u64>,
+    len: usize,
+}
+
+impl DynamicBits {
+    fn new(len: usize) -> Self {
+        Self { words: vec![0; len.div_ceil(64)], len }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn get(&self, index: usize) -> Option<bool> {
+        (index < self.len).then(|| (self.words[index / 64] >> (index % 64)) & 1 != 0)
+    }
+
+    /// Index of the first set bit in `[start, end)`, or `None` if all are 0.
+    fn first_taken(&self, start: usize, end: usize) -> Option<usize> {
+        let mut at = start;
+        while at < end {
+            let w = at / 64;
+            let b = at % 64;
+            let bits = (end - at).min(64 - b);
+            let mask = if bits == 64 { !0u64 } else { ((1u64 << bits) - 1) << b };
+            let hit = self.words[w] & mask;
+            if hit != 0 {
+                return Some(w * 64 + hit.trailing_zeros() as usize);
+            }
+            at += bits;
+        }
+        None
+    }
+
+    fn find_in(&self, start: usize, limit: usize, n: usize) -> Option<usize> {
+        let mut at = start;
+        while at + n <= limit {
+            let w = at / 64;
+            let b = at % 64;
+            let shifted = self.words[w] >> b;
+            let ones = shifted.trailing_ones() as usize;
+            if ones > 0 {
+                at += ones.min(64 - b);
+                continue;
+            }
+            match self.first_taken(at, at + n) {
+                None => return Some(at),
+                Some(hit) => at = hit + 1,
+            }
+        }
+        None
+    }
+
+    fn find_run(&self, cursor: usize, n: usize) -> Option<usize> {
+        if n == 0 || n > self.len {
+            return None;
+        }
+        if cursor + n <= self.len && self.first_taken(cursor, cursor + n).is_none() {
+            return Some(cursor);
+        }
+        if let Some(at) = self.find_in(cursor, self.len, n) {
+            return Some(at);
+        }
+        let second_end = cursor.saturating_add(n.saturating_sub(1)).min(self.len);
+        self.find_in(0, second_end, n)
+    }
+
+    fn set_taken(&mut self, first: usize, n: usize) {
+        let end = (first + n).min(self.len);
+        let mut at = first;
+        while at < end {
+            let w = at / 64;
+            let b = at % 64;
+            let bits = (end - at).min(64 - b);
+            let mask = if bits == 64 { !0u64 } else { ((1u64 << bits) - 1) << b };
+            self.words[w] |= mask;
+            at += bits;
+        }
+    }
+
+    fn clear_taken(&mut self, first: usize, n: usize) -> u32 {
+        let end = (first + n).min(self.len);
+        let mut at = first;
+        let mut freed = 0u32;
+        while at < end {
+            let w = at / 64;
+            let b = at % 64;
+            let bits = (end - at).min(64 - b);
+            let mask = if bits == 64 { !0u64 } else { ((1u64 << bits) - 1) << b };
+            let prev = self.words[w];
+            freed += (prev & mask).count_ones();
+            self.words[w] = prev & !mask;
+            at += bits;
+        }
+        freed
+    }
+}
+
 pub(crate) struct HostHeap {
     id: u64,
     pub(crate) buffer_sweep: Mutex<crate::draw::BufferSweep>,
@@ -175,9 +273,15 @@ pub(crate) struct HostHeap {
     /// waited for most (5.6 % of their time, profile waits-1: each descriptor
     /// made for a draw takes it, and lets go of what the slot held under it).
     kept: Box<[Mutex<Option<ID3D12Resource>>]>,
+    /// Per-slot packed state (`count + dynamic` entries): bit 7 (`SLOT_HAS_KEPT`)
+    /// mirrors whether `kept[i]` holds `Some(_)` so `keep(i, None)` skips taking
+    /// the slot's mutex when empty; bits 0..=6 (`SLOT_NULL_MASK`) cache the
+    /// exact null descriptor kind currently in slot `i` (`NULL_NONE` = non-null)
+    /// so redundant null writes skip both `Create*View` and `CopyDescriptorsSimple`.
+    slot_state: Box<[std::sync::atomic::AtomicU8]>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
+    next: Mutex<(u32, DynamicBits)>,
     /// How many dynamic slots are free (changed under `next`'s lock): with
     /// fewer than a table needs, the search is not made. Once the world
     /// had taken them all, every later table of the frame searched every
@@ -1581,7 +1685,7 @@ pub(crate) fn slot_story(slot: u32) -> String {
         let mut text = if index < host.count {
             format!("title slot {index}, made from {}", host.describe_slot(index).unwrap_or_default())
         } else {
-            let taken = host.next.lock().unwrap_or_else(|e| e.into_inner()).1.get((index - host.count) as usize).copied();
+            let taken = host.next.lock().unwrap_or_else(|e| e.into_inner()).1.get((index - host.count) as usize);
             format!("dynamic slot {} (taken {taken:?})", index - host.count)
         };
         if twin {
@@ -1890,7 +1994,8 @@ impl HostHeap {
             waiting: Mutex::default(),
             away: Mutex::default(),
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            slot_state: (0..count + extra).map(|_| std::sync::atomic::AtomicU8::new(NULL_NONE)).collect(),
+            next: Mutex::new((0, DynamicBits::new(extra as usize))),
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
@@ -1969,6 +2074,11 @@ impl HostHeap {
                 }
             }
         }
+        let initial_null = if self.sampler { NULL_SAMPLER } else { NULL_SRV_2D };
+        let limit = (total as usize).min(self.slot_state.len());
+        for s in &self.slot_state[..limit] {
+            s.store(initial_null, std::sync::atomic::Ordering::Relaxed);
+        }
         Ok(())
     }
 
@@ -2012,27 +2122,9 @@ impl HostHeap {
         let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
             && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
         let n = n as usize;
-        // Search from `next` on, then from the start (extending past cursor by
-        // n - 1 so contiguous runs crossing the cursor are not missed).
         let cursor = *next as usize;
         let end = self.dynamic as usize;
-        let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
-        let starts = (cursor..end).chain(0..second_end);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts.take(if enough { usize::MAX } else { 0 }) {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
+        let found = if enough { taken.find_run(cursor, n) } else { None };
         let Some(first) = found else {
             if enough {
                 self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
@@ -2056,7 +2148,7 @@ impl HostHeap {
             add(C::DynamicNs, started.elapsed().as_nanos() as u64);
             add(C::DynamicSlots, n as u64);
         }
-        taken[first..first + n].fill(true);
+        taken.set_taken(first, n);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % end) as u32;
         Some(self.count + first as u32)
@@ -2877,10 +2969,9 @@ impl HostHeap {
             return;
         }
         match view_at(key as u32, (key >> 32) as u32) {
-            Some(view) => null_for(&view, self.at(index)),
-            None => null_view(self.at(index)),
+            Some(view) => self.put_null_for(index, &view),
+            None => self.put_null_view(index),
         }
-        self.put(index);
         self.clear_twin(index);
         self.write_view_metadata(index, 0, 0);
         self.keep(index, None);
@@ -3131,20 +3222,30 @@ impl HostHeap {
     /// when they came from this heap.
     ///
     /// [`dynamic`]: HostHeap::dynamic
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn release(&self, id: u64, first: u32, n: u32) {
-        if id != self.id {
+        self.release_many(id, &[(first, n)]);
+    }
+
+    /// Gives back a batch of `(first, n)` dynamic slot ranges under one lock
+    /// when they came from this heap.
+    pub(crate) fn release_many(&self, id: u64, ranges: &[(u32, u32)]) {
+        if id != self.id || ranges.is_empty() {
             return;
         }
-        let Some(at) = first.checked_sub(self.count) else {
-            return;
-        };
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            let given = slots.iter().filter(|taken| **taken).count() as u32;
+        let mut given = 0u32;
+        for &(first, n) in ranges {
+            let Some(at) = first.checked_sub(self.count) else {
+                continue;
+            };
+            if (at as usize) < guard.1.len {
+                given += guard.1.clear_taken(at as usize, n as usize);
+            }
+        }
+        if given != 0 {
             self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
             self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
-            slots.fill(false);
         }
     }
 
@@ -3153,9 +3254,10 @@ impl HostHeap {
     pub(crate) fn make_at(&self, index: u32, view: &View) {
         let kept = make_twinned(view, self.at(index), self.twin(index));
         if kept.is_none() {
-            null_for(view, self.at(index));
+            self.put_null_for(index, view);
+        } else {
+            self.put(index);
         }
-        self.put(index);
         self.twin_made(index, kept.is_some() && twinned(view));
         let (stride, address) = if kept.is_some() {
             (view_stride_word(view), view_address(view).unwrap_or(0))
@@ -3222,6 +3324,7 @@ impl HostHeap {
     /// As [`HostHeap::copy_to`], from the slot `from`, which the card does not
     /// see.
     fn copy_from(&self, to: u32, from: D3D12_CPU_DESCRIPTOR_HANDLE) {
+        self.clear_slot_null_kind(to);
         #[cfg(feature = "diagnostics")]
         if let Some(written) = self.written.get(to as usize) {
             written.store(crate::host::coarse_ms() as u32, std::sync::atomic::Ordering::Relaxed);
@@ -3231,13 +3334,83 @@ impl HostHeap {
         unsafe { host.device.CopyDescriptorsSimple(1, self.cpu(to), from, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
     }
 
+    fn slot_null_kind(&self, index: u32) -> u8 {
+        self.slot_state
+            .get(index as usize)
+            .map_or(NULL_NONE, |s| s.load(std::sync::atomic::Ordering::Relaxed) & SLOT_NULL_MASK)
+    }
+
+    fn set_slot_null_kind(&self, index: u32, kind: u8) {
+        if let Some(s) = self.slot_state.get(index as usize) {
+            let kind = kind & SLOT_NULL_MASK;
+            let _ = s.fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |old| {
+                    let next = (old & SLOT_HAS_KEPT) | kind;
+                    (next != old).then_some(next)
+                },
+            );
+        }
+    }
+
+    fn clear_slot_null_kind(&self, index: u32) {
+        if let Some(s) = self.slot_state.get(index as usize)
+            && (s.load(std::sync::atomic::Ordering::Relaxed) & SLOT_NULL_MASK) != NULL_NONE
+        {
+            s.fetch_and(SLOT_HAS_KEPT, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn copy_null_template(&self, to: u32, kind: u8) -> bool {
+        let (Some(src), Some(host)) = (null_template(kind), host()) else {
+            return false;
+        };
+        #[cfg(feature = "diagnostics")]
+        if let Some(written) = self.written.get(to as usize) {
+            written.store(crate::host::coarse_ms() as u32, std::sync::atomic::Ordering::Relaxed);
+        }
+        // SAFETY: `src` is a pre-created CPU-only null descriptor in `null_template`,
+        // and `self.cpu(to)` is a valid slot in this CBV/SRV/UAV heap.
+        unsafe {
+            host.device
+                .CopyDescriptorsSimple(1, self.cpu(to), src, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        }
+        true
+    }
+
+    fn put_null_view(&self, index: u32) {
+        if self.slot_null_kind(index) == NULL_SRV_2D {
+            return;
+        }
+        if !self.copy_null_template(index, NULL_SRV_2D) {
+            null_view(self.at(index));
+            self.put(index);
+        }
+        self.set_slot_null_kind(index, NULL_SRV_2D);
+    }
+
+    fn put_null_for(&self, index: u32, view: &View) {
+        let kind = null_kind_for(view);
+        if self.slot_null_kind(index) == kind {
+            return;
+        }
+        if !self.copy_null_template(index, kind) {
+            null_for(view, self.at(index));
+            self.put(index);
+        }
+        self.set_slot_null_kind(index, kind);
+    }
+
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
     pub(crate) fn make_null(&self, index: u32) {
         if self.sampler {
-            self.null_sampler(index);
+            if self.slot_null_kind(index) != NULL_SAMPLER {
+                self.null_sampler(index);
+                self.set_slot_null_kind(index, NULL_SAMPLER);
+            }
         } else {
-            null_view(self.at(index));
-            self.put(index);
+            self.put_null_view(index);
             self.write_view_metadata(index, 0, 0);
         }
         self.clear_twin(index);
@@ -3265,6 +3438,7 @@ impl HostHeap {
     fn clear_twin(&self, index: u32) {
         if let Some(made) = self.twins.get(index as usize)
             && made.swap(false, std::sync::atomic::Ordering::Relaxed)
+            && !self.copy_null_template(self.raw + index, NULL_SRV_BUFFER)
         {
             null_buffer_view(self.at(self.raw + index));
             self.put(self.raw + index);
@@ -3273,15 +3447,31 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+        if resource.is_none()
+            && self
+                .slot_state
+                .get(index as usize)
+                .is_some_and(|s| (s.load(std::sync::atomic::Ordering::Relaxed) & SLOT_HAS_KEPT) == 0)
+        {
+            return;
+        }
         let Some(slot) = self.kept.get(index as usize) else {
             return;
         };
+        let has_next = resource.is_some();
         let old = {
             use windows::core::Interface;
             let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
             // The same again: nothing to retire.
             if slot.as_ref().map(Interface::as_raw) == resource.as_ref().map(Interface::as_raw) {
                 return;
+            }
+            if let Some(state) = self.slot_state.get(index as usize) {
+                if has_next {
+                    state.fetch_or(SLOT_HAS_KEPT, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    state.fetch_and(!SLOT_HAS_KEPT, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             std::mem::replace(&mut *slot, resource)
         };
@@ -3537,6 +3727,9 @@ impl HostHeap {
     }
 
     fn copy_to(&self, to: u32, which: u32) {
+        if which == 0 {
+            self.clear_slot_null_kind(to);
+        }
         #[cfg(feature = "diagnostics")]
         if let Some(written) = self.written.get(to as usize) {
             written.store(crate::host::coarse_ms() as u32, std::sync::atomic::Ordering::Relaxed);
@@ -3782,10 +3975,11 @@ impl HostHeap {
             // A null descriptor during an allocation cooldown is still due.
             let ready_key = if later || (deferred && kept.is_none()) { 0 } else { key };
             self.made.set(index, ready_key);
-            if kept.is_none() && !self.sampler {
-                null_for(&view, self.at(index));
-            }
-            if kept.is_some() || !self.sampler {
+            if kept.is_none() {
+                if !self.sampler {
+                    self.put_null_for(index, &view);
+                }
+            } else {
                 self.put(index);
             }
             self.twin_made(index, kept.is_some() && twinned(&view));
@@ -5295,6 +5489,145 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
     Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
 }
 
+const SLOT_HAS_KEPT: u8 = 0x80;
+const SLOT_NULL_MASK: u8 = 0x7F;
+const NULL_NONE: u8 = 0;
+const NULL_SRV_2D: u8 = 1;
+const NULL_SRV_BUFFER: u8 = 2;
+const NULL_CBV: u8 = 3;
+const NULL_UAV_BUFFER: u8 = 4;
+const NULL_UAV_2D: u8 = 5;
+const NULL_UAV_1D: u8 = 6;
+const NULL_UAV_1D_ARRAY: u8 = 7;
+const NULL_UAV_2D_ARRAY: u8 = 8;
+const NULL_UAV_3D: u8 = 9;
+// 10..=18: SRV null_like for texture dimensions 2..=10 (words[1] == 4 maps to NULL_SRV_2D).
+const NULL_SAMPLER: u8 = 19;
+
+/// Pre-created CPU-only null CBV/SRV/UAV descriptors (kinds `1..=18`) so
+/// clearing a slot copies a ready-made template instead of calling
+/// `Create*View` + `CopyDescriptorsSimple` on every null write.
+fn null_template(kind: u8) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+    if kind == 0 || kind >= NULL_SAMPLER {
+        return None;
+    }
+    struct Templates {
+        _heap: ID3D12DescriptorHeap,
+        base: usize,
+        stride: usize,
+    }
+    static TEMPLATES: std::sync::OnceLock<Option<Templates>> = std::sync::OnceLock::new();
+    let templates = TEMPLATES
+        .get_or_init(|| {
+            let host = host()?;
+            let desc = D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: u32::from(NULL_SAMPLER),
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                NodeMask: 0,
+            };
+            // SAFETY: plain CPU-only descriptor heap creation.
+            let heap: ID3D12DescriptorHeap = unsafe { host.device.CreateDescriptorHeap(&desc).ok()? };
+            // SAFETY: live CPU-only descriptor heap and device.
+            let base = unsafe { heap.GetCPUDescriptorHandleForHeapStart().ptr };
+            // SAFETY: valid device handle.
+            let stride = unsafe { host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize };
+            let at = |k: u8| D3D12_CPU_DESCRIPTOR_HANDLE {
+                ptr: base + usize::from(k) * stride,
+            };
+
+            null_view(at(NULL_SRV_2D));
+            null_buffer_view(at(NULL_SRV_BUFFER));
+            let cbv = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
+            // SAFETY: valid CPU-only heap slot.
+            unsafe { host.device.CreateConstantBufferView(Some(&cbv), at(NULL_CBV)) };
+            let uav_buf = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_UINT,
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                ..Default::default()
+            };
+            // SAFETY: valid CPU-only heap slot.
+            unsafe {
+                host.device.CreateUnorderedAccessView(
+                    None::<&ID3D12Resource>,
+                    None::<&ID3D12Resource>,
+                    Some(&uav_buf),
+                    at(NULL_UAV_BUFFER),
+                );
+            }
+            for (k, dim) in [
+                (NULL_UAV_2D, None),
+                (NULL_UAV_1D, Some(D3D12_UAV_DIMENSION_TEXTURE1D.0 as u32)),
+                (NULL_UAV_1D_ARRAY, Some(D3D12_UAV_DIMENSION_TEXTURE1DARRAY.0 as u32)),
+                (NULL_UAV_2D_ARRAY, Some(D3D12_UAV_DIMENSION_TEXTURE2DARRAY.0 as u32)),
+                (NULL_UAV_3D, Some(D3D12_UAV_DIMENSION_TEXTURE3D.0 as u32)),
+            ] {
+                let uav = null_uav_desc(dim);
+                // SAFETY: valid CPU-only heap slot.
+                unsafe {
+                    host.device.CreateUnorderedAccessView(
+                        None::<&ID3D12Resource>,
+                        None::<&ID3D12Resource>,
+                        Some(&uav),
+                        at(k),
+                    );
+                }
+            }
+            for d in 2u32..=10 {
+                let mut words = [0u32; 10];
+                words[1] = d;
+                null_like(&words, at(10 + (d - 2) as u8));
+            }
+            Some(Templates { _heap: heap, base, stride })
+        })
+        .as_ref()?;
+    Some(D3D12_CPU_DESCRIPTOR_HANDLE {
+        ptr: templates.base + usize::from(kind) * templates.stride,
+    })
+}
+
+fn null_like_kind(words: &[u32; 10]) -> u8 {
+    match words[1] {
+        4 => NULL_SRV_2D,
+        d @ 2..=10 => 10 + (d - 2) as u8,
+        _ => NULL_SRV_2D,
+    }
+}
+
+/// Identifies the exact null descriptor [`null_for`] writes for `view` so
+/// redundant null writes into a slot already holding that null kind can be
+/// skipped.
+fn null_kind_for(view: &View) -> u8 {
+    let is_buffer = |r: &usize| crate::resource::buffer_bytes(*r as crate::object::This).is_some();
+    let (buffer, dimension) = match view {
+        View::Unordered(r, _, desc) => (
+            desc.is_some_and(|d| d[1] == 1) || is_buffer(r),
+            desc.map(|d| d[1]),
+        ),
+        View::Placed(true, resource, desc) => (resource[0] == 1, Some(desc[1])),
+        View::Shader(r, desc) if desc.is_some_and(|d| d[1] == 1) || is_buffer(r) => {
+            return NULL_SRV_BUFFER;
+        }
+        View::Placed(false, resource, _) if resource[0] == 1 => return NULL_SRV_BUFFER,
+        View::Shader(_, Some(desc)) => return null_like_kind(desc),
+        View::Placed(false, _, desc) => {
+            return null_like_kind(desc[..10].try_into().unwrap_or(&[0; 10]));
+        }
+        View::Constant(..) => return NULL_CBV,
+        _ => return NULL_SRV_2D,
+    };
+    if buffer {
+        return NULL_UAV_BUFFER;
+    }
+    match dimension.map(|d| D3D12_UAV_DIMENSION(d as i32)) {
+        Some(D3D12_UAV_DIMENSION_TEXTURE1D) => NULL_UAV_1D,
+        Some(D3D12_UAV_DIMENSION_TEXTURE1DARRAY) => NULL_UAV_1D_ARRAY,
+        Some(D3D12_UAV_DIMENSION_TEXTURE2DARRAY) => NULL_UAV_2D_ARRAY,
+        Some(D3D12_UAV_DIMENSION_TEXTURE3D) => NULL_UAV_3D,
+        _ => NULL_UAV_2D,
+    }
+}
+
 /// A null view of the kind `view` is, for a slot whose view the host
 /// cannot make: unordered access (to a buffer or a 2D texture) or a shader
 /// view. Writes to it are dropped, reads give zeros.
@@ -5478,6 +5811,22 @@ mod tests {
         assert_eq!(new.free.load(Ordering::Relaxed), free);
         new.release(new.id(), first, 2);
         assert_eq!(new.free.load(Ordering::Relaxed), free + 2);
+    }
+
+    #[test]
+    fn dynamic_bits_finds_multiword_runs_wraps_and_counts_clears() {
+        let mut bits = DynamicBits::new(130);
+        bits.set_taken(0, 64);
+        bits.set_taken(65, 5);
+        assert_eq!(bits.find_run(0, 4), Some(70));
+        assert_eq!(bits.find_run(64, 1), Some(64));
+        assert_eq!(bits.find_run(64, 2), Some(70));
+        // Wrap around past cursor to slot 64 when tail is full.
+        bits.set_taken(70, 60);
+        assert_eq!(bits.find_run(70, 1), Some(64));
+        // Clearing already-free and taken bits reports only actually freed count.
+        assert_eq!(bits.clear_taken(63, 4), 3);
+        assert_eq!(bits.find_run(0, 4), Some(63));
     }
 
     /// Every host sampler heap backs all 2,048 hardware descriptors and

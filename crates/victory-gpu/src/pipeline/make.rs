@@ -222,6 +222,59 @@ pub(crate) fn hashes(p: &Pending) -> String {
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
+fn wait_for_made<T>(made: &OnceLock<T>, started: Instant, allowance: Duration) -> Option<&T> {
+    if let Some(result) = made.get() {
+        return Some(result);
+    }
+    if started.elapsed() >= allowance {
+        return made.get();
+    }
+    let (lock, done) = &DONE;
+    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while made.get().is_none() {
+        let left = allowance.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            break;
+        }
+        held = done.wait_timeout(held, left).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    made.get()
+}
+
+/// Waiting for the prequeued head map is normally a matter of milliseconds.
+/// Keep one deadline for the shader so new frames or copies of the PSO
+/// cannot prolong a stalled driver call on the title's recording threads.
+struct HeadMapWait {
+    started: OnceLock<Instant>,
+    allowance: Duration,
+    reported_timeout: AtomicBool,
+}
+
+impl HeadMapWait {
+    const fn new(allowance: Duration) -> Self {
+        Self { started: OnceLock::new(), allowance, reported_timeout: AtomicBool::new(false) }
+    }
+
+    fn wait<'a>(&self, pipeline: &'a Pending) -> Option<&'a Option<HostPipeline>> {
+        if let Some(made) = pipeline.made.get() {
+            return Some(made);
+        }
+        let started = *self.started.get_or_init(Instant::now);
+        let made = wait_for_made(&pipeline.made, started, self.allowance);
+        if made.is_none() && !self.reported_timeout.load(Ordering::Relaxed)
+            && !self.reported_timeout.swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                key = pipeline.key,
+                frame = crate::frame::current(),
+                budget_ms = self.allowance.as_millis() as u64,
+                "head blend-shape map pipeline still pending at its dispatch deadline"
+            );
+        }
+        made
+    }
+}
+
 /// Waiting allowed per title frame, over all threads.
 fn wait_budget() -> Duration {
     static BUDGET: OnceLock<Duration> = OnceLock::new();
@@ -259,12 +312,18 @@ pub(crate) fn waiting() -> u64 {
 }
 
 /// Queue the host pipeline on first use and wait within the frame budget.
-/// The head-map dispatch waits for completion because its work runs once.
+/// The one-shot head map has its own budget below the title's watchdog.
 pub(crate) fn ready(p: &Arc<Pending>, dispatch: bool) -> Option<&HostPipeline> {
-    ready_with(p, dispatch, |p| wait(p, crate::frame::current()))
+    static HEAD_MAP_WAIT: HeadMapWait = HeadMapWait::new(Duration::from_secs(2));
+    ready_with(p, dispatch, &HEAD_MAP_WAIT, |p| wait(p, crate::frame::current()))
 }
 
-fn ready_with(p: &Arc<Pending>, dispatch: bool, wait_for_frame: impl FnOnce(&Pending)) -> Option<&HostPipeline> {
+fn ready_with<'a>(
+    p: &'a Arc<Pending>,
+    dispatch: bool,
+    head_wait: &HeadMapWait,
+    wait_for_frame: impl FnOnce(&Pending),
+) -> Option<&'a HostPipeline> {
     if p.left_out.is_some() {
         return None;
     }
@@ -286,7 +345,7 @@ fn ready_with(p: &Arc<Pending>, dispatch: bool, wait_for_frame: impl FnOnce(&Pen
         made = if dispatch && p.wait_for_head_map {
             // start has released the queue lock. The worker publishes both
             // failure and success through made and wakes all callers.
-            Some(p.made.wait())
+            head_wait.wait(p)
         } else {
             wait_for_frame(p);
             p.made.get()
@@ -371,16 +430,7 @@ fn wait(p: &Pending, frame: u64) {
     }
     let waiting = crate::timeline::span("pipeline: first use waits for a host pipeline");
     let started = Instant::now();
-    let (lock, done) = &DONE;
-    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
-    while p.made.get().is_none() {
-        let rest = left.saturating_sub(started.elapsed());
-        if rest.is_zero() {
-            break;
-        }
-        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
-    }
-    drop(held);
+    let _ = wait_for_made(&p.made, started, left);
     let waited = started.elapsed().min(left);
     waiting.end();
     if screen && waited > Duration::from_millis(500) {
@@ -515,7 +565,13 @@ fn start(p: &Arc<Pending>, priority: u8) {
     }
     if !workers() {
         if p.queue_state.swap(MAKING, Ordering::Relaxed) == NOT_QUEUED {
-            p.make();
+            if p.wait_for_head_map {
+                // No worker could be started. Publish the failure instead of
+                // moving this unbounded driver call onto the title's thread.
+                p.make_with(|| None);
+            } else {
+                p.make();
+            }
         }
         return;
     }
@@ -797,15 +853,17 @@ mod tests {
             let head = Arc::new(head_map_pipeline(wait));
             head.queue_state.store(MAKING, Ordering::Relaxed);
             head.used.store(true, Ordering::Relaxed);
+            let head_wait = HeadMapWait::new(Duration::from_secs(2));
 
             std::thread::scope(|scope| {
                 let (entered, began) = std::sync::mpsc::channel();
                 let (finished, result) = std::sync::mpsc::channel();
                 let pending = &head;
+                let head_wait = &head_wait;
                 scope.spawn(move || {
                     entered.send(()).unwrap();
                     let mut used_budget = false;
-                    let ready = ready_with(pending, true, |_| used_budget = true);
+                    let ready = ready_with(pending, true, head_wait, |_| used_budget = true);
                     assert!(ready.is_none());
                     finished.send((used_budget, pending.made.get().is_some())).unwrap();
                 });
@@ -821,6 +879,42 @@ mod tests {
                 }
             });
         }
+    }
+
+    #[test]
+    fn head_map_timeout_is_shared_and_leaves_the_worker_result_pending() {
+        let budget = HeadMapWait::new(Duration::from_millis(25));
+        let pending = head_map_pipeline(true);
+        std::thread::scope(|scope| {
+            let (finished, result) = std::sync::mpsc::channel();
+            let budget = &budget;
+            let pending = &pending;
+            scope.spawn(move || finished.send(budget.wait(pending).is_none()).unwrap());
+            let expired = result.recv_timeout(Duration::from_secs(2));
+            if expired.is_err() {
+                pending.make_with(|| None);
+            }
+            assert_eq!(expired, Ok(true));
+        });
+        assert!(budget.reported_timeout.load(Ordering::Relaxed));
+        assert!(pending.made.get().is_none());
+        let started = budget.started.get().copied();
+
+        let other = head_map_pipeline(true);
+        assert!(budget.wait(&other).is_none());
+        assert_eq!(budget.started.get().copied(), started);
+
+        pending.make_with(|| None);
+        assert!(matches!(budget.wait(&pending), Some(None)));
+    }
+
+    #[test]
+    fn a_pipeline_result_remains_visible_after_the_wait_deadline() {
+        let made = OnceLock::new();
+        let started = Instant::now();
+        assert_eq!(wait_for_made(&made, started, Duration::ZERO), None);
+        made.set(Some(7)).unwrap();
+        assert_eq!(wait_for_made(&made, started, Duration::ZERO), Some(&Some(7)));
     }
 
     fn compute_shader(hash: &str) -> Arc<Shader> {

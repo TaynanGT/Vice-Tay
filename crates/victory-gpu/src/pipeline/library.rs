@@ -533,11 +533,11 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
 }
 
 /// Formats the trail entry when a pipeline was created after a library load
-/// did not return it. On an empty or cold `ID3D12PipelineLibrary`, cache misses
-/// normally return `E_INVALIDARG` (`0x80070057`), which is not a failure.
+/// did not return it. The library returns `E_INVALIDARG` if the name is absent
+/// or the stored description differs from the requested one.
 fn format_made_trail(label: &str, elapsed_ms: f64, refused: &windows::core::Error) -> String {
     if refused.code() == windows::Win32::Foundation::E_INVALIDARG {
-        format!("pipeline library: made {label} in {elapsed_ms:.1} ms (not in library)")
+        format!("pipeline library: made {label} in {elapsed_ms:.1} ms (no matching library entry)")
     } else {
         format!("pipeline library: made {label} in {elapsed_ms:.1} ms (the library did not load it: {refused})")
     }
@@ -1069,8 +1069,9 @@ mod tests {
     fn empty_library_compute_miss_returns_invalidarg_and_formats_cleanly() {
         use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG};
 
+        let no_match = "pipeline library: made cs_probe in 1.5 ms (no matching library entry)";
         let expected_miss = format_made_trail("cs_probe", 1.5, &windows::core::Error::from(E_INVALIDARG));
-        assert_eq!(expected_miss, "pipeline library: made cs_probe in 1.5 ms (not in library)");
+        assert_eq!(expected_miss, no_match);
         assert!(!expected_miss.contains("0x80070057"));
         assert!(!expected_miss.contains("The parameter is incorrect"));
 
@@ -1115,7 +1116,7 @@ mod tests {
         assert_eq!(miss.code(), E_INVALIDARG);
 
         let miss_trail = format_made_trail("cs_probe", 1.5, &miss);
-        assert_eq!(miss_trail, "pipeline library: made cs_probe in 1.5 ms (not in library)");
+        assert_eq!(miss_trail, no_match);
         assert!(!miss_trail.contains("0x80070057"));
         assert!(!miss_trail.contains("The parameter is incorrect"));
 

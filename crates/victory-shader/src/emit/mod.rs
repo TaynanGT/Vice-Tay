@@ -579,6 +579,7 @@ fn wave_pairs_listed(input: &[u8]) -> bool {
 /// - the atmospheric diffusion and its depth scan, `CS_GatherDiffusion`, `CS_ScanMip0..3`, with
 ///   `CS_DeferredFallbacksAlpha_SkyProbe` and `CS_TemporalResolve2_Opaque_FrameStatistics`: a
 ///   halo around dark silhouettes against the sky.
+///
 /// Together they cost about 0.1 ms of card time a frame (a timing run on an RTX 4090).
 const DEFAULT_WAVE_PAIRS_HASHES: [&str; 28] = [
     // shadow mask

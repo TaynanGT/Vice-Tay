@@ -549,7 +549,7 @@ fn fp32_expected(op: u32, ident: u32, values: [u32; 4], active: u32, lds: bool) 
     let old = lanes;
     lanes = std::array::from_fn(|i| fp32_reference(op, old[i ^ 15], old[i]));
     let old = lanes;
-    lanes = std::array::from_fn(|i| fp32_reference(op, old[(i / 16 ^ 1) * 16], old[i]));
+    lanes = std::array::from_fn(|i| fp32_reference(op, old[((i / 16) ^ 1) * 16], old[i]));
     let result = fp32_reference(op, lanes[32], lanes[0]);
     (0..64)
         .flat_map(|lane| [result, lane, lane, lane])
@@ -912,7 +912,7 @@ fn execute_wave32_dispatch(
     let was = lower::TEST_HOST_WAVE.replace(Some(lanes));
     let result = crate::emit::emit(&c, native, &p, &st, &io, &res);
     let key = crate::emit::translation_fingerprint();
-    // (VICTORY_WAVE_PAIRS_FP32 is in victory-gpu's shader cache key on this line, not in
+    // (VICTORY_WAVE_PAIRS_FP32 is in victory-gpu's shader cache key in this tree, not in
     // the shader crate's fingerprint)
     lower::TEST_HOST_WAVE.set(was);
     let global_pairs = std::env::var_os("VICTORY_WAVE_PAIRS").is_some_and(|v| v == "1");
@@ -956,14 +956,11 @@ fn execute_wave32_dispatch(
     for (i, &(s0, s1)) in cases.iter().enumerate() {
         let mut ud = vec![0; shader.user_data_dwords().max(1) as usize];
         for u in &shader.user_data {
-            match (u.root, u.slot, u.dword) {
-                (RootType::Constants, 0, d @ 0..=3) => {
-                    ud[u.index as usize] = [s0, s1, 0, 0][d as usize];
-                }
-                _ => {}
+            if let (RootType::Constants, 0, d @ 0..=3) = (u.root, u.slot, u.dword) {
+                ud[u.index as usize] = [s0, s1, 0, 0][d as usize];
             }
         }
-        // (no dispatch spread across z on this line: `asked` is the group count)
+        // (this tree has no dispatch spread across z: `asked` is the group count)
         let _ = asked;
         let words = threads * 4 * groups.iter().product::<u32>();
         let dispatch = Dispatch {

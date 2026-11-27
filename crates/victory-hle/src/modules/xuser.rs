@@ -56,7 +56,22 @@ pub const USER_NOT_FOUND: HRESULT = 0x8924_5104_u32 as i32;
 
 pub const XUID: u64 = 0x0009_0000_0000_0001;
 pub const LOCAL_ID: u64 = 1;
-const GAMERTAG: &str = "Player";
+static GAMERTAG: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let custom = std::env::var("VICTORY_USERNAME").unwrap_or_default();
+    if valid_gamertag(&custom) {
+        custom
+    } else {
+        "Player".into()
+    }
+});
+
+fn valid_gamertag(name: &str) -> bool {
+    // All three name components return a classic tag without a suffix.
+    // Classic callers may allocate just 16 bytes including the terminator.
+    !name.trim().is_empty()
+        && name.len() <= 15
+        && name.bytes().all(|byte| byte == b' ' || byte.is_ascii_graphic())
+}
 
 /// The only user; a handle is its address, duplicating and closing are free.
 pub struct User;
@@ -168,7 +183,7 @@ extern "system" fn get_gamertag(
     const MODERN_SUFFIX: u32 = 2;
     let text = match component {
         MODERN_SUFFIX => "",
-        _ => GAMERTAG,
+        _ => GAMERTAG.as_str(),
     };
     put_string(text, size, buffer, used)
 }
@@ -330,20 +345,30 @@ mod tests {
     use crate::modules::xgameruntime::method as slot;
 
     #[test]
+    fn a_custom_classic_gamertag_fits_both_user_interfaces() {
+        assert!(valid_gamertag("Dock Runner 123"));
+        for invalid in ["", "   ", "Dock Runner 1234", "Café", "Line\nbreak"] {
+            assert!(!valid_gamertag(invalid));
+        }
+    }
+
+    #[test]
     fn a_gamertag_without_a_suffix_has_an_empty_modern_suffix() {
         type Gamertag =
             extern "system" fn(This, Handle, u32, usize, *mut u8, *mut usize) -> HRESULT;
         let this: This = &OBJECT;
         let user = std::ptr::null();
         // Classic, modern, modern suffix, unique modern; through both slots.
-        let expected: [&[u8]; 4] = [b"Player\0", b"Player\0", b"\0", b"Player\0"];
+        let expected = [GAMERTAG.as_str(), GAMERTAG.as_str(), "", GAMERTAG.as_str()];
         for (object, at) in [(&GAMERTAG_OBJECT, 0x18), (&OBJECT, 0x78)] {
             let get = slot::<Gamertag>(object, at);
             for (component, expected) in (0..).zip(expected) {
                 let (mut name, mut used) = ([0xff_u8; 16], 0);
                 let hr = get(this, user, component, 16, name.as_mut_ptr(), &mut used);
                 assert_eq!(hr, S_OK);
-                assert_eq!(&name[..used], expected, "component {component}");
+                assert_eq!(used, expected.len() + 1, "component {component}");
+                assert_eq!(&name[..used - 1], expected.as_bytes());
+                assert_eq!(name[used - 1], 0);
             }
         }
     }
@@ -378,7 +403,8 @@ mod tests {
         let mut used = 0;
         let get = slot::<Gamertag>(&GAMERTAG_OBJECT, 0x18);
         assert_eq!(get(this, handle, 0, 16, name.as_mut_ptr(), &mut used), S_OK);
-        assert_eq!(&name[..used], b"Player\0");
+        assert_eq!(&name[..used - 1], GAMERTAG.as_bytes());
+        assert_eq!(name[used - 1], 0);
         assert_eq!(
             get(this, handle, 0, 2, name.as_mut_ptr(), &mut used),
             E_NOT_SUFFICIENT_BUFFER

@@ -9,7 +9,10 @@ $start.Arguments = 'run "' + $Exe + '" --console ' + $Console + ' --execute'
 $start.WorkingDirectory = (Get-Location).Path
 $start.UseShellExecute = $false
 $start.EnvironmentVariables['VICTORY_LOG_FILE'] = $log
-$start.EnvironmentVariables['VICTORY_LOG'] = 'warn,victory_gpu::host=info,victory_hle::modules::fidelityfx=info,victory_gpu::draw::rtv_trace=info'
+$start.EnvironmentVariables['VICTORY_LOG'] = 'warn,victory_gpu::host=info,victory_hle::modules::fidelityfx=info'
+if ($env:VICTORY_LOG) {
+    $start.EnvironmentVariables['VICTORY_LOG'] += ",$env:VICTORY_LOG"
+}
 # The input clock starts when the title begins polling GameInput.
 $start.EnvironmentVariables['VICTORY_KEYS'] = '3-3.4:Enter,8-8.4:Enter'
 $keys = Join-Path $run.FullName 'input'
@@ -35,7 +38,7 @@ try {
                 $capture.UseShellExecute = $false
                 $capture.RedirectStandardInput = $true
                 $handle = $game.MainWindowHandle.ToInt64()
-                $capture.Arguments = "-hide_banner -loglevel error -f lavfi -i gfxcapture=hwnd=${handle}:capture_cursor=0:max_framerate=8,hwdownload,format=bgra -vf scale=960:-2 -c:v libx264 -preset ultrafast -pix_fmt yuv420p -fps_mode vfr window.mkv"
+                $capture.Arguments = "-hide_banner -loglevel error -f lavfi -i gfxcapture=hwnd=${handle}:capture_cursor=0:max_framerate=8,hwdownload,format=bgra -vf scale=960:-2 -c:v libx264 -preset ultrafast -pix_fmt yuv420p -fps_mode vfr -flush_packets 1 -cluster_time_limit 1000 window.mkv"
                 $recorder = [Diagnostics.Process]::Start($capture)
                 Write-Host "Window recording $($run.FullName)\window.mkv"
             }

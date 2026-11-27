@@ -72,6 +72,7 @@ If the title reaches the menu but stops at world load, verify your title files b
 | `-Machine 4090` / `-Machine 4070` / `-Machine 7900xtx` | Select a GPU preset explicitly. See the [RTX 4070 test notes](docs/rtx4070-performance.md). |
 | `-Machine 4070tisuper` | The RTX 4070 Ti SUPER (16 GB) preset, asked for explicitly. With Resizable BAR on, it moves up to 4 GB of shader-read windows from RAM into the card's memory. Also [measured on an RTX 5080 with eight cores](docs/rtx5080-16gb.md), where it ran one scene at 27 fps against 16 with the RTX 4090 settings. |
 | `-Machine 4080` | Select the RTX 4080 / 4080 SUPER preset. The launcher also detects these cards automatically. |
+| `-Username 'Player Name'` | Set the local player name for this launch. Use 1 to 15 printable ASCII characters. The local user ID stays the same. |
 | `-TestSeconds 30` | Send controller A at startup, wait for two consecutive reports with at least 1,000 draws per frame, then measure for 30 seconds and close the launched process. The log path and median sampled FPS appear in the terminal. A high-draw cinematic can start the timer. |
 | `-TestFfmpeg <path>` | Record the timed run from the first available game window through the last sample. Requires an FFmpeg build with the Windows `gfxcapture` filter. The video is written beside the benchmark log. |
 | `-Machine laptop` | Try the [16 GB NVIDIA laptop preset](docs/laptop-16gb.md), measured on one RTX 3050 laptop. |

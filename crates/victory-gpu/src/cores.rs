@@ -275,6 +275,53 @@ fn ask(what: &str, from: u32) {
     tracing::info!(what, fast = fast.len(), of, "the thread is kept on the fast cores (VICTORY_FAST_CORES=0: not)");
 }
 
+/// Whether the threads the submitting thread waits for run at its priority
+/// (`VICTORY_HELPER_PRIORITY`, on unless `0`; `VICTORY_AB` can flip it while
+/// the title runs): above normal, ahead of the title's threads and of the
+/// threads that translate lists. They are the threads that spread its work
+/// (`shadow::wide`, the pools of `land`), the one that makes the heaps'
+/// records and the one that passes over the heap's views beside the lists.
+///
+/// The submitting thread is above normal (`queue::behind`); its helpers were
+/// not. On a six-core processor (i5-12400F, 12 threads) the title's threads
+/// and the list translators keep every core busy, and the submitting thread
+/// stood waiting for helpers that were not running. Measured with `VICTORY_AB`
+/// in one run (RTX 3060, `-Machine 4070`, Series S at half scale, medians of
+/// the steady phases, off / on): 10.8 / 11.4 fps, the submitting thread 87.0 /
+/// 77.3 ms a frame, refreshes 21.9 / 18.5 ms, waiting for the heaps' records
+/// 5.0 / 0.6 ms, the card idle behind the submitting thread 40.3 / 29.6 ms.
+fn helpers_raised() -> bool {
+    crate::toggled!("VICTORY_HELPER_PRIORITY")
+}
+
+/// A helper's priority ([`helpers_raised`]). [`Self::keep`] is called before
+/// each piece of work; it asks the system only when the switch has changed.
+pub(crate) struct Priority {
+    applied: Option<bool>,
+}
+
+impl Priority {
+    pub(crate) fn new() -> Self {
+        let mut priority = Self { applied: None };
+        priority.keep();
+        priority
+    }
+
+    pub(crate) fn keep(&mut self) {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_NORMAL,
+        };
+        let on = helpers_raised();
+        if self.applied == Some(on) {
+            return;
+        }
+        let priority = if on { THREAD_PRIORITY_ABOVE_NORMAL } else { THREAD_PRIORITY_NORMAL };
+        // SAFETY: our own thread.
+        unsafe { SetThreadPriority(GetCurrentThread(), priority) };
+        self.applied = Some(on);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

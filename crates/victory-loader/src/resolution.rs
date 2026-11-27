@@ -35,8 +35,10 @@
 //!   in its padding (as pull request #53 did). That one is not safe: at 0.5
 //!   on Series S (run res-6) FidelityFX's jitter phase count came back 0 and
 //!   the title divided by it (+0x28f03e8) 49 s in.
-//! - **Upscaler.** `VICTORY_UPSCALER=<kind>` makes the picker return
-//!   `kind` (pull request #53): 6 the title's own, 7 FidelityFX.
+//! - **Upscaler.** `VICTORY_UPSCALER=<kind>` makes the picker and its
+//!   per-frame copy (+0x5400190) return `kind` (pull request #53): 6 the
+//!   title's own, 7 FidelityFX. On a Series S of the known build both return
+//!   6 without it (`VICTORY_TITLE_PATCHES=0` leaves them; `=1` on any console).
 
 use crate::frame_rate::Patched;
 
@@ -192,6 +194,27 @@ pub const PICKER: Site = Site {
     ],
 };
 
+/// The picker's per-frame copy, +0x5400190 (its first 32 bytes): the
+/// title asks it again every frame, so with only [`PICKER`] changed a
+/// Series S still switches to FidelityFX. (victory-fork #798, by KyleS98.)
+pub const PICKER_FRAME: Site = Site {
+    at: 0x540_0190,
+    what: "upscaler picker (the per-frame copy)",
+    bytes: &[
+        0x48, 0x83, 0xec, 0x28, 0x48, 0x8b, 0x05, 0xb5, 0xe2, 0x1d, 0x02, 0x48, 0x8d, 0x0d, 0x5e, 0x00, 0x00, 0x00, 0x48, 0x8b,
+        0x80, 0xa8, 0x00, 0x00, 0x00, 0x48, 0x39, 0xc8, 0x75, 0x3c, 0xe8, 0x4d,
+    ],
+};
+
+/// The upscaler both pickers are made to return: `VICTORY_UPSCALER` if set;
+/// else, on a Series S of the known build (`series_s_default`), 6, the
+/// title's own: FidelityFX's (7) output never reaches the screen here, and
+/// its DLL is refused by the host policy, so the world stays black.
+/// `VICTORY_TITLE_PATCHES=0` leaves the title's choice alone.
+pub fn upscaler_kind(asked: Option<u32>, series_s_default: bool) -> Option<u32> {
+    asked.or(series_s_default.then_some(6))
+}
+
 /// `rel32` from the end of an instruction at image offset `next` to `to`.
 fn rel(to: usize, next: usize) -> [u8; 4] {
     ((to as i64 - next as i64) as i32).to_le_bytes()
@@ -294,6 +317,115 @@ pub unsafe fn write(base: usize, size: usize, site: &Site, code: &[u8]) -> Patch
     Patched::Done
 }
 
+/// Writes every (offset, old, new) as one group. Every page is prepared
+/// and every signature compared before writing any replacement bytes.
+/// Err names the first site that stopped the group and why.
+///
+/// # Safety
+/// The image remains mapped and no thread runs its code during the patch.
+#[cfg(windows)]
+pub unsafe fn write_all(base: usize, size: usize, sites: &[(usize, &[u8], &[u8])]) -> Result<(), (usize, Patched)> {
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_GUARD, PAGE_NOACCESS,
+        VirtualProtect, VirtualQuery,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    let mut protections = Vec::with_capacity(sites.len());
+    // SAFETY: the caller keeps the range mapped and its code inactive.
+    let result = unsafe {
+        write_all_with(base, size, sites, |mut at, len| {
+            let end = at + len;
+            while at < end {
+                let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                if VirtualQuery(at as *const _, &mut info, std::mem::size_of_val(&info)) == 0
+                    || info.State != MEM_COMMIT
+                    || info.Protect & (PAGE_GUARD | PAGE_NOACCESS) != 0
+                {
+                    return Err("Windows did not report readable committed memory");
+                }
+                // VirtualProtect only reports the old protection of its first
+                // page. Limit each call to a region of uniform protection.
+                let Some(region_end) = (info.BaseAddress as usize)
+                    .checked_add(info.RegionSize)
+                    .filter(|&region_end| region_end > at)
+                else {
+                    return Err("Windows reported invalid region bounds");
+                };
+                let next = end.min(region_end);
+                let mut old = 0;
+                if VirtualProtect(at as *const _, next - at, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+                    return Err("Windows would not make it writable");
+                }
+                protections.push((at, next - at, old));
+                at = next;
+            }
+            Ok(())
+        })
+    };
+    // Reverse order also restores the right permissions when two sites touch
+    // one page and the later one temporarily inherited its writable state.
+    for (at, len, protection) in protections.into_iter().rev() {
+        let mut old = 0;
+        // SAFETY: these are the still-mapped regions recorded above.
+        if unsafe { VirtualProtect(at as *const _, len, protection, &mut old) } == 0 {
+            tracing::error!(at, len, "could not restore image page protection");
+        }
+    }
+    if result.is_ok() {
+        for &(at, _, new) in sites {
+            if !new.is_empty() {
+                // SAFETY: the written bytes are still in the mapped image.
+                if unsafe { FlushInstructionCache(GetCurrentProcess(), (base + at) as *const _, new.len()) } == 0 {
+                    tracing::error!(at, "could not flush the image instruction cache");
+                }
+            }
+        }
+    }
+    result
+}
+
+/// Prepares a group of byte ranges, verifies all signatures, then writes.
+///
+/// # Safety
+/// A successful prepare call leaves the range readable and writable until
+/// the function returns. Nothing runs or changes the image during the patch.
+#[cfg(any(windows, test))]
+pub(crate) unsafe fn write_all_with(
+    base: usize,
+    size: usize,
+    sites: &[(usize, &[u8], &[u8])],
+    mut prepare: impl FnMut(usize, usize) -> Result<(), &'static str>,
+) -> Result<(), (usize, Patched)> {
+    for (i, &(at, old, new)) in sites.iter().enumerate() {
+        if new.len() > old.len()
+            || at.checked_add(old.len()).is_none_or(|end| end > size || base.checked_add(end).is_none())
+        {
+            return Err((i, Patched::Failed("outside the image or longer than the bytes compared")));
+        }
+        if !old.is_empty() {
+            prepare(base + at, old.len()).map_err(|why| (i, Patched::Failed(why)))?;
+        }
+    }
+    for (i, &(at, old, _)) in sites.iter().enumerate() {
+        if !old.is_empty() {
+            // SAFETY: prepare validated this readable range.
+            let there = unsafe { std::slice::from_raw_parts((base + at) as *const u8, old.len()) };
+            if there != old {
+                return Err((i, Patched::Differs));
+            }
+        }
+    }
+    for &(at, _, new) in sites {
+        if !new.is_empty() {
+            // SAFETY: prepare made the range writable and new is a separate buffer.
+            unsafe { std::ptr::copy_nonoverlapping(new.as_ptr(), (base + at) as *mut u8, new.len()) };
+        }
+    }
+    Ok(())
+}
+
 /// Applies what the switches ask for; a line each in the log and on
 /// standard output.
 ///
@@ -301,7 +433,7 @@ pub unsafe fn write(base: usize, size: usize, site: &Site, code: &[u8]) -> Patch
 /// The image of `size` bytes at `base` stays mapped and no thread runs its
 /// code yet.
 #[cfg(windows)]
-pub unsafe fn apply_asked(base: usize, size: usize) {
+pub unsafe fn apply_asked(base: usize, size: usize, series_s_default: bool) {
     let mut asked: Vec<(&Site, Vec<u8>, String)> = Vec::new();
     if let Some((w, h)) = asked_output() {
         let split_code = ui_plane::requested(
@@ -338,8 +470,29 @@ pub unsafe fn apply_asked(base: usize, size: usize) {
     if let Some(s) = asked_ffx_scale() {
         asked.push((&FFX_SCALE, ffx_scale_code(s), format!("{s}")));
     }
-    if let Some(kind) = asked_upscaler() {
-        asked.push((&PICKER, picker_code(kind), format!("returns {kind}")));
+    // The two upscaler choices as a pair: both sites are compared first, and
+    // neither is written unless both are the expected bytes (as in
+    // fxceless/victory-fork #798), so the title never runs with one choice
+    // changed and the other not.
+    if let Some(kind) = upscaler_kind(asked_upscaler(), series_s_default) {
+        let code = picker_code(kind);
+        let pair = [(PICKER.at, PICKER.bytes, &code[..]), (PICKER_FRAME.at, PICKER_FRAME.bytes, &code[..])];
+        // SAFETY: the caller's promise.
+        match unsafe { write_all(base, size, &pair) } {
+            Ok(()) => {
+                for site in [&PICKER, &PICKER_FRAME] {
+                    let offset = format!("{:#x}", site.at);
+                    tracing::info!(site = %offset, what = site.what, value = %format!("returns {kind}"), "resolution: patched");
+                    println!("resolution: {} (returns {kind}) at title+{offset}: Done", site.what);
+                }
+            }
+            Err((i, why)) => {
+                let site = [&PICKER, &PICKER_FRAME][i];
+                let offset = format!("{:#x}", site.at);
+                tracing::warn!(site = %offset, what = site.what, ?why, "resolution: upscaler choice not patched at either site (another build?)");
+                println!("resolution: upscaler choice (returns {kind}) not patched: title+{offset} {why:?}; neither site written");
+            }
+        }
     }
     for (site, code, value) in asked {
         // SAFETY: the caller's promise.
@@ -430,7 +583,107 @@ mod tests {
         let changed: Vec<usize> = (0..ffx.len()).filter(|&i| ffx[i] != FFX_SCALE.bytes[i]).collect();
         assert!(changed.iter().all(|&i| (0x2c..0x30).contains(&i) || (0x36..0x3a).contains(&i) || (0x64..0x68).contains(&i)));
         assert_eq!(picker_code(7), [0xb8, 7, 0, 0, 0, 0xc3]);
+        assert!(picker_code(6).len() <= PICKER_FRAME.bytes.len());
+        assert_eq!(PICKER_FRAME.bytes[..6], [0x48, 0x83, 0xec, 0x28, 0x48, 0x8b]);
         assert_eq!(pool_check_code(), [0x48, 0x3d, 0xff, 0xff, 0x1f, 0x00, 0xeb, 0x01]);
+    }
+
+    #[test]
+    fn series_s_takes_the_titles_own_upscaler_unless_asked() {
+        assert_eq!(upscaler_kind(None, true), Some(6));
+        assert_eq!(upscaler_kind(None, false), None);
+        assert_eq!(upscaler_kind(Some(7), true), Some(7));
+        assert_eq!(upscaler_kind(Some(6), false), Some(6));
+    }
+
+    /// A synthetic image with the picker pair at 0x100 and 0x200.
+    fn pair_image(second: &[u8]) -> Vec<u8> {
+        let mut image = vec![0xccu8; 0x300];
+        image[0x100..0x100 + PICKER.bytes.len()].copy_from_slice(PICKER.bytes);
+        image[0x200..0x200 + second.len()].copy_from_slice(second);
+        image
+    }
+
+    fn write_pair(image: &mut [u8], fail_at: Option<usize>) -> Result<(), (usize, Patched)> {
+        let code = picker_code(6);
+        let pair = [(0x100, PICKER.bytes, &code[..]), (0x200, PICKER_FRAME.bytes, &code[..])];
+        let base = image.as_mut_ptr() as usize;
+        let mut calls = 0;
+        // SAFETY: the image belongs to the test and is already writable.
+        unsafe {
+            write_all_with(base, image.len(), &pair, |_, _| {
+                calls += 1;
+                if Some(calls) == fail_at {
+                    return Err("refused");
+                }
+                Ok(())
+            })
+        }
+    }
+
+    /// Both upscaler choices are written, or neither: a second site that is
+    /// not the expected bytes leaves the first as it was.
+    #[test]
+    fn the_upscaler_pair_is_written_whole_or_not_at_all() {
+        let mut image = pair_image(PICKER_FRAME.bytes);
+        assert_eq!(write_pair(&mut image, None), Ok(()));
+        assert_eq!(image[0x100..0x106], picker_code(6)[..]);
+        assert_eq!(image[0x200..0x206], picker_code(6)[..]);
+
+        let mut other = PICKER_FRAME.bytes.to_vec();
+        other[10] ^= 0xff;
+        let mut image = pair_image(&other);
+        let before = image.clone();
+        assert_eq!(write_pair(&mut image, None), Err((1, Patched::Differs)));
+        assert_eq!(image, before, "nothing written when the second site differs");
+    }
+
+    /// A failure preparing the second site leaves both original sequences intact.
+    #[test]
+    fn a_failed_second_preparation_leaves_both_sites_unchanged() {
+        let mut image = pair_image(PICKER_FRAME.bytes);
+        let before = image.clone();
+        assert_eq!(write_pair(&mut image, Some(2)), Err((1, Patched::Failed("refused"))));
+        assert_eq!(image, before);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cross_page_group_restores_protection_after_success_and_failure() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ,
+            PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+            VirtualProtect, VirtualQuery,
+        };
+        const PAGE: usize = 0x1000;
+        // SAFETY: the test owns the reserved pages and writes code-shaped
+        // data into them without executing it.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 3 * PAGE, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            assert_eq!(VirtualAlloc(base.cast(), 2 * PAGE, MEM_COMMIT, PAGE_READWRITE).cast::<u8>(), base);
+            base.add(PAGE - 1).write(1);
+            base.add(PAGE).write(2);
+            let mut old = 0;
+            assert_ne!(VirtualProtect(base.cast(), PAGE, PAGE_EXECUTE_READ, &mut old), 0);
+            assert_ne!(VirtualProtect(base.add(PAGE).cast(), PAGE, PAGE_READONLY, &mut old), 0);
+
+            let original = || (base.add(PAGE - 1).read(), base.add(PAGE).read());
+            let protection = |offset| {
+                let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                assert_ne!(VirtualQuery(base.add(offset).cast(), &mut info, std::mem::size_of_val(&info)), 0);
+                info.Protect
+            };
+            let patch: (usize, &[u8], &[u8]) = (PAGE - 1, &[1, 2], &[3, 4]);
+            assert!(matches!(write_all(base as usize, 3 * PAGE, &[patch, (2 * PAGE, &[0], &[1])]), Err((1, Patched::Failed(_)))));
+            assert_eq!(original(), (1, 2));
+            assert_eq!((protection(0), protection(PAGE)), (PAGE_EXECUTE_READ, PAGE_READONLY));
+
+            assert_eq!(write_all(base as usize, 3 * PAGE, &[patch]), Ok(()));
+            assert_eq!(original(), (3, 4));
+            assert_eq!((protection(0), protection(PAGE)), (PAGE_EXECUTE_READ, PAGE_READONLY));
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
     }
 
     #[cfg(windows)]

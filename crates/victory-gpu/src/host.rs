@@ -7272,11 +7272,13 @@ impl Host {
         stage.next("submit: steps given to the card");
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
-        // what they write.
+        // what they write. Rare sparse-VA UAV writes also settle before the
+        // next flight submits so relay readbacks stay ordered on `self.queue`.
         // Or the reads are done on the card, behind the flights.
+        let sparse_uav = late && crate::sparse_va::has_active_uav();
         #[cfg(feature = "diagnostics")]
         let mut redirect_wait = None;
-        let own = if late {
+        let own = if late && !sparse_uav {
             self.card_steps(
                 runs, preplan,
                 #[cfg(feature = "diagnostics")]
@@ -7288,8 +7290,8 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         ahead.part(12);
         stage.next("submit: waiting for flights it reads from");
-        if !late {
-            self.settle(&mut submitted, WHY_SYNC);
+        if !late || sparse_uav {
+            self.settle(&mut submitted, if sparse_uav { WHY_STALE } else { WHY_SYNC });
         } else if own.is_none()
             && let Some(why) = late_blocked(runs)
         {

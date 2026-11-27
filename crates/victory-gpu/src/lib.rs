@@ -113,6 +113,8 @@ mod memory;
 #[cfg(windows)]
 mod shadow;
 #[cfg(windows)]
+mod sparse_va;
+#[cfg(windows)]
 mod tiles;
 pub mod signature;
 mod switch;

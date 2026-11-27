@@ -131,7 +131,7 @@ Run these steps separately from the repository root to warm the shader cache and
 .\target\diag\victory.exe warm --used
 ```
 
-Pass an archive path to `shaders` to scan just that archive. `-SkipShaders` skips pretranslation at launch.
+Pass an archive path to `shaders` to scan just that archive. At launch, `--if-needed` checks file metadata throughout each input directory before reusing a completed scan. On Windows volumes that do not report file change times, it scans the input again. `-SkipShaders` skips pretranslation at launch.
 
 </details>
 

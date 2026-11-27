@@ -1065,6 +1065,20 @@ fn bury_lag() -> u64 {
     })
 }
 
+/// Current submission retirement safety lag (`bury_lag`).
+pub(crate) fn bury_lag_value() -> u64 {
+    bury_lag()
+}
+
+/// Drops already-matured retired resources whose safety lag (`bury_lag`) has
+/// elapsed, releasing their VRAM/host backing immediately without waiting for
+/// the next submission completion. Safe to call while holding other engine
+/// locks (`MEMORY`, etc.) because `bury` locks only `RETIRED` shards and drops
+/// COM handles outside the lock.
+pub(crate) fn drain_retired() {
+    bury(FINISHED.load(Ordering::Acquire));
+}
+
 /// Drops the eligible prefix of each stamp-ordered retirement shard.
 fn bury(finished: u64) {
     let finished = finished.saturating_sub(bury_lag());
@@ -3428,6 +3442,8 @@ struct CardPlan {
     sends: Option<send::Memory>,
     /// With [`upq`]: the copy list and buffer what went up came through.
     up: Option<upq::Slot>,
+    /// Transient upload buffers for GPU-ordered single-buffer PC-RAM arena updates.
+    _direct_uploads: Vec<ID3D12Resource>,
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -5928,8 +5944,9 @@ impl Host {
         };
         let gathering = crate::timeline::span("copies in the card's memory: what changed");
         let mut dirty = crate::shadow::card_dirty(sent_as);
+        let direct_dirty = crate::shadow::direct_dirty();
         gathering.end();
-        if declared.is_empty() && dirty.is_empty() && looked.is_empty() {
+        if declared.is_empty() && dirty.is_empty() && direct_dirty.is_empty() && looked.is_empty() {
             return None;
         }
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
@@ -5952,11 +5969,12 @@ impl Host {
         let mut used: Vec<(bool, Prelude)> = Vec::new();
         let mut looks = None;
         let mut up = None;
+        let mut direct_uploads: Vec<ID3D12Resource> = Vec::new();
         // The bytes as they are now, whatever later submissions put there.
         let taking = crate::timeline::span("copies in the card's memory: taken");
         let own = if send::own() { send::take(self, &dirty) } else { None };
         taking.end();
-        if !dirty.is_empty() {
+        if !dirty.is_empty() || !direct_dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
             };
@@ -6030,6 +6048,45 @@ impl Host {
                             }
                         }
                     }
+                    if !direct_dirty.is_empty() {
+                        let total: u64 = direct_dirty
+                            .iter()
+                            .flat_map(|(_, runs)| runs.iter())
+                            .map(|(_, bytes)| bytes.len() as u64)
+                            .sum();
+                        if total > 0 {
+                            if let Some((up_buf, up_ptr)) = self.upload_buffer(total) {
+                                let mut cursor = 0usize;
+                                for (shadow, runs) in &direct_dirty {
+                                    for (offset, bytes) in runs {
+                                        if bytes.is_empty() {
+                                            continue;
+                                        }
+                                        // SAFETY: `cursor + bytes.len() <= total` inside `up_buf`.
+                                        std::ptr::copy_nonoverlapping(
+                                            bytes.as_ptr(),
+                                            up_ptr.add(cursor),
+                                            bytes.len(),
+                                        );
+                                        list.CopyBufferRegion(
+                                            &shadow.buffer,
+                                            *offset as u64,
+                                            &up_buf,
+                                            cursor as u64,
+                                            bytes.len() as u64,
+                                        );
+                                        cursor += bytes.len();
+                                    }
+                                }
+                                direct_uploads.push(up_buf);
+                            } else {
+                                tracing::warn!(
+                                    total,
+                                    "no transient upload buffer for single-buffer PC-RAM by-address update"
+                                );
+                            }
+                        }
+                    }
                     if !sent.is_empty() {
                         list.ResourceBarrier(&sent);
                     }
@@ -6082,15 +6139,19 @@ impl Host {
             used.push((false, sync));
         }
         drop(order);
+        let mut synced: Vec<Arc<crate::shadow::Shadow>> =
+            dirty.into_iter().map(|(shadow, _)| shadow).collect();
+        synced.extend(direct_dirty.into_iter().map(|(shadow, _)| shadow));
         let mut plan = CardPlan {
             ranges: Vec::new(),
             check: None,
-            _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
+            _synced: synced,
             lists: used,
             sent_as,
             looks,
             sends: own.map(send::Own::memory),
             up,
+            _direct_uploads: direct_uploads,
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
@@ -13447,5 +13508,56 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+
+    #[test]
+    fn drain_retired_releases_matured_com_resource_after_fence() {
+        use windows::core::Interface;
+
+        let Some(host) = super::host() else {
+            eprintln!("no host GPU; skipped");
+            return;
+        };
+        let matured = host.uav_buffer(64 * 1024).expect("matured uav_buffer");
+        let in_flight = host.uav_buffer(64 * 1024).expect("in_flight uav_buffer");
+        assert_eq!(super::references(&matured), 1);
+        assert_eq!(super::references(&in_flight), 1);
+
+        // Put `[(0, matured), (u64::MAX, in_flight), ...]` at the front of this
+        // thread's `RETIRED` shard so `bury()`'s `take_while` pops `matured`
+        // and stops at `in_flight` regardless of any earlier or concurrent
+        // test entries in the shard.
+        {
+            let mut q = super::retired();
+            q.push_front((u64::MAX, super::Retired::Resource(in_flight.clone())));
+            q.push_front((0, super::Retired::Resource(matured.clone())));
+        }
+        assert_eq!(super::references(&matured), 2);
+        assert_eq!(super::references(&in_flight), 2);
+
+        // `drain_retired()` immediately releases resources whose fence + bury_lag
+        // has matured, while keeping in-flight resources alive.
+        super::drain_retired();
+        assert_eq!(
+            super::references(&matured),
+            1,
+            "matured retired resource must be released immediately by drain_retired()"
+        );
+        assert_eq!(
+            super::references(&in_flight),
+            2,
+            "in-flight retired resource must remain alive before fence + bury_lag"
+        );
+
+        // Clean up only this test's `in_flight` entry so no test state leaks.
+        let raw = in_flight.as_raw();
+        {
+            let mut q = super::retired();
+            q.retain(|(stamp, item)| {
+                !(*stamp == u64::MAX
+                    && matches!(item, super::Retired::Resource(r) if r.as_raw() == raw))
+            });
+        }
+        assert_eq!(super::references(&in_flight), 1);
     }
 }

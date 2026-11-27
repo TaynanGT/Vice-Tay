@@ -7385,7 +7385,19 @@ impl<'a> Lower<'a> {
         (first, props, image, uav, used)
         };
         let src = Source::Loaded { load: site, first };
-        let h = self.handle(site, &src, false, props)?;
+        // A buffer's size is asked through a handle of its own, marked
+        // non-uniform: AMD's RDNA4 compiler (`amdxc64.dll+0x861b9f`, driver
+        // 32.0.32029.2010) reads a null pointer compiling `getDimensions`
+        // through the uniform heap handle the buffer's loads use. A descriptor
+        // loaded per lane in a waterfall loop keeps its own handle, which is
+        // already non-uniform.
+        let h = if image.is_none() && !self.x.res.waterfall.loads.contains(&site) {
+            let index = self.heap_index(site, first, false)?;
+            let (index, bounded) = self.raw_twin(&src, index, false, props);
+            self.s.size_handle_at(self.cur, index, props, bounded)
+        } else {
+            self.handle(site, &src, false, props)?
+        };
         let c = self.cur;
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);

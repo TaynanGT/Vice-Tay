@@ -14,7 +14,8 @@ pub mod opt;
 pub(crate) struct Ty(u32);
 
 /// What the lowering made an instruction for, where it says so (counted by
-/// [`census`], nothing else reads it).
+/// [`census`]; [`Tag::Clamp`] is also read by [`opt`] to keep per-handle index
+/// clamps separate).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Tag {
     /// The select that keeps a register's old value in lanes a guard masks.
@@ -377,10 +378,11 @@ impl Module {
     }
 
     /// Notes what instruction `v` is for (see [`Tag`]); only when modules
-    /// are counted.
+    /// are counted, except clamps, which the clean-up keeps one per handle
+    /// ([`opt::REUSE`]).
     pub fn tag(&mut self, v: V, tag: Tag) {
         if let V::Inst(i) = v
-            && census::enabled()
+            && (tag == Tag::Clamp || census::enabled())
         {
             self.tags.insert(i, tag);
         }

@@ -5446,8 +5446,13 @@ impl Host {
                     let cmd_list: ID3D12CommandList = list.cast()?;
                     if let Some(tl) = crate::async_timeline::existing() {
                         // Atomically wait on in-flight Compute/Copy hazards, submit Direct
-                        // `sync`, signal `direct_fence`, and record Direct writes (including
-                        // `work.differs.0` whenever `bound_compare` bound it as UAV slot 3).
+                        // `sync`, signal `direct_fence`, and record Direct reads/writes
+                        // (including `async_bounce` read and `work.differs.0` whenever
+                        // `bound_compare` bound it as UAV slot 3).
+                        let mut sync_reads = Vec::new();
+                        if let Some(bounce) = &async_bounce {
+                            sync_reads.push(crate::async_timeline::resource_key(bounce.resource()));
+                        }
                         let mut sync_writes = Vec::with_capacity(dirty.len() * 2 + 1);
                         for (shadow, _) in &dirty {
                             sync_writes.push(crate::async_timeline::resource_key(&shadow.buffer));
@@ -5460,9 +5465,12 @@ impl Host {
                         if bound_compare {
                             sync_writes.push(crate::async_timeline::resource_key(&work.differs.0));
                         }
-                        let ((), tok, _) = tl.execute_direct_tracked(&self.queue, &[], &sync_writes, || {
+                        let ((), tok, _) = tl.execute_direct_tracked(&self.queue, &sync_reads, &sync_writes, || {
                             self.queue.ExecuteCommandLists(&[Some(cmd_list)]);
                         })?;
+                        if let Some(bounce) = async_bounce.as_mut() {
+                            bounce.note_direct_consumer(tok);
+                        }
                         sync_tok = Some(tok);
                     } else {
                         self.queue.ExecuteCommandLists(&[Some(cmd_list)]);
@@ -5948,7 +5956,22 @@ impl Host {
                     // In the order of the queue: the sends of title bytes so
                     // far are ahead of this fetch, every later one behind it.
                     let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
-                    self.queue.ExecuteCommandLists(&lists);
+                    if let Some(tl) = crate::async_timeline::existing() {
+                        let src_list = check.as_ref().map_or(&pieces, |c| &c.copies);
+                        let mut fb_reads = Vec::with_capacity(src_list.len());
+                        for (shadow, ..) in src_list {
+                            let k = crate::async_timeline::resource_key(&shadow.buffer);
+                            if !fb_reads.contains(&k) {
+                                fb_reads.push(k);
+                            }
+                        }
+                        let fb_writes = [crate::async_timeline::resource_key(&buffer)];
+                        let _ = tl.execute_direct_tracked(&self.queue, &fb_reads, &fb_writes, || {
+                            self.queue.ExecuteCommandLists(&lists);
+                        })?;
+                    } else {
+                        self.queue.ExecuteCommandLists(&lists);
+                    }
                     let after = *order;
                     drop(order);
                     self.card_sent();

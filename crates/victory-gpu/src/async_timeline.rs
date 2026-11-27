@@ -125,6 +125,12 @@ pub(crate) fn resource_key(resource: &ID3D12Resource) -> usize {
 struct ResourceUsage {
     last_write: Option<TimelineToken>,
     last_read: [u64; 3],
+    /// Bitmask of queues (`1 << q.index()`) that executed an un-signaled write
+    /// to this resource (after `Signal` failed following `ExecuteCommandLists`).
+    unsignaled_write: u8,
+    /// Bitmask of queues (`1 << q.index()`) that executed an un-signaled read
+    /// of this resource.
+    unsignaled_read: u8,
 }
 
 /// Tracks cross-queue RAW / WAR / WAW dependencies per resource and coalesces
@@ -132,6 +138,9 @@ struct ResourceUsage {
 #[derive(Default)]
 pub(crate) struct HazardTracker {
     entries: HashMap<usize, ResourceUsage>,
+    /// Whether queue `q` executed at least one `ExecuteCommandLists` whose
+    /// trailing `Signal` failed and has not yet been sealed by a recovery `Signal`.
+    unsignaled_queues: [bool; 3],
 }
 
 impl HazardTracker {
@@ -202,12 +211,53 @@ impl HazardTracker {
         }
     }
 
+    /// Marks `queue` as having un-signaled in-flight GPU work touching `reads`
+    /// and `writes` (used when `Signal` fails after `ExecuteCommandLists`).
+    fn mark_unsignaled(&mut self, queue: QueueKind, reads: &[usize], writes: &[usize]) {
+        let q_idx = queue.index();
+        let bit = 1u8 << q_idx;
+        self.unsignaled_queues[q_idx] = true;
+        for &key in reads {
+            self.entries.entry(key).or_default().unsignaled_read |= bit;
+        }
+        for &key in writes {
+            self.entries.entry(key).or_default().unsignaled_write |= bit;
+        }
+    }
+
+    /// Upgrades all un-signaled entries for `token.queue` once a recovery
+    /// `Signal(fence, token.value)` succeeds on that FIFO queue.
+    fn seal_queue(&mut self, token: TimelineToken) {
+        let q_idx = token.queue.index();
+        let bit = 1u8 << q_idx;
+        self.unsignaled_queues[q_idx] = false;
+        for usage in self.entries.values_mut() {
+            if (usage.unsignaled_read & bit) != 0 {
+                usage.last_read[q_idx] = usage.last_read[q_idx].max(token.value);
+                usage.unsignaled_read &= !bit;
+            }
+            if (usage.unsignaled_write & bit) != 0 {
+                usage.last_write = Some(token);
+                usage.last_read = [0; 3];
+                usage.unsignaled_write &= !bit;
+            }
+        }
+    }
+
+    #[inline]
+    fn is_queue_unsignaled(&self, queue: QueueKind) -> bool {
+        self.unsignaled_queues[queue.index()]
+    }
+
     /// Drops resource entries whose tracked fence values have all completed on GPU.
     pub(crate) fn prune(&mut self, completed: [u64; 3]) {
         if self.entries.len() < HAZARD_PRUNE_THRESHOLD {
             return;
         }
         self.entries.retain(|_, usage| {
+            if usage.unsignaled_write != 0 || usage.unsignaled_read != 0 {
+                return true;
+            }
             let write_live = usage
                 .last_write
                 .is_some_and(|tok| tok.value > completed[tok.queue.index()]);
@@ -248,8 +298,12 @@ struct QueueEngine {
     idle: Vec<CommandSlot>,
     in_flight: VecDeque<InFlight>,
     /// Slots whose `ExecuteCommandLists` ran but whose trailing `Signal` failed;
-    /// pinned until teardown and never waited on via `SetEventOnCompletion`.
+    /// pinned until a recovery `Signal` seals them into `in_flight` (or teardown)
+    /// and never waited on directly via `SetEventOnCompletion`.
     abandoned: Vec<InFlight>,
+    /// True whenever `ExecuteCommandLists` ran without a subsequent successful
+    /// `Signal`, even if `abandoned` is later inspected.
+    needs_seal: bool,
     total_slots: usize,
 }
 
@@ -280,6 +334,7 @@ impl QueueEngine {
             idle: Vec::new(),
             in_flight: VecDeque::new(),
             abandoned: Vec::new(),
+            needs_seal: false,
             total_slots: 0,
         })
     }
@@ -314,11 +369,18 @@ impl QueueEngine {
         self.reclaim(fence);
         let slot = if let Some(slot) = self.idle.pop() {
             // SAFETY: The slot was reclaimed only after `fence.GetCompletedValue() >= last_fence`.
-            unsafe {
-                slot.allocator.Reset()?;
-                slot.list.Reset(&slot.allocator, None)?;
+            let reset_res = unsafe {
+                slot.allocator
+                    .Reset()
+                    .and_then(|()| slot.list.Reset(&slot.allocator, None))
+            };
+            match reset_res {
+                Ok(()) => slot,
+                Err(err) => {
+                    self.total_slots = self.total_slots.saturating_sub(1);
+                    return Err(err);
+                }
             }
-            slot
         } else if self.total_slots < MAX_SLOTS_PER_QUEUE {
             // SAFETY: Plain D3D12 object creation matching this queue's list type.
             let slot = unsafe {
@@ -347,11 +409,20 @@ impl QueueEngine {
                 .pop_front()
                 .ok_or_else(windows::core::Error::empty)?;
             // SAFETY: The oldest submission's fence value has completed on GPU.
-            unsafe {
-                oldest.slot.allocator.Reset()?;
-                oldest.slot.list.Reset(&oldest.slot.allocator, None)?;
+            let reset_res = unsafe {
+                oldest
+                    .slot
+                    .allocator
+                    .Reset()
+                    .and_then(|()| oldest.slot.list.Reset(&oldest.slot.allocator, None))
+            };
+            match reset_res {
+                Ok(()) => oldest.slot,
+                Err(err) => {
+                    self.total_slots = self.total_slots.saturating_sub(1);
+                    return Err(err);
+                }
             }
-            oldest.slot
         };
         Ok(slot)
     }
@@ -409,6 +480,7 @@ pub(crate) struct BounceHandle {
     buffer: ID3D12Resource,
     size: u64,
     copy_token: TimelineToken,
+    direct_token: Option<TimelineToken>,
 }
 
 // SAFETY: Free-threaded D3D12 resource owned exclusively by one submission until returned.
@@ -419,6 +491,13 @@ impl BounceHandle {
     pub(crate) fn resource(&self) -> &ID3D12Resource {
         &self.buffer
     }
+
+    /// Records the Direct submission token that read this bounce buffer so
+    /// [`AsyncTimeline::return_bounce`] can verify both Copy producer and Direct
+    /// consumer completed before recycling it into the pool.
+    pub(crate) fn note_direct_consumer(&mut self, token: TimelineToken) {
+        self.direct_token = Some(token);
+    }
 }
 
 struct PooledBounce {
@@ -428,6 +507,68 @@ struct PooledBounce {
 
 // SAFETY: Free-threaded D3D12 resource stored behind a mutex.
 unsafe impl Send for PooledBounce {}
+
+/// Resource kept alive when its GPU completion could not be confirmed (e.g. a
+/// failed `Wait`/`Signal`/`wait_cpu`), preventing premature reuse or GPU UAF.
+struct AbandonedResource {
+    token: Option<TimelineToken>,
+    _resource: ID3D12Resource,
+}
+
+// SAFETY: Free-threaded D3D12 resource stored behind a mutex.
+unsafe impl Send for AbandonedResource {}
+
+/// Direct queue fence counter plus retained queue reference for sealing if
+/// `signal_direct` fails after `execute()`.
+#[derive(Default)]
+struct DirectState {
+    sent: u64,
+    unsignaled_queue: Option<ID3D12CommandQueue>,
+}
+
+// SAFETY: `ID3D12CommandQueue` is free-threaded and protected by `Mutex<DirectState>`.
+unsafe impl Send for DirectState {}
+
+/// Distinguishes pre-execute submission failures (safe to recycle buffers) from
+/// post-execute `Signal` failures (GPU already executing; resources stay pinned).
+enum SubmitSlotError {
+    BeforeExecute(windows::core::Error),
+    SignalFailedAfterExecute(windows::core::Error),
+}
+
+impl SubmitSlotError {
+    fn into_error(self) -> windows::core::Error {
+        match self {
+            Self::BeforeExecute(e) | Self::SignalFailedAfterExecute(e) => e,
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct FaultInject {
+    fail_signal: [AtomicU64; 3],
+    fail_wait: [AtomicU64; 3],
+    fail_wait_cpu: [AtomicU64; 3],
+}
+
+#[cfg(test)]
+impl FaultInject {
+    fn take(counter: &AtomicU64) -> windows::core::Result<()> {
+        let mut cur = counter.load(Relaxed);
+        while cur > 0 {
+            match counter.compare_exchange_weak(cur, cur - 1, Relaxed, Relaxed) {
+                Ok(_) => {
+                    return Err(windows::core::Error::from(
+                        windows::Win32::Foundation::E_FAIL,
+                    ));
+                }
+                Err(actual) => cur = actual,
+            }
+        }
+        Ok(())
+    }
+}
 
 /// Telemetry counters for the frame-rate log line.
 /// 0: compute submits, 1: copy uploads, 2: copy readbacks,
@@ -451,9 +592,9 @@ const ST_RB_BYTES: usize = 9;
 /// execution with strictly GPU-side `ID3D12Fence` handoffs.
 ///
 /// Lock order invariant (strictly acyclic):
-/// `hazards` (outer, held atomically across Wait + ExecuteCommandLists + Signal + record)
+/// `hazards` (outer, held atomically across seal + Wait + ExecuteCommandLists + Signal + record)
 ///   -> `compute` | `copy` | `direct_sent` (inner, never nested with each other).
-/// `bounces` is a leaf lock. `wait_cpu` never holds any lock.
+/// `bounces` and `abandoned_resources` are leaf locks. `wait_cpu` never holds any lock.
 pub(crate) struct AsyncTimeline {
     device: ID3D12Device,
     direct_fence: ID3D12Fence,
@@ -463,12 +604,15 @@ pub(crate) struct AsyncTimeline {
     /// mode-0 `CARD_COMPARE` rehash dispatches so async rehash never aliases
     /// `CARD_WORK.differs` across queues.
     rehash_dummy_uav: ID3D12Resource,
-    direct_sent: Mutex<u64>,
+    direct_sent: Mutex<DirectState>,
     compute: Mutex<QueueEngine>,
     copy: Mutex<QueueEngine>,
     hazards: Mutex<HazardTracker>,
     bounces: Mutex<Vec<PooledBounce>>,
+    abandoned_resources: Mutex<Vec<AbandonedResource>>,
     copy_timestamps_supported: bool,
+    #[cfg(test)]
+    faults: FaultInject,
 }
 
 // SAFETY: All D3D12 device/fence/resource interfaces are free-threaded; mutable
@@ -494,48 +638,47 @@ impl AsyncTimeline {
             "victory async copy queue",
         )?;
         // SAFETY: Plain fence, scratch UAV buffer, and feature query on a live device.
-        let (direct_fence, compute_fence, copy_fence, rehash_dummy_uav, copy_timestamps_supported) =
-            unsafe {
-                let direct_fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
-                let compute_fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
-                let copy_fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
-                let mut dummy: Option<ID3D12Resource> = None;
-                device.CreateCommittedResource(
-                    &D3D12_HEAP_PROPERTIES {
-                        Type: D3D12_HEAP_TYPE_DEFAULT,
-                        ..Default::default()
+        let (direct_fence, compute_fence, copy_fence, rehash_dummy_uav, copy_timestamps_supported) = unsafe {
+            let direct_fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+            let compute_fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+            let copy_fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+            let mut dummy: Option<ID3D12Resource> = None;
+            device.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_DEFAULT,
+                    ..Default::default()
+                },
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: 256,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
                     },
-                    D3D12_HEAP_FLAG_NONE,
-                    &D3D12_RESOURCE_DESC {
-                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                        Width: 256,
-                        Height: 1,
-                        DepthOrArraySize: 1,
-                        MipLevels: 1,
-                        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
-                            Count: 1,
-                            Quality: 0,
-                        },
-                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                        ..Default::default()
-                    },
-                    D3D12_RESOURCE_STATE_COMMON,
-                    None,
-                    &mut dummy,
-                )?;
-                let dummy = dummy.ok_or_else(windows::core::Error::empty)?;
-                let mut opts3 = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
-                let copy_ts = device
-                    .CheckFeatureSupport(
-                        D3D12_FEATURE_D3D12_OPTIONS3,
-                        (&raw mut opts3).cast(),
-                        size_of_val(&opts3) as u32,
-                    )
-                    .is_ok()
-                    && opts3.CopyQueueTimestampQueriesSupported.as_bool();
-                (direct_fence, compute_fence, copy_fence, dummy, copy_ts)
-            };
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    ..Default::default()
+                },
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut dummy,
+            )?;
+            let dummy = dummy.ok_or_else(windows::core::Error::empty)?;
+            let mut opts3 = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+            let copy_ts = device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS3,
+                    (&raw mut opts3).cast(),
+                    size_of_val(&opts3) as u32,
+                )
+                .is_ok()
+                && opts3.CopyQueueTimestampQueriesSupported.as_bool();
+            (direct_fence, compute_fence, copy_fence, dummy, copy_ts)
+        };
         crate::host::name(&direct_fence, || "victory timeline direct fence".into());
         crate::host::name(&compute_fence, || "victory timeline compute fence".into());
         crate::host::name(&copy_fence, || "victory timeline copy fence".into());
@@ -548,12 +691,15 @@ impl AsyncTimeline {
             compute_fence,
             copy_fence,
             rehash_dummy_uav,
-            direct_sent: Mutex::new(0),
+            direct_sent: Mutex::new(DirectState::default()),
             compute: Mutex::new(compute),
             copy: Mutex::new(copy),
             hazards: Mutex::new(HazardTracker::default()),
             bounces: Mutex::new(Vec::new()),
+            abandoned_resources: Mutex::new(Vec::new()),
             copy_timestamps_supported,
+            #[cfg(test)]
+            faults: FaultInject::default(),
         })
     }
 
@@ -572,6 +718,38 @@ impl AsyncTimeline {
         }
     }
 
+    #[inline]
+    fn raw_signal(
+        &self,
+        queue_kind: QueueKind,
+        queue: &ID3D12CommandQueue,
+        fence: &ID3D12Fence,
+        value: u64,
+    ) -> windows::core::Result<()> {
+        #[cfg(test)]
+        FaultInject::take(&self.faults.fail_signal[queue_kind.index()])?;
+        #[cfg(not(test))]
+        let _ = queue_kind;
+        // SAFETY: Caller supplies a live queue and matching device fence.
+        unsafe { queue.Signal(fence, value) }
+    }
+
+    #[inline]
+    fn raw_wait(
+        &self,
+        consumer_kind: QueueKind,
+        consumer_queue: &ID3D12CommandQueue,
+        producer_fence: &ID3D12Fence,
+        value: u64,
+    ) -> windows::core::Result<()> {
+        #[cfg(test)]
+        FaultInject::take(&self.faults.fail_wait[consumer_kind.index()])?;
+        #[cfg(not(test))]
+        let _ = consumer_kind;
+        // SAFETY: Both queue and fence live on the same device.
+        unsafe { consumer_queue.Wait(producer_fence, value) }
+    }
+
     /// Whether the adapter supports `D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP`.
     #[cfg(test)]
     pub(crate) fn copy_timestamps_supported(&self) -> bool {
@@ -583,21 +761,31 @@ impl AsyncTimeline {
         &self,
         direct_queue: &ID3D12CommandQueue,
     ) -> windows::core::Result<TimelineToken> {
-        let mut sent = self.direct_sent.lock().unwrap_or_else(|e| e.into_inner());
-        let value = *sent + 1;
-        // SAFETY: Caller supplies a live Direct queue; `direct_fence` belongs to this device.
-        unsafe { direct_queue.Signal(&self.direct_fence, value)? };
-        *sent = value;
+        let mut state = self.direct_sent.lock().unwrap_or_else(|e| e.into_inner());
+        let value = state.sent + 1;
+        self.raw_signal(QueueKind::Direct, direct_queue, &self.direct_fence, value)?;
+        state.sent = value;
+        state.unsignaled_queue = None;
         Ok(TimelineToken {
             queue: QueueKind::Direct,
             value,
         })
     }
 
-    /// Inserts a GPU-side `consumer_queue->Wait(producer_fence, token.value)`.
-    /// Zero CPU stall.
+    /// Inserts a GPU-side `consumer_queue->Wait(producer_fence, token.value)` for a
+    /// Direct consumer queue. Zero CPU stall.
+    #[cfg(test)]
     pub(crate) fn wait_on_gpu(
         &self,
+        consumer_queue: &ID3D12CommandQueue,
+        token: TimelineToken,
+    ) -> windows::core::Result<()> {
+        self.wait_on_gpu_for(QueueKind::Direct, consumer_queue, token)
+    }
+
+    fn wait_on_gpu_for(
+        &self,
+        consumer_kind: QueueKind,
         consumer_queue: &ID3D12CommandQueue,
         token: TimelineToken,
     ) -> windows::core::Result<()> {
@@ -605,19 +793,156 @@ impl AsyncTimeline {
             return Ok(());
         }
         let fence = self.fence_for(token.queue);
-        // SAFETY: Both queue and fence live on the same device.
-        unsafe { consumer_queue.Wait(fence, token.value)? };
+        self.raw_wait(consumer_kind, consumer_queue, fence, token.value)?;
         STATS[ST_GPU_WAITS].fetch_add(1, Relaxed);
         Ok(())
     }
 
-    /// Atomically checks cross-queue hazards for `reads`/`writes`, inserts any
-    /// required GPU-side `direct_queue->Wait(...)`, invokes `execute` (which must
-    /// only perform non-blocking `direct_queue.ExecuteCommandLists`), signals
-    /// `direct_fence`, and records the Direct accesses in [`HazardTracker`].
+    /// Attempts to seal one queue that previously failed `Signal` after
+    /// `ExecuteCommandLists`. Because D3D12 queues execute FIFO, a single
+    /// subsequent `Signal(fence, next_val)` safely bounds every earlier un-signaled
+    /// command list on that queue and moves any `abandoned` allocators/resources
+    /// into `in_flight` at `next_val`.
+    fn try_seal_queue(
+        &self,
+        producer: QueueKind,
+        direct_override: Option<&ID3D12CommandQueue>,
+    ) -> windows::core::Result<Option<TimelineToken>> {
+        match producer {
+            QueueKind::Direct => {
+                let mut state = self.direct_sent.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(queue) = direct_override.or(state.unsignaled_queue.as_ref()) else {
+                    return Ok(None);
+                };
+                if state.unsignaled_queue.is_none() {
+                    return Ok(None);
+                }
+                let val = state.sent + 1;
+                self.raw_signal(QueueKind::Direct, queue, &self.direct_fence, val)?;
+                state.sent = val;
+                state.unsignaled_queue = None;
+                Ok(Some(TimelineToken {
+                    queue: QueueKind::Direct,
+                    value: val,
+                }))
+            }
+            QueueKind::Compute | QueueKind::Copy => {
+                let (engine_mutex, own_fence) = match producer {
+                    QueueKind::Compute => (&self.compute, &self.compute_fence),
+                    QueueKind::Copy => (&self.copy, &self.copy_fence),
+                    QueueKind::Direct => unreachable!(),
+                };
+                let mut engine = engine_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                if !engine.needs_seal && engine.abandoned.is_empty() {
+                    return Ok(None);
+                }
+                let val = engine.sent + 1;
+                self.raw_signal(producer, &engine.queue, own_fence, val)?;
+                engine.sent = val;
+                engine.needs_seal = false;
+                for mut entry in std::mem::take(&mut engine.abandoned) {
+                    entry.fence_value = val;
+                    engine.in_flight.push_back(entry);
+                }
+                Ok(Some(TimelineToken {
+                    queue: producer,
+                    value: val,
+                }))
+            }
+        }
+    }
+
+    /// Seals any queues marked unsignaled inside `hazards`. If a producing queue
+    /// `p != consumer` cannot be sealed, returns `Err` so the consumer NEVER runs
+    /// ahead of an un-signaled producer. Returns extra minimum waits for any
+    /// producer `p != consumer` that was just sealed.
+    fn seal_unsignaled_producers_locked(
+        &self,
+        hazards: &mut HazardTracker,
+        consumer: QueueKind,
+        current_direct: Option<&ID3D12CommandQueue>,
+    ) -> windows::core::Result<[u64; 3]> {
+        let mut extra_waits = [0u64; 3];
+        for p in QueueKind::ALL {
+            if !hazards.is_queue_unsignaled(p) {
+                continue;
+            }
+            let override_q = if p == QueueKind::Direct {
+                current_direct
+            } else {
+                None
+            };
+            match self.try_seal_queue(p, override_q) {
+                Ok(Some(tok)) => {
+                    hazards.seal_queue(tok);
+                    if p != consumer {
+                        extra_waits[p.index()] = extra_waits[p.index()].max(tok.value);
+                    }
+                }
+                Ok(None) => {
+                    // Queue state had nothing pending to seal; clear flag.
+                    hazards.unsignaled_queues[p.index()] = false;
+                }
+                Err(err) => {
+                    if p != consumer {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+        Ok(extra_waits)
+    }
+
+    /// Best-effort seal across all queues (used on `drain_all` and `Drop`).
+    fn seal_all_unsignaled(&self) -> windows::core::Result<()> {
+        let mut hazards = self.hazards.lock().unwrap_or_else(|e| e.into_inner());
+        let mut first_err = None;
+        for p in QueueKind::ALL {
+            let needs = hazards.is_queue_unsignaled(p)
+                || match p {
+                    QueueKind::Direct => self
+                        .direct_sent
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .unsignaled_queue
+                        .is_some(),
+                    QueueKind::Compute => {
+                        let e = self.compute.lock().unwrap_or_else(|e| e.into_inner());
+                        e.needs_seal || !e.abandoned.is_empty()
+                    }
+                    QueueKind::Copy => {
+                        let e = self.copy.lock().unwrap_or_else(|e| e.into_inner());
+                        e.needs_seal || !e.abandoned.is_empty()
+                    }
+                };
+            if !needs {
+                continue;
+            }
+            match self.try_seal_queue(p, None) {
+                Ok(Some(tok)) => hazards.seal_queue(tok),
+                Ok(None) => hazards.unsignaled_queues[p.index()] = false,
+                Err(err) => {
+                    if first_err.is_none() {
+                        first_err = Some(err);
+                    }
+                }
+            }
+        }
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
+    /// Atomically seals any un-signaled producers, checks cross-queue hazards for
+    /// `reads`/`writes`, inserts any required GPU-side `direct_queue->Wait(...)`,
+    /// invokes `execute` (which must only perform non-blocking
+    /// `direct_queue.ExecuteCommandLists`), signals `direct_fence`, and records the
+    /// Direct accesses in [`HazardTracker`].
     ///
-    /// Holding `self.hazards` across Wait + Execute + Signal + Record eliminates
-    /// TOCTOU races between concurrent threads submitting to Direct, Compute, and Copy.
+    /// Holding `self.hazards` across seal + Wait + Execute + Signal + Record
+    /// eliminates TOCTOU races between concurrent threads submitting to Direct,
+    /// Compute, and Copy.
     pub(crate) fn execute_direct_tracked<R>(
         &self,
         direct_queue: &ID3D12CommandQueue,
@@ -626,21 +951,52 @@ impl AsyncTimeline {
         execute: impl FnOnce() -> R,
     ) -> windows::core::Result<(R, TimelineToken, u32)> {
         let mut hazards = self.hazards.lock().unwrap_or_else(|e| e.into_inner());
-        let waits = if reads.is_empty() && writes.is_empty() {
+        let seal_waits = self.seal_unsignaled_producers_locked(
+            &mut hazards,
+            QueueKind::Direct,
+            Some(direct_queue),
+        )?;
+        let mut waits = if reads.is_empty() && writes.is_empty() {
             [0u64; 3]
         } else {
             hazards.deps_for(QueueKind::Direct, reads, writes)
         };
         let mut wait_count = 0u32;
         for q in [QueueKind::Compute, QueueKind::Copy] {
-            let val = waits[q.index()];
+            let val = waits[q.index()].max(seal_waits[q.index()]);
+            waits[q.index()] = val;
             if val > 0 {
-                self.wait_on_gpu(direct_queue, TimelineToken { queue: q, value: val })?;
+                self.wait_on_gpu_for(
+                    QueueKind::Direct,
+                    direct_queue,
+                    TimelineToken {
+                        queue: q,
+                        value: val,
+                    },
+                )?;
                 wait_count += 1;
             }
         }
         let result = execute();
-        let token = self.signal_direct(direct_queue)?;
+        let token = match self.signal_direct(direct_queue) {
+            Ok(tok) => {
+                if hazards.is_queue_unsignaled(QueueKind::Direct) {
+                    hazards.seal_queue(tok);
+                }
+                tok
+            }
+            Err(err) => {
+                // `execute()` already ran on `direct_queue`: retain the queue handle
+                // and mark Direct unsignaled so any cross-queue consumer must seal and
+                // wait for this Direct work before proceeding.
+                self.direct_sent
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .unsignaled_queue = Some(direct_queue.clone());
+                hazards.mark_unsignaled(QueueKind::Direct, reads, writes);
+                return Err(err);
+            }
+        };
         if !reads.is_empty() || !writes.is_empty() {
             let completed = self.completed_snapshot();
             hazards.record_submission(token, reads, writes);
@@ -663,6 +1019,8 @@ impl AsyncTimeline {
     /// Blocks the calling CPU thread until `token` finishes on the GPU (only for
     /// final readback consumption, landing, or shutdown — never on the submit path).
     pub(crate) fn wait_cpu(&self, token: TimelineToken) -> windows::core::Result<()> {
+        #[cfg(test)]
+        FaultInject::take(&self.faults.fail_wait_cpu[token.queue.index()])?;
         let fence = self.fence_for(token.queue);
         let blocked = wait_fence_cpu(fence, token.value)?;
         if blocked {
@@ -673,7 +1031,8 @@ impl AsyncTimeline {
         Ok(())
     }
 
-    /// Reclaims completed command slots on both Compute and Copy queues without blocking.
+    /// Reclaims completed command slots on both Compute and Copy queues without
+    /// blocking, and releases abandoned bounce resources whose fences have completed.
     pub(crate) fn reclaim(&self) {
         self.compute
             .lock()
@@ -683,11 +1042,18 @@ impl AsyncTimeline {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .reclaim(&self.copy_fence);
+        let mut abandoned = self
+            .abandoned_resources
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        abandoned.retain(|entry| !entry.token.is_some_and(|tok| self.is_complete(tok)));
     }
 
-    /// Waits on CPU for all currently submitted Compute and Copy work and reclaims slots.
+    /// Seals any un-signaled work, waits on CPU for all currently submitted Compute
+    /// and Copy work, and reclaims slots.
     #[cfg(test)]
     pub(crate) fn drain_all(&self) -> windows::core::Result<()> {
+        self.seal_all_unsignaled()?;
         let comp_sent = self.compute.lock().unwrap_or_else(|e| e.into_inner()).sent;
         let copy_sent = self.copy.lock().unwrap_or_else(|e| e.into_inner()).sent;
         if comp_sent > 0 {
@@ -710,20 +1076,26 @@ impl AsyncTimeline {
             let mut engine = self.compute.lock().unwrap_or_else(|e| e.into_inner());
             engine.acquire_open(&self.device, &self.compute_fence)?
         };
-        let rec_res = record(&slot.list).and_then(|()| {
-            // SAFETY: The list was just opened and recorded by `record`.
-            unsafe { slot.list.Close() }
-        });
-        if let Err(err) = rec_res {
-            // Close best-effort before returning the unused slot to `idle`.
-            // SAFETY: Closing an abandoned open list before recycling.
-            let _ = unsafe { slot.list.Close() };
-            self.compute
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .idle
-                .push(slot);
-            return Err(err);
+        match record(&slot.list) {
+            Ok(()) => {
+                // SAFETY: The list was just opened and recorded by `record`.
+                if let Err(err) = unsafe { slot.list.Close() } {
+                    let mut engine = self.compute.lock().unwrap_or_else(|e| e.into_inner());
+                    engine.total_slots = engine.total_slots.saturating_sub(1);
+                    return Err(err);
+                }
+            }
+            Err(err) => {
+                // SAFETY: Closing an un-submitted open list before deciding whether to recycle it.
+                let closed = unsafe { slot.list.Close() }.is_ok();
+                let mut engine = self.compute.lock().unwrap_or_else(|e| e.into_inner());
+                if closed {
+                    engine.idle.push(slot);
+                } else {
+                    engine.total_slots = engine.total_slots.saturating_sub(1);
+                }
+                return Err(err);
+            }
         }
         Ok(PreparedCompute { slot })
     }
@@ -747,14 +1119,16 @@ impl AsyncTimeline {
         writes: &[usize],
         keep: Vec<ID3D12Resource>,
     ) -> windows::core::Result<TimelineToken> {
-        let token = self.execute_slot_tracked(
-            QueueKind::Compute,
-            prepared.slot,
-            explicit_deps,
-            reads,
-            writes,
-            keep,
-        )?;
+        let token = self
+            .execute_slot_tracked_detailed(
+                QueueKind::Compute,
+                prepared.slot,
+                explicit_deps,
+                reads,
+                writes,
+                keep,
+            )
+            .map_err(SubmitSlotError::into_error)?;
         STATS[ST_COMPUTE].fetch_add(1, Relaxed);
         Ok(token)
     }
@@ -784,25 +1158,53 @@ impl AsyncTimeline {
         keep: Vec<ID3D12Resource>,
         record: impl FnOnce(&ID3D12GraphicsCommandList) -> windows::core::Result<()>,
     ) -> windows::core::Result<TimelineToken> {
+        self.submit_copy_detailed(explicit_deps, reads, writes, keep, record)
+            .map_err(SubmitSlotError::into_error)
+    }
+
+    fn submit_copy_detailed(
+        &self,
+        explicit_deps: &[TimelineToken],
+        reads: &[usize],
+        writes: &[usize],
+        keep: Vec<ID3D12Resource>,
+        record: impl FnOnce(&ID3D12GraphicsCommandList) -> windows::core::Result<()>,
+    ) -> Result<TimelineToken, SubmitSlotError> {
         let slot = {
             let mut engine = self.copy.lock().unwrap_or_else(|e| e.into_inner());
-            engine.acquire_open(&self.device, &self.copy_fence)?
+            engine
+                .acquire_open(&self.device, &self.copy_fence)
+                .map_err(SubmitSlotError::BeforeExecute)?
         };
-        let rec_res = record(&slot.list).and_then(|()| {
-            // SAFETY: The list was opened and recorded by `record`.
-            unsafe { slot.list.Close() }
-        });
-        if let Err(err) = rec_res {
-            // SAFETY: Closing an abandoned list before returning it to `idle`.
-            let _ = unsafe { slot.list.Close() };
-            self.copy
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .idle
-                .push(slot);
-            return Err(err);
+        match record(&slot.list) {
+            Ok(()) => {
+                // SAFETY: The list was opened and recorded by `record`.
+                if let Err(err) = unsafe { slot.list.Close() } {
+                    let mut engine = self.copy.lock().unwrap_or_else(|e| e.into_inner());
+                    engine.total_slots = engine.total_slots.saturating_sub(1);
+                    return Err(SubmitSlotError::BeforeExecute(err));
+                }
+            }
+            Err(err) => {
+                // SAFETY: Closing an un-submitted open list before deciding whether to recycle it.
+                let closed = unsafe { slot.list.Close() }.is_ok();
+                let mut engine = self.copy.lock().unwrap_or_else(|e| e.into_inner());
+                if closed {
+                    engine.idle.push(slot);
+                } else {
+                    engine.total_slots = engine.total_slots.saturating_sub(1);
+                }
+                return Err(SubmitSlotError::BeforeExecute(err));
+            }
         }
-        self.execute_slot_tracked(QueueKind::Copy, slot, explicit_deps, reads, writes, keep)
+        self.execute_slot_tracked_detailed(
+            QueueKind::Copy,
+            slot,
+            explicit_deps,
+            reads,
+            writes,
+            keep,
+        )
     }
 
     /// Copies staging/upload ranges into a pooled VRAM bounce buffer on the async
@@ -834,7 +1236,7 @@ impl AsyncTimeline {
             }
         }
         let writes = [resource_key(&bounce)];
-        let copy_res = self.submit_copy(&[], &reads, &writes, keep, |list| {
+        let copy_res = self.submit_copy_detailed(&[], &reads, &writes, keep, |list| {
             let mut dst_at = 0u64;
             for &(src, src_offset, bytes) in ranges {
                 // SAFETY: Open copy list; live staging/upload source and VRAM bounce
@@ -849,18 +1251,30 @@ impl AsyncTimeline {
         });
         let copy_token = match copy_res {
             Ok(tok) => tok,
-            Err(err) => {
-                tracing::warn!(error = %err, "async copy queue upload failed; falling back to direct queue");
+            Err(SubmitSlotError::BeforeExecute(err)) => {
+                tracing::warn!(error = %err, "async copy queue upload failed before execute; falling back to direct queue");
                 self.push_bounce(PooledBounce {
                     buffer: bounce,
                     size: bounce_size,
                 });
                 return None;
             }
+            Err(SubmitSlotError::SignalFailedAfterExecute(err)) => {
+                // `ExecuteCommandLists` already ran on Copy; `bounce` is pinned in
+                // `copy.abandoned._keep` and MUST NOT be recycled into `self.bounces`.
+                tracing::warn!(error = %err, "async copy queue upload signal failed after execute; pinning bounce and falling back to direct queue");
+                return None;
+            }
         };
-        if let Err(err) = self.wait_on_gpu(direct_queue, copy_token) {
+        if let Err(err) = self.wait_on_gpu_for(QueueKind::Direct, direct_queue, copy_token) {
             tracing::warn!(error = %err, "direct queue GPU wait on async copy failed; waiting on CPU");
-            let _ = self.wait_cpu(copy_token);
+            if let Err(cpu_err) = self.wait_cpu(copy_token) {
+                // Neither GPU wait nor CPU wait confirmed completion: do NOT expose
+                // `bounce` to Direct and do NOT recycle it into `self.bounces`.
+                tracing::warn!(error = %cpu_err, "CPU wait fallback on async copy failed; abandoning bounce and falling back to direct queue");
+                self.abandon_resource(Some(copy_token), bounce);
+                return None;
+            }
         }
         let mut dst_at = 0u64;
         let mut payload_bytes = 0u64;
@@ -875,18 +1289,32 @@ impl AsyncTimeline {
             buffer: bounce,
             size: bounce_size,
             copy_token,
+            direct_token: None,
         })
     }
 
-    /// Returns a VRAM bounce buffer to the pool once Direct has finished reading it.
+    /// Returns a VRAM bounce buffer to the pool only once both its Copy producer
+    /// and any tracked Direct consumer have proven GPU completion.
     pub(crate) fn return_bounce(&self, handle: BounceHandle) {
-        if !self.is_complete(handle.copy_token) {
-            let _ = self.wait_cpu(handle.copy_token);
+        let copy_ok =
+            self.is_complete(handle.copy_token) || self.wait_cpu(handle.copy_token).is_ok();
+        let direct_ok = match handle.direct_token {
+            Some(dtok) => self.is_complete(dtok) || self.wait_cpu(dtok).is_ok(),
+            None => true,
+        };
+        if copy_ok && direct_ok {
+            self.push_bounce(PooledBounce {
+                buffer: handle.buffer,
+                size: handle.size,
+            });
+        } else {
+            let pending = if !direct_ok {
+                handle.direct_token
+            } else {
+                Some(handle.copy_token)
+            };
+            self.abandon_resource(pending, handle.buffer);
         }
-        self.push_bounce(PooledBounce {
-            buffer: handle.buffer,
-            size: handle.size,
-        });
     }
 
     /// Submits a VRAM -> shared/readback DMA copy batch on the async copy queue.
@@ -959,6 +1387,16 @@ impl AsyncTimeline {
         }
     }
 
+    fn abandon_resource(&self, token: Option<TimelineToken>, resource: ID3D12Resource) {
+        self.abandoned_resources
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(AbandonedResource {
+                token,
+                _resource: resource,
+            });
+    }
+
     fn completed_snapshot(&self) -> [u64; 3] {
         // SAFETY: Lock-free queries on live fences.
         unsafe {
@@ -970,10 +1408,10 @@ impl AsyncTimeline {
         }
     }
 
-    /// Atomically queries `hazards`, emits GPU-side `Queue->Wait` calls, executes
-    /// and signals `target`'s queue, and records `reads`/`writes` under the same
-    /// `hazards` lock (lock order: `hazards` -> `engine`).
-    fn execute_slot_tracked(
+    /// Atomically seals un-signaled producers, queries `hazards`, emits GPU-side
+    /// `Queue->Wait` calls, executes and signals `target`'s queue, and records
+    /// `reads`/`writes` under the same `hazards` lock (lock order: `hazards` -> `engine`).
+    fn execute_slot_tracked_detailed(
         &self,
         target: QueueKind,
         slot: CommandSlot,
@@ -981,18 +1419,34 @@ impl AsyncTimeline {
         reads: &[usize],
         writes: &[usize],
         keep: Vec<ID3D12Resource>,
-    ) -> windows::core::Result<TimelineToken> {
+    ) -> Result<TimelineToken, SubmitSlotError> {
         let (engine_mutex, own_fence) = match target {
             QueueKind::Compute => (&self.compute, &self.compute_fence),
             QueueKind::Copy => (&self.copy, &self.copy_fence),
             QueueKind::Direct => {
-                return Err(windows::core::Error::from(
+                return Err(SubmitSlotError::BeforeExecute(windows::core::Error::from(
                     windows::Win32::Foundation::E_INVALIDARG,
-                ));
+                )));
             }
         };
         let mut hazards = self.hazards.lock().unwrap_or_else(|e| e.into_inner());
+        let seal_waits = match self.seal_unsignaled_producers_locked(&mut hazards, target, None) {
+            Ok(w) => w,
+            Err(err) => {
+                // A producing queue could not be sealed: return the un-executed slot
+                // to `idle` and refuse to run the consumer ahead of its producer.
+                engine_mutex
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .idle
+                    .push(slot);
+                return Err(SubmitSlotError::BeforeExecute(err));
+            }
+        };
         let mut waits = hazards.deps_for(target, reads, writes);
+        for q in QueueKind::ALL {
+            waits[q.index()] = waits[q.index()].max(seal_waits[q.index()]);
+        }
         for dep in explicit_deps {
             if dep.queue != target && dep.value > 0 {
                 let idx = dep.queue.index();
@@ -1001,17 +1455,16 @@ impl AsyncTimeline {
         }
         waits[target.index()] = 0;
 
-        let token = {
+        let (token, sealed_self) = {
             let mut engine = engine_mutex.lock().unwrap_or_else(|e| e.into_inner());
             // Insert all GPU-side `ConsumerQueue->Wait` calls strictly BEFORE `ExecuteCommandLists`.
             for q in QueueKind::ALL {
                 let val = waits[q.index()];
                 if q != target && val > 0 {
                     let producer_fence = self.fence_for(q);
-                    // SAFETY: Same-device fence wait on `engine.queue` before list execution.
-                    if let Err(err) = unsafe { engine.queue.Wait(producer_fence, val) } {
+                    if let Err(err) = self.raw_wait(target, &engine.queue, producer_fence, val) {
                         engine.idle.push(slot);
-                        return Err(err);
+                        return Err(SubmitSlotError::BeforeExecute(err));
                     }
                     STATS[ST_GPU_WAITS].fetch_add(1, Relaxed);
                 }
@@ -1020,39 +1473,55 @@ impl AsyncTimeline {
                 Ok(list) => list,
                 Err(err) => {
                     engine.idle.push(slot);
-                    return Err(err);
+                    return Err(SubmitSlotError::BeforeExecute(err));
                 }
             };
             let value = engine.sent + 1;
             // SAFETY: `cmd_list` is closed and its referenced resources are held in `keep`
             // until `own_fence` reaches `value`.
-            let signal_res = unsafe {
+            unsafe {
                 engine.queue.ExecuteCommandLists(&[Some(cmd_list)]);
-                engine.queue.Signal(own_fence, value)
-            };
-            if let Err(err) = signal_res {
-                // Keep `slot` and `keep` pinned in `abandoned` (never waited on via
-                // `SetEventOnCompletion` and never popped by `acquire_open`) and do
-                // not advance `engine.sent`.
+            }
+            if let Err(err) = self.raw_signal(target, &engine.queue, own_fence, value) {
+                // Keep `slot` (including its `ID3D12CommandAllocator`) and `keep` pinned
+                // in `abandoned`, mark `needs_seal`, do not advance `engine.sent`, and
+                // record the un-signaled producer accesses in `hazards`.
                 engine.abandoned.push(InFlight {
                     fence_value: 0,
                     slot,
                     _keep: keep,
                 });
-                return Err(err);
+                engine.needs_seal = true;
+                drop(engine);
+                hazards.mark_unsignaled(target, reads, writes);
+                return Err(SubmitSlotError::SignalFailedAfterExecute(err));
             }
             engine.sent = value;
+            let sealed_self = engine.needs_seal || !engine.abandoned.is_empty();
+            if sealed_self {
+                engine.needs_seal = false;
+                for mut prev in std::mem::take(&mut engine.abandoned) {
+                    prev.fence_value = value;
+                    engine.in_flight.push_back(prev);
+                }
+            }
             engine.in_flight.push_back(InFlight {
                 fence_value: value,
                 slot,
                 _keep: keep,
             });
-            TimelineToken {
-                queue: target,
-                value,
-            }
+            (
+                TimelineToken {
+                    queue: target,
+                    value,
+                },
+                sealed_self,
+            )
         };
 
+        if sealed_self || hazards.is_queue_unsignaled(target) {
+            hazards.seal_queue(token);
+        }
         if !reads.is_empty() || !writes.is_empty() {
             let completed = self.completed_snapshot();
             hazards.record_submission(token, reads, writes);
@@ -1084,6 +1553,9 @@ impl AsyncTimeline {
 
 impl Drop for AsyncTimeline {
     fn drop(&mut self) {
+        // Attempt to seal any previously un-signaled batches so GPU completion can
+        // be verified before dropping command allocators and referenced resources.
+        let _ = self.seal_all_unsignaled();
         let comp_sent = self.compute.lock().unwrap_or_else(|e| e.into_inner()).sent;
         let copy_sent = self.copy.lock().unwrap_or_else(|e| e.into_inner()).sent;
         if comp_sent > 0 {
@@ -1093,6 +1565,43 @@ impl Drop for AsyncTimeline {
             let _ = wait_fence_cpu(&self.copy_fence, copy_sent);
         }
         self.reclaim();
+        // SAFETY: Plain device removal status query.
+        let device_alive = unsafe { self.device.GetDeviceRemovedReason().is_ok() };
+        if device_alive {
+            // Never destroy an uncompleted command allocator or referenced resource
+            // while the device is still alive and may still be executing commands.
+            for engine_mutex in [&self.compute, &self.copy] {
+                let mut engine = engine_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                if !engine.in_flight.is_empty() {
+                    let leaked = std::mem::take(&mut engine.in_flight);
+                    tracing::error!(
+                        count = leaked.len(),
+                        "retaining uncompleted async command slots on live device drop"
+                    );
+                    std::mem::forget(leaked);
+                }
+                if !engine.abandoned.is_empty() {
+                    let leaked = std::mem::take(&mut engine.abandoned);
+                    tracing::error!(
+                        count = leaked.len(),
+                        "retaining unsealed async command slots on live device drop"
+                    );
+                    std::mem::forget(leaked);
+                }
+            }
+            let mut abandoned_res = self
+                .abandoned_resources
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !abandoned_res.is_empty() {
+                let leaked = std::mem::take(&mut *abandoned_res);
+                tracing::error!(
+                    count = leaked.len(),
+                    "retaining unconfirmed async resources on live device drop"
+                );
+                std::mem::forget(leaked);
+            }
+        }
     }
 }
 
@@ -1183,12 +1692,18 @@ mod tests {
 
         // Copy writes A at copy=1, B at copy=2.
         tracker.record_submission(
-            TimelineToken { queue: QueueKind::Copy, value: 1 },
+            TimelineToken {
+                queue: QueueKind::Copy,
+                value: 1,
+            },
             &[],
             &[buf_a],
         );
         tracker.record_submission(
-            TimelineToken { queue: QueueKind::Copy, value: 2 },
+            TimelineToken {
+                queue: QueueKind::Copy,
+                value: 2,
+            },
             &[],
             &[buf_b],
         );
@@ -1211,7 +1726,10 @@ mod tests {
 
         // Compute reads A and writes C at compute=5.
         tracker.record_submission(
-            TimelineToken { queue: QueueKind::Compute, value: 5 },
+            TimelineToken {
+                queue: QueueKind::Compute,
+                value: 5,
+            },
             &[buf_a],
             &[buf_c],
         );
@@ -1234,14 +1752,14 @@ mod tests {
 
         // After Direct writes A at direct=7, old Compute read is superseded.
         tracker.record_submission(
-            TimelineToken { queue: QueueKind::Direct, value: 7 },
+            TimelineToken {
+                queue: QueueKind::Direct,
+                value: 7,
+            },
             &[],
             &[buf_a],
         );
-        assert_eq!(
-            tracker.deps_for(QueueKind::Copy, &[buf_a], &[]),
-            [7, 0, 0]
-        );
+        assert_eq!(tracker.deps_for(QueueKind::Copy, &[buf_a], &[]), [7, 0, 0]);
         assert_eq!(
             tracker.deps_for(QueueKind::Compute, &[], &[buf_a]),
             [7, 0, 0]
@@ -1260,7 +1778,9 @@ mod tests {
         assert!(!is_copy_legal_state(D3D12_RESOURCE_STATE_RENDER_TARGET));
 
         assert!(is_compute_legal_state(D3D12_RESOURCE_STATE_COMMON));
-        assert!(is_compute_legal_state(D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+        assert!(is_compute_legal_state(
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+        ));
         assert!(is_compute_legal_state(
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
         ));
@@ -1288,23 +1808,27 @@ mod tests {
 
     /// Returns `(adapter_name, is_software)` for `device`.
     fn adapter_info(device: &ID3D12Device) -> (String, bool) {
+        let warp_env = std::env::var_os("VICTORY_D3D12_WARP").is_some_and(|v| v == "1");
         // SAFETY: Plain DXGI adapter query by LUID.
         unsafe {
             let luid = device.GetAdapterLuid();
             let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             else {
-                return ("unknown".into(), false);
+                return ("unknown".into(), true);
             };
             let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(luid) else {
-                return ("unknown".into(), false);
+                return ("unknown".into(), true);
             };
             let Ok(desc) = adapter.GetDesc1() else {
-                return ("unknown".into(), false);
+                return ("unknown".into(), true);
             };
             let name = String::from_utf16_lossy(&desc.Description)
                 .trim_end_matches('\0')
                 .to_owned();
-            let sw = (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0;
+            let sw = warp_env
+                || (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0
+                || desc.VendorId == 0x1414
+                || name.to_ascii_lowercase().contains("basic render");
             (name, sw)
         }
     }
@@ -1545,7 +2069,8 @@ void main(uint3 id : SV_DispatchThreadID) {
                 up.Map(0, None, Some(&mut ptr)).unwrap();
                 let slice = std::slice::from_raw_parts_mut(ptr.cast::<u32>(), WORDS as usize);
                 for (i, slot) in slice.iter_mut().enumerate() {
-                    *slot = ((f as u32 + 1) * 0x0101_0001u32) ^ (i as u32).wrapping_mul(0x9E37_79B9);
+                    *slot =
+                        ((f as u32 + 1) * 0x0101_0001u32) ^ (i as u32).wrapping_mul(0x9E37_79B9);
                 }
                 up.Unmap(0, None);
             }
@@ -1699,7 +2224,8 @@ void main(uint3 id : SV_DispatchThreadID) {
                 readbacks[f].Map(0, None, Some(&mut ptr)).unwrap();
                 let out = std::slice::from_raw_parts(ptr.cast::<u32>(), WORDS as usize);
                 for (i, &actual) in out.iter().enumerate() {
-                    let init = ((f as u32 + 1) * 0x0101_0001u32) ^ (i as u32).wrapping_mul(0x9E37_79B9);
+                    let init =
+                        ((f as u32 + 1) * 0x0101_0001u32) ^ (i as u32).wrapping_mul(0x9E37_79B9);
                     let mid = cpu_transform(init, mul_c, add_c, 3);
                     let expected = cpu_transform(mid, mul_d, add_d, 2);
                     assert_eq!(
@@ -1712,7 +2238,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
 
         timeline.drain_all().unwrap();
-        assert_zero_d3d12_debug_issues(device, "multi_flight_copy_compute_direct_readback_ordering");
+        assert_zero_d3d12_debug_issues(
+            device,
+            "multi_flight_copy_compute_direct_readback_ordering",
+        );
         eprintln!(
             "[async_timeline] multi_flight_copy_compute_direct_readback_ordering PASS \
              (adapter={adapter_name}, sw={is_sw}, flights={FLIGHTS}, gpu_waits={gpu_waits_inserted}, cpu_waits_in_submit_loop=0)"
@@ -2125,9 +2654,14 @@ void main(uint3 id : SV_DispatchThreadID) {
         // SAFETY: `cmp_tok` has completed; `differs_ptr` holds `PIECES` u32 flags.
         let flagged: Vec<u32> = unsafe {
             let slice = std::slice::from_raw_parts(differs_ptr.cast::<u32>(), PIECES as usize);
-            (0..PIECES).filter(|&p| (slice[p as usize] & 1) != 0).collect()
+            (0..PIECES)
+                .filter(|&p| (slice[p as usize] & 1) != 0)
+                .collect()
         };
-        assert_eq!(flagged, mutated, "CARD_COMPARE on async compute must flag exact mutated pieces");
+        assert_eq!(
+            flagged, mutated,
+            "CARD_COMPARE on async compute must flag exact mutated pieces"
+        );
 
         let rb_copies: Vec<(&ID3D12Resource, u64, u64, u64)> = flagged
             .iter()
@@ -2151,7 +2685,10 @@ void main(uint3 id : SV_DispatchThreadID) {
             let mut ptr = std::ptr::null_mut();
             readback.Map(0, None, Some(&mut ptr)).unwrap();
             let bytes = std::slice::from_raw_parts(ptr.cast::<u8>(), PIECE * 4);
-            assert!(bytes.iter().all(|&b| b == 0xA5), "readback pieces must match 0xA5 patch");
+            assert!(
+                bytes.iter().all(|&b| b == 0xA5),
+                "readback pieces must match 0xA5 patch"
+            );
             readback.Unmap(0, None);
         }
 
@@ -2187,9 +2724,14 @@ void main(uint3 id : SV_DispatchThreadID) {
         // SAFETY: `cmp_tok2` has completed.
         let flagged2: Vec<u32> = unsafe {
             let slice = std::slice::from_raw_parts(differs_ptr.cast::<u32>(), PIECES as usize);
-            (0..PIECES).filter(|&p| (slice[p as usize] & 1) != 0).collect()
+            (0..PIECES)
+                .filter(|&p| (slice[p as usize] & 1) != 0)
+                .collect()
         };
-        assert!(flagged2.is_empty(), "unchanged buffer must flag 0 pieces on second compare");
+        assert!(
+            flagged2.is_empty(),
+            "unchanged buffer must flag 0 pieces on second compare"
+        );
 
         timeline.drain_all().unwrap();
         assert_zero_d3d12_debug_issues(device, "async_card_compare_matches_direct_bit_for_bit");
@@ -2210,6 +2752,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// 2) Multi-queue `AsyncTimeline` (Copy DMA + Async Compute + Direct overlapped via
     ///    GPU-side `ID3D12Fence` handoffs).
     #[test]
+    #[ignore = "hardware multi-queue overlap benchmark"]
     fn benchmark_multi_queue_overlap_vs_serialized_direct() {
         let Some(host) = crate::host::host() else {
             return;
@@ -2322,16 +2865,7 @@ void main(uint3 id : SV_DispatchThreadID) {
                 D3D12_RESOURCE_FLAG_NONE,
                 D3D12_RESOURCE_STATE_COPY_DEST,
             );
-            (
-                dq,
-                df,
-                dqh.unwrap(),
-                cqh.unwrap(),
-                cpqh,
-                d_rb,
-                c_rb,
-                cp_rb,
-            )
+            (dq, df, dqh.unwrap(), cqh.unwrap(), cpqh, d_rb, c_rb, cp_rb)
         };
 
         // Allocate per-flight independent resources (upload -> VRAM bounce, Direct src/dst,
@@ -2536,7 +3070,12 @@ void main(uint3 id : SV_DispatchThreadID) {
                     slot.list
                         .CopyBufferRegion(&bounce_bufs[f], 0, &up_bufs[f], 0, upload_bytes);
                     // 2) Direct compute workload
-                    let params = [direct_words, 1_664_525u32, 1_013_904_223u32 + f as u32, direct_rounds];
+                    let params = [
+                        direct_words,
+                        1_664_525u32,
+                        1_013_904_223u32 + f as u32,
+                        direct_rounds,
+                    ];
                     slot.list.SetComputeRootSignature(&xform_root);
                     slot.list.SetPipelineState(&xform_pso);
                     slot.list
@@ -2556,8 +3095,10 @@ void main(uint3 id : SV_DispatchThreadID) {
                         .SetComputeRootShaderResourceView(1, cmp_bufs[f].GetGPUVirtualAddress());
                     slot.list
                         .SetComputeRootUnorderedAccessView(2, cmp_hashes[f].GetGPUVirtualAddress());
-                    slot.list
-                        .SetComputeRootUnorderedAccessView(3, cmp_differs[f].GetGPUVirtualAddress());
+                    slot.list.SetComputeRootUnorderedAccessView(
+                        3,
+                        cmp_differs[f].GetGPUVirtualAddress(),
+                    );
                     for _ in 0..cmp_reps {
                         slot.list.Dispatch(cmp_pieces, 1, 1);
                     }
@@ -2570,11 +3111,8 @@ void main(uint3 id : SV_DispatchThreadID) {
                         slot.list
                             .CopyBufferRegion(&direct_rb_check[f], 0, &direct_dst[f], 0, 64);
                     }
-                    slot.list.EndQuery(
-                        &direct_qh,
-                        D3D12_QUERY_TYPE_TIMESTAMP,
-                        (f * 2 + 1) as u32,
-                    );
+                    slot.list
+                        .EndQuery(&direct_qh, D3D12_QUERY_TYPE_TIMESTAMP, (f * 2 + 1) as u32);
                     slot.list.ResolveQueryData(
                         &direct_qh,
                         D3D12_QUERY_TYPE_TIMESTAMP,
@@ -2587,16 +3125,21 @@ void main(uint3 id : SV_DispatchThreadID) {
                     direct_queue.ExecuteCommandLists(&[Some(slot.list.cast().unwrap())]);
                 }
                 direct_fence_val += 1;
-                direct_queue.Signal(&direct_fence, direct_fence_val).unwrap();
+                direct_queue
+                    .Signal(&direct_fence, direct_fence_val)
+                    .unwrap();
             }
             wait_fence_cpu(&direct_fence, direct_fence_val).unwrap();
             let s_wall = t0.elapsed().as_secs_f64() * 1000.0;
             let s_ts = read_timestamps(&direct_ts_rb, flights * 2);
-            let s_gpu = (s_ts[flights * 2 - 1].saturating_sub(s_ts[0]) as f64 / direct_freq) * 1000.0;
+            let s_gpu =
+                (s_ts[flights * 2 - 1].saturating_sub(s_ts[0]) as f64 / direct_freq) * 1000.0;
             // SAFETY: `direct_fence_val` completed; reading 1 dword checksum.
             let serial_checksum = unsafe {
                 let mut ptr = std::ptr::null_mut();
-                direct_rb_check[flights - 1].Map(0, None, Some(&mut ptr)).unwrap();
+                direct_rb_check[flights - 1]
+                    .Map(0, None, Some(&mut ptr))
+                    .unwrap();
                 let v = ptr.cast::<u32>().read();
                 direct_rb_check[flights - 1].Unmap(0, None);
                 v
@@ -2610,8 +3153,14 @@ void main(uint3 id : SV_DispatchThreadID) {
             let cal_cp = copy_freq.map(|f| calibrate_us(&copy_queue, f));
 
             let t1 = Instant::now();
-            let mut last_copy_tok = TimelineToken { queue: QueueKind::Copy, value: 0 };
-            let mut last_comp_tok = TimelineToken { queue: QueueKind::Compute, value: 0 };
+            let mut last_copy_tok = TimelineToken {
+                queue: QueueKind::Copy,
+                value: 0,
+            };
+            let mut last_comp_tok = TimelineToken {
+                queue: QueueKind::Compute,
+                value: 0,
+            };
 
             for f in 0..flights {
                 // 1) Copy Queue: DMA upload UPLOAD -> bounce_bufs[f] concurrently with Direct & Compute!
@@ -2718,7 +3267,12 @@ void main(uint3 id : SV_DispatchThreadID) {
                     slot.list.Reset(&slot.allocator, None).unwrap();
                     slot.list
                         .EndQuery(&direct_qh, D3D12_QUERY_TYPE_TIMESTAMP, (f * 2) as u32);
-                    let params = [direct_words, 1_664_525u32, 1_013_904_223u32 + f as u32, direct_rounds];
+                    let params = [
+                        direct_words,
+                        1_664_525u32,
+                        1_013_904_223u32 + f as u32,
+                        direct_rounds,
+                    ];
                     slot.list.SetComputeRootSignature(&xform_root);
                     slot.list.SetPipelineState(&xform_pso);
                     slot.list
@@ -2737,11 +3291,8 @@ void main(uint3 id : SV_DispatchThreadID) {
                         slot.list
                             .CopyBufferRegion(&direct_rb_check[f], 0, &direct_dst[f], 0, 64);
                     }
-                    slot.list.EndQuery(
-                        &direct_qh,
-                        D3D12_QUERY_TYPE_TIMESTAMP,
-                        (f * 2 + 1) as u32,
-                    );
+                    slot.list
+                        .EndQuery(&direct_qh, D3D12_QUERY_TYPE_TIMESTAMP, (f * 2 + 1) as u32);
                     slot.list.ResolveQueryData(
                         &direct_qh,
                         D3D12_QUERY_TYPE_TIMESTAMP,
@@ -2762,7 +3313,9 @@ void main(uint3 id : SV_DispatchThreadID) {
             direct_fence_val += 1;
             // SAFETY: Valid final fence signal on Direct queue.
             unsafe {
-                direct_queue.Signal(&direct_fence, direct_fence_val).unwrap();
+                direct_queue
+                    .Signal(&direct_fence, direct_fence_val)
+                    .unwrap();
             }
             wait_fence_cpu(&direct_fence, direct_fence_val).unwrap();
             let o_wall = t1.elapsed().as_secs_f64() * 1000.0;
@@ -2806,7 +3359,9 @@ void main(uint3 id : SV_DispatchThreadID) {
             // SAFETY: Final fence completed; verify checksum parity.
             let overlap_checksum = unsafe {
                 let mut ptr = std::ptr::null_mut();
-                direct_rb_check[flights - 1].Map(0, None, Some(&mut ptr)).unwrap();
+                direct_rb_check[flights - 1]
+                    .Map(0, None, Some(&mut ptr))
+                    .unwrap();
                 let v = ptr.cast::<u32>().read();
                 direct_rb_check[flights - 1].Unmap(0, None);
                 v
@@ -2842,7 +3397,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         let gpu_speedup = s_gpu_avg / o_union_avg.max(1e-6);
 
         timeline.drain_all().unwrap();
-        assert_zero_d3d12_debug_issues(device, "benchmark_multi_queue_overlap_vs_serialized_direct");
+        assert_zero_d3d12_debug_issues(
+            device,
+            "benchmark_multi_queue_overlap_vs_serialized_direct",
+        );
 
         eprintln!(
             "[async_timeline] BENCHMARK (adapter={adapter_name}, sw={is_sw}, flights={flights}, upload={} MiB/flight, copy_ts={}):\n  \
@@ -2985,7 +3543,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
 
         timeline.drain_all().unwrap();
-        assert_zero_d3d12_debug_issues(device, "host_async_bounce_and_prepared_compute_integration");
+        assert_zero_d3d12_debug_issues(
+            device,
+            "host_async_bounce_and_prepared_compute_integration",
+        );
         eprintln!(
             "[async_timeline] host_async_bounce_and_prepared_compute_integration PASS \
              (adapter={adapter_name}, sw={is_sw}, 0 debug issues)"
@@ -3000,13 +3561,13 @@ void main(uint3 id : SV_DispatchThreadID) {
             return;
         };
         // SAFETY: Plain fence creation on live test device.
-        let fence: ID3D12Fence = unsafe {
-            host.device
-                .CreateFence(0, D3D12_FENCE_FLAG_NONE)
-                .unwrap()
-        };
+        let fence: ID3D12Fence =
+            unsafe { host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap() };
         let err = wait_fence_cpu(&fence, u64::MAX);
-        assert!(err.is_err(), "u64::MAX fence wait must return Err immediately");
+        assert!(
+            err.is_err(),
+            "u64::MAX fence wait must return Err immediately"
+        );
     }
 
     /// Multi-threaded stress test proving zero TOCTOU hazard between a Direct
@@ -3220,6 +3781,588 @@ void main(uint3 id : SV_DispatchThreadID) {
         eprintln!(
             "[async_timeline] concurrent_direct_write_and_copy_readback_stress PASS \
              (adapter={adapter_name}, sw={is_sw}, rounds={ROUNDS}, 0 torn reads, 0 debug issues)"
+        );
+    }
+
+    /// Regression test for signal failure after producer `ExecuteCommandLists` on
+    /// an async queue:
+    /// 1) The producing command allocator and referenced resources stay retained in
+    ///    `abandoned` (never recycled or dropped prematurely) and `sent` does not
+    ///    advance to an un-signaled fence value.
+    /// 2) While the producer cannot be sealed, cross-queue consumers (`Copy` and
+    ///    `Direct`) fail before executing rather than reading ahead of the producer.
+    /// 3) Once a recovery `Signal` succeeds, the consumer automatically seals the
+    ///    producer, waits on the sealed fence, reads bit-exact producer output, and
+    ///    reclaims the retained allocator only after GPU completion (0 debug issues).
+    #[test]
+    fn signal_failure_retains_allocator_and_seals_for_consumer() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let device = &host.device;
+        clear_debug_queue(device);
+        let (adapter_name, is_sw) = adapter_info(device);
+
+        let timeline = AsyncTimeline::new(device).unwrap();
+        let (root, pso) = make_compute_pso(device, TRANSFORM_CS);
+
+        const WORDS: u32 = 4096;
+        const BYTES: u64 = (WORDS as u64) * 4;
+        let up = make_committed_buffer(
+            device,
+            D3D12_HEAP_TYPE_UPLOAD,
+            BYTES,
+            D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+        );
+        // SAFETY: Valid upload buffer mapping.
+        unsafe {
+            let mut ptr = std::ptr::null_mut();
+            up.Map(0, None, Some(&mut ptr)).unwrap();
+            let slice = std::slice::from_raw_parts_mut(ptr.cast::<u32>(), WORDS as usize);
+            for (i, w) in slice.iter_mut().enumerate() {
+                *w = (i as u32).wrapping_mul(17).wrapping_add(5);
+            }
+            up.Unmap(0, None);
+        }
+        let src = make_committed_buffer(
+            device,
+            D3D12_HEAP_TYPE_DEFAULT,
+            BYTES,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COMMON,
+        );
+        let dst = make_committed_buffer(
+            device,
+            D3D12_HEAP_TYPE_DEFAULT,
+            BYTES,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COMMON,
+        );
+        let rb = make_committed_buffer(
+            device,
+            D3D12_HEAP_TYPE_READBACK,
+            BYTES,
+            D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        );
+        let direct_q: ID3D12CommandQueue = unsafe {
+            device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .unwrap()
+        };
+
+        // Seed `src` via Copy queue.
+        let src_c = src.clone();
+        let up_c = up.clone();
+        let seed_tok = timeline
+            .submit_copy(
+                &[],
+                &[resource_key(&up)],
+                &[resource_key(&src)],
+                vec![up.clone(), src.clone()],
+                move |list| {
+                    // SAFETY: Valid seed copy into `COMMON` VRAM buffer.
+                    unsafe { list.CopyBufferRegion(&src_c, 0, &up_c, 0, BYTES) };
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(seed_tok.value >= 1);
+
+        // Inject a Signal failure on Compute AFTER `ExecuteCommandLists` runs.
+        timeline.faults.fail_signal[QueueKind::Compute.index()].store(1, Relaxed);
+        let src_va = unsafe { src.GetGPUVirtualAddress() };
+        let dst_va = unsafe { dst.GetGPUVirtualAddress() };
+        let r = root.clone();
+        let p = pso.clone();
+        let prod_res = timeline.submit_compute(
+            &[],
+            &[resource_key(&src)],
+            &[resource_key(&dst)],
+            vec![src.clone(), dst.clone()],
+            move |clist| {
+                let params = [WORDS, 1_664_525u32, 1_013_904_223u32, 16u32];
+                // SAFETY: Valid compute transform pass.
+                unsafe {
+                    clist.SetComputeRootSignature(&r);
+                    clist.SetPipelineState(&p);
+                    clist.SetComputeRoot32BitConstants(0, 4, params.as_ptr().cast(), 0);
+                    clist.SetComputeRootShaderResourceView(1, src_va);
+                    clist.SetComputeRootUnorderedAccessView(2, dst_va);
+                    clist.Dispatch(WORDS.div_ceil(64), 1, 1);
+                }
+                Ok(())
+            },
+        );
+        assert!(
+            prod_res.is_err(),
+            "injected compute signal failure must return Err"
+        );
+
+        // Allocator + resources must stay pinned in `abandoned`; `sent` must stay 0;
+        // `idle` must stay empty; `hazards` must mark Compute unsignaled.
+        {
+            let comp = timeline.compute.lock().unwrap();
+            assert_eq!(comp.sent, 0, "failed Signal must not advance sent fence");
+            assert_eq!(
+                comp.abandoned.len(),
+                1,
+                "allocator/keep must stay pinned in abandoned"
+            );
+            assert!(
+                comp.idle.is_empty(),
+                "abandoned allocator must never be recycled to idle"
+            );
+            assert!(comp.needs_seal);
+        }
+        assert!(
+            timeline
+                .hazards
+                .lock()
+                .unwrap()
+                .is_queue_unsignaled(QueueKind::Compute)
+        );
+
+        // While Compute's recovery Signal also fails, cross-queue consumers (Copy and Direct)
+        // must fail BEFORE executing rather than running ahead of the producing queue.
+        timeline.faults.fail_signal[QueueKind::Compute.index()].store(2, Relaxed);
+        let blocked_copy = timeline.submit_copy_readback(&[], &rb, &[(&dst, 0, 0, BYTES)]);
+        assert!(
+            blocked_copy.is_err(),
+            "Copy consumer must refuse to run while Compute producer cannot be sealed"
+        );
+        let mut direct_ran = false;
+        let blocked_direct =
+            timeline.execute_direct_tracked(&direct_q, &[resource_key(&dst)], &[], || {
+                direct_ran = true;
+            });
+        assert!(
+            blocked_direct.is_err(),
+            "Direct consumer must refuse to run while Compute producer cannot be sealed"
+        );
+        assert!(
+            !direct_ran,
+            "Direct execute closure must not run when producer sealing fails"
+        );
+        assert_eq!(
+            timeline.compute.lock().unwrap().abandoned.len(),
+            1,
+            "allocator must remain retained across failed recovery attempts"
+        );
+
+        // Once Compute's recovery Signal succeeds, the Copy consumer automatically seals
+        // Compute (moving `abandoned` -> `in_flight` at `seal_val`), waits on `compute_fence`,
+        // and reads back bit-exact output written by the previously un-signaled compute pass.
+        let rb_tok = timeline
+            .submit_copy_readback(&[], &rb, &[(&dst, 0, 0, BYTES)])
+            .unwrap();
+        assert!(
+            timeline.compute.lock().unwrap().abandoned.is_empty(),
+            "sealed abandoned slot must move into in_flight under the recovery fence"
+        );
+        assert!(
+            timeline.compute.lock().unwrap().sent >= 1,
+            "recovery seal must advance compute sent fence"
+        );
+        timeline.wait_cpu(rb_tok).unwrap();
+
+        // SAFETY: Copy readback completed on GPU; verify all `WORDS` bit-for-bit.
+        unsafe {
+            let mut ptr = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut ptr)).unwrap();
+            let got = std::slice::from_raw_parts(ptr.cast::<u32>(), WORDS as usize);
+            for (i, &actual) in got.iter().enumerate() {
+                let init = (i as u32).wrapping_mul(17).wrapping_add(5);
+                let expected = cpu_transform(init, 1_664_525u32, 1_013_904_223u32, 16);
+                assert_eq!(
+                    actual, expected,
+                    "word {i} mismatch after sealed signal failure"
+                );
+            }
+            rb.Unmap(0, None);
+        }
+
+        // After GPU completion and drain, the sealed allocator is reclaimed cleanly to `idle`.
+        timeline.drain_all().unwrap();
+        {
+            let comp = timeline.compute.lock().unwrap();
+            assert!(comp.in_flight.is_empty());
+            assert!(comp.abandoned.is_empty());
+            assert_eq!(
+                comp.idle.len(),
+                1,
+                "sealed allocator must reclaim only after completion"
+            );
+        }
+        assert_zero_d3d12_debug_issues(
+            device,
+            "signal_failure_retains_allocator_and_seals_for_consumer",
+        );
+        eprintln!(
+            "[async_timeline] signal_failure_retains_allocator_and_seals_for_consumer PASS \
+             (adapter={adapter_name}, sw={is_sw}, 0 debug issues)"
+        );
+    }
+
+    /// Regression test for Direct `signal_direct` failure after `execute()`:
+    /// verifies an async Copy consumer refuses to read Direct's output while Direct
+    /// cannot be sealed, then seals Direct and reads bit-exact bytes once Direct
+    /// recovers.
+    #[test]
+    fn direct_signal_failure_blocks_and_seals_async_consumer() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let device = &host.device;
+        clear_debug_queue(device);
+        let (adapter_name, is_sw) = adapter_info(device);
+
+        let timeline = AsyncTimeline::new(device).unwrap();
+        const WORDS: u32 = 4096;
+        const BYTES: u64 = (WORDS as u64) * 4;
+        let up = make_committed_buffer(
+            device,
+            D3D12_HEAP_TYPE_UPLOAD,
+            BYTES,
+            D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+        );
+        // SAFETY: Valid full mapping of upload buffer.
+        unsafe {
+            let mut ptr = std::ptr::null_mut();
+            up.Map(0, None, Some(&mut ptr)).unwrap();
+            let slice = std::slice::from_raw_parts_mut(ptr.cast::<u32>(), WORDS as usize);
+            for (i, w) in slice.iter_mut().enumerate() {
+                *w = 0xD1EC_0000u32 ^ (i as u32);
+            }
+            up.Unmap(0, None);
+        }
+        let vram = make_committed_buffer(
+            device,
+            D3D12_HEAP_TYPE_DEFAULT,
+            BYTES,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COMMON,
+        );
+        let rb = make_committed_buffer(
+            device,
+            D3D12_HEAP_TYPE_READBACK,
+            BYTES,
+            D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        );
+        // SAFETY: Dedicated Direct queue and single command list kept alive through completion.
+        let (direct_q, direct_alloc, direct_list): (
+            ID3D12CommandQueue,
+            ID3D12CommandAllocator,
+            ID3D12GraphicsCommandList,
+        ) = unsafe {
+            let q: ID3D12CommandQueue = device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .unwrap();
+            let a: ID3D12CommandAllocator = device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .unwrap();
+            let l: ID3D12GraphicsCommandList = device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &a, None)
+                .unwrap();
+            l.CopyBufferRegion(&vram, 0, &up, 0, BYTES);
+            l.Close().unwrap();
+            (q, a, l)
+        };
+        let cmd: ID3D12CommandList = direct_list.cast().unwrap();
+
+        // Inject Signal failure on Direct right after `ExecuteCommandLists`.
+        timeline.faults.fail_signal[QueueKind::Direct.index()].store(1, Relaxed);
+        let direct_res = timeline.execute_direct_tracked(
+            &direct_q,
+            &[resource_key(&up)],
+            &[resource_key(&vram)],
+            || {
+                // SAFETY: Closed Direct list with live buffers and allocator.
+                unsafe { direct_q.ExecuteCommandLists(&[Some(cmd)]) };
+            },
+        );
+        assert!(direct_res.is_err());
+        assert!(
+            timeline
+                .hazards
+                .lock()
+                .unwrap()
+                .is_queue_unsignaled(QueueKind::Direct)
+        );
+
+        // While Direct recovery Signal also fails, Copy consumer must fail before executing.
+        timeline.faults.fail_signal[QueueKind::Direct.index()].store(1, Relaxed);
+        assert!(
+            timeline
+                .submit_copy_readback(&[], &rb, &[(&vram, 0, 0, BYTES)])
+                .is_err()
+        );
+
+        // Once Direct recovery Signal succeeds, Copy seals Direct, waits on `direct_fence`,
+        // and reads back exact bytes written by Direct.
+        let rb_tok = timeline
+            .submit_copy_readback(&[], &rb, &[(&vram, 0, 0, BYTES)])
+            .unwrap();
+        timeline.wait_cpu(rb_tok).unwrap();
+        // SAFETY: Copy readback waited for sealed Direct completion; verify data.
+        unsafe {
+            let mut ptr = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut ptr)).unwrap();
+            let got = std::slice::from_raw_parts(ptr.cast::<u32>(), WORDS as usize);
+            for (i, &actual) in got.iter().enumerate() {
+                assert_eq!(actual, 0xD1EC_0000u32 ^ (i as u32), "word {i} mismatch");
+            }
+            rb.Unmap(0, None);
+        }
+
+        // Keep `direct_alloc` and `direct_list` explicitly alive until GPU completion.
+        timeline.drain_all().unwrap();
+        drop(direct_list);
+        drop(direct_alloc);
+        assert_zero_d3d12_debug_issues(
+            device,
+            "direct_signal_failure_blocks_and_seals_async_consumer",
+        );
+        eprintln!(
+            "[async_timeline] direct_signal_failure_blocks_and_seals_async_consumer PASS \
+             (adapter={adapter_name}, sw={is_sw}, 0 debug issues)"
+        );
+    }
+
+    /// Regression test for fallback paths and `submit_upload_bounce` error handling:
+    /// A) Copy `Signal` failure after `ExecuteCommandLists` falls back (`None`), never
+    ///    invokes `on_placed`, pins allocator+bounce in `copy.abandoned`, and NEVER
+    ///    recycles the active bounce buffer into `bounces`.
+    /// B) `wait_on_gpu` failure falls back to `wait_cpu` and still delivers bit-exact data.
+    /// C) Combined `wait_on_gpu` + `wait_cpu` failure falls back (`None`), never invokes
+    ///    `on_placed`, and pins the bounce buffer in `abandoned_resources` instead of pooling.
+    /// D) Direct fallback (`execute_direct_tracked` after an async Compute producer)
+    ///    inserts a GPU-side `Direct->Wait(compute_fence)` and observes exact producer writes.
+    #[test]
+    fn upload_bounce_fallback_on_signal_and_wait_failure_preserves_lifetime() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let device = &host.device;
+        clear_debug_queue(device);
+        let (adapter_name, is_sw) = adapter_info(device);
+
+        let timeline = AsyncTimeline::new(device).unwrap();
+        let (root, pso) = make_compute_pso(device, TRANSFORM_CS);
+        const WORDS: u32 = 4096;
+        const BYTES: u64 = (WORDS as u64) * 4;
+
+        let (staging, staging_ptr) = host.upload_buffer(BYTES).unwrap();
+        // SAFETY: Valid full mapping of staging upload buffer.
+        unsafe {
+            let slice = std::slice::from_raw_parts_mut(staging_ptr.cast::<u32>(), WORDS as usize);
+            for (i, w) in slice.iter_mut().enumerate() {
+                *w = 0xABCD_0000u32 ^ (i as u32);
+            }
+        }
+
+        // Subcase A: Copy `Signal` fails after `ExecuteCommandLists` inside `submit_upload_bounce`.
+        timeline.faults.fail_signal[QueueKind::Copy.index()].store(1, Relaxed);
+        let mut placed_a = false;
+        let res_a = timeline.submit_upload_bounce(
+            host,
+            host.queue(),
+            &[(&staging, 0, BYTES)],
+            |_, _, _| {
+                placed_a = true;
+            },
+        );
+        assert!(
+            res_a.is_none(),
+            "post-execute Copy Signal failure must fall back to Direct"
+        );
+        assert!(!placed_a, "on_placed must not fire when Copy Signal failed");
+        assert!(
+            timeline.bounces.lock().unwrap().is_empty(),
+            "in-flight bounce buffer must NOT be returned to reusable pool after Copy Signal failure"
+        );
+        assert_eq!(
+            timeline.copy.lock().unwrap().abandoned.len(),
+            1,
+            "Copy allocator and bounce resource must remain pinned in abandoned"
+        );
+        // Seal and reclaim cleanly before Subcase B.
+        timeline.drain_all().unwrap();
+        assert!(timeline.copy.lock().unwrap().abandoned.is_empty());
+
+        // Subcase B: `wait_on_gpu` fails -> `wait_cpu` fallback succeeds -> Direct reads exact bytes.
+        timeline.faults.fail_wait[QueueKind::Direct.index()].store(1, Relaxed);
+        let mut placed_offset = None;
+        let mut handle_b = timeline
+            .submit_upload_bounce(host, host.queue(), &[(&staging, 0, BYTES)], |_, _, off| {
+                placed_offset = Some(off);
+            })
+            .expect("wait_on_gpu failure with working wait_cpu must succeed via CPU wait fallback");
+        let off_b = placed_offset.unwrap();
+        let card_buf = host.uav_buffer(BYTES).unwrap();
+        let rb = host.read_back_buffer(BYTES).unwrap();
+        let dlist = host.new_list().unwrap();
+        // SAFETY: `bounce` was synchronized via `wait_cpu` fallback; copy bounce -> card_buf -> rb.
+        unsafe {
+            dlist
+                .list
+                .CopyBufferRegion(&card_buf, 0, handle_b.resource(), off_b, BYTES);
+            dlist.list.ResourceBarrier(&[crate::host::transition(
+                &card_buf,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            dlist.list.CopyBufferRegion(&rb, 0, &card_buf, 0, BYTES);
+        }
+        dlist.close();
+        let ((), dtok_b, _) = timeline
+            .execute_direct_tracked(
+                host.queue(),
+                &[resource_key(handle_b.resource())],
+                &[resource_key(&card_buf), resource_key(&rb)],
+                || {
+                    let _ = host.execute(&[&dlist]);
+                },
+            )
+            .unwrap();
+        handle_b.note_direct_consumer(dtok_b);
+        timeline.wait_cpu(dtok_b).unwrap();
+        // SAFETY: Direct copy to `rb` completed.
+        unsafe {
+            let mut ptr = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut ptr)).unwrap();
+            let got = std::slice::from_raw_parts(ptr.cast::<u32>(), WORDS as usize);
+            for (i, &w) in got.iter().enumerate() {
+                assert_eq!(
+                    w,
+                    0xABCD_0000u32 ^ (i as u32),
+                    "subcase B word {i} mismatch"
+                );
+            }
+            rb.Unmap(0, None);
+        }
+        timeline.return_bounce(handle_b);
+        assert_eq!(
+            timeline.bounces.lock().unwrap().len(),
+            1,
+            "completed bounce buffer must recycle cleanly into pool"
+        );
+
+        // Subcase C: Both `wait_on_gpu` AND `wait_cpu` fail -> must fall back (`None`),
+        // never fire `on_placed`, and pin bounce in `abandoned_resources` (not pool).
+        timeline.faults.fail_wait[QueueKind::Direct.index()].store(1, Relaxed);
+        timeline.faults.fail_wait_cpu[QueueKind::Copy.index()].store(1, Relaxed);
+        let mut placed_c = false;
+        let res_c = timeline.submit_upload_bounce(
+            host,
+            host.queue(),
+            &[(&staging, 0, BYTES)],
+            |_, _, _| {
+                placed_c = true;
+            },
+        );
+        assert!(
+            res_c.is_none(),
+            "double wait failure must fall back cleanly to Direct"
+        );
+        assert!(
+            !placed_c,
+            "on_placed must not fire when completion cannot be guaranteed"
+        );
+        assert!(
+            timeline.bounces.lock().unwrap().is_empty(),
+            "unconfirmed bounce must NOT be returned to reusable pool"
+        );
+        assert_eq!(
+            timeline.abandoned_resources.lock().unwrap().len(),
+            1,
+            "unconfirmed bounce must stay pinned in abandoned_resources"
+        );
+        // Once Copy completes and drains, abandoned resource is released cleanly.
+        timeline.drain_all().unwrap();
+        assert!(timeline.abandoned_resources.lock().unwrap().is_empty());
+
+        // Subcase D: Direct fallback after async Compute producer (e.g. `VICTORY_AB` toggle
+        // or Direct fallback compare) must emit GPU `Direct->Wait(compute_fence)` and read
+        // exact producer writes.
+        let out_buf = host.uav_buffer(BYTES).unwrap();
+        let rb_d = host.read_back_buffer(BYTES).unwrap();
+        let card_va = unsafe { card_buf.GetGPUVirtualAddress() };
+        let out_va = unsafe { out_buf.GetGPUVirtualAddress() };
+        let r = root.clone();
+        let p = pso.clone();
+        let _comp_tok = timeline
+            .submit_compute(
+                &[],
+                &[resource_key(&card_buf)],
+                &[resource_key(&out_buf)],
+                vec![card_buf.clone(), out_buf.clone()],
+                move |clist| {
+                    let params = [WORDS, 1_664_525u32, 1_013_904_223u32, 8u32];
+                    // SAFETY: Valid compute pass reading `card_buf` and writing `out_buf`.
+                    unsafe {
+                        clist.SetComputeRootSignature(&r);
+                        clist.SetPipelineState(&p);
+                        clist.SetComputeRoot32BitConstants(0, 4, params.as_ptr().cast(), 0);
+                        clist.SetComputeRootShaderResourceView(1, card_va);
+                        clist.SetComputeRootUnorderedAccessView(2, out_va);
+                        clist.Dispatch(WORDS.div_ceil(64), 1, 1);
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let fb_list = host.new_list().unwrap();
+        // SAFETY: Open Direct fallback list reading `out_buf` written by async Compute.
+        unsafe {
+            fb_list.list.CopyBufferRegion(&rb_d, 0, &out_buf, 0, BYTES);
+        }
+        fb_list.close();
+        let ((), fb_tok, fb_waits) = timeline
+            .execute_direct_tracked(
+                host.queue(),
+                &[resource_key(&out_buf)],
+                &[resource_key(&rb_d)],
+                || {
+                    let _ = host.execute(&[&fb_list]);
+                },
+            )
+            .unwrap();
+        assert!(
+            fb_waits >= 1,
+            "Direct fallback must emit GPU Wait for async Compute producer (got {fb_waits})"
+        );
+        timeline.wait_cpu(fb_tok).unwrap();
+        // SAFETY: Direct fallback copy completed on GPU; verify bit-exact parity.
+        unsafe {
+            let mut ptr = std::ptr::null_mut();
+            rb_d.Map(0, None, Some(&mut ptr)).unwrap();
+            let got = std::slice::from_raw_parts(ptr.cast::<u32>(), WORDS as usize);
+            for (i, &w) in got.iter().enumerate() {
+                let init = 0xABCD_0000u32 ^ (i as u32);
+                let expected = cpu_transform(init, 1_664_525u32, 1_013_904_223u32, 8);
+                assert_eq!(w, expected, "subcase D word {i} mismatch");
+            }
+            rb_d.Unmap(0, None);
+        }
+
+        timeline.drain_all().unwrap();
+        assert_zero_d3d12_debug_issues(
+            device,
+            "upload_bounce_fallback_on_signal_and_wait_failure_preserves_lifetime",
+        );
+        eprintln!(
+            "[async_timeline] upload_bounce_fallback_on_signal_and_wait_failure_preserves_lifetime PASS \
+             (adapter={adapter_name}, sw={is_sw}, 0 debug issues)"
         );
     }
 }

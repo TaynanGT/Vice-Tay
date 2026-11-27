@@ -1,11 +1,12 @@
 # Summarize the rendered frame reports emitted by victory_gpu::host.
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName = 'Summary')]
 param(
     [Parameter(Mandatory, Position = 0)][string]$Path,
     [datetimeoffset]$From,
     [datetimeoffset]$Until,
     [ValidateRange(0, [int]::MaxValue)][int]$MinDraws = 0,
-    [switch]$TextureProgress
+    [Parameter(Mandatory, ParameterSetName = 'TextureProgress')][switch]$TextureProgress,
+    [Parameter(ParameterSetName = 'Summary')][switch]$TimingBreakdown
 )
 
 $hasFrom = $PSBoundParameters.ContainsKey('From')
@@ -16,7 +17,7 @@ if ($hasFrom -and $hasUntil -and $Until -le $From) {
 
 $file = (Get-Item -LiteralPath $Path -ErrorAction Stop).FullName
 $culture = [Globalization.CultureInfo]::InvariantCulture
-$framePattern = '^\s*(?<time>\d{4}-\d\d-\d\dT\S+)\s+INFO\s+victory_gpu::host:\s+(?<fps>\d+(?:\.\d+)?) fps, (?<ms>\d+(?:\.\d+)?) ms/frame \(.*?\), (?<draws>\d+) draws/frame'
+$framePattern = '^\s*(?<time>\d{4}-\d\d-\d\dT\S+)\s+INFO\s+victory_gpu::host:\s+(?<fps>\d+(?:\.\d+)?) fps, (?<ms>\d+(?:\.\d+)?) ms/frame \((?<timing>.*?)\), (?<draws>\d+) draws/frame'
 $complete = ' draws/frame'
 $limit = 512
 if ($TextureProgress) {
@@ -28,6 +29,12 @@ $pattern = [regex]$framePattern
 $recordStart = [regex]'^\s*\d{4}-\d\d-\d\dT\S+(?=\s|$)'
 $rates = [Collections.Generic.List[double]]::new()
 $times = [Collections.Generic.List[double]]::new()
+$timingPattern = [regex]'^(?<PrepareMs>\d+(?:\.\d+)?) preparing:.*?;\s+(?<GpuWaitMs>\d+(?:\.\d+)?) on the GPU;\s+(?<CopyBackMs>\d+(?:\.\d+)?) copying back\b'
+$timingSamples = [ordered]@{
+    PrepareMs  = [Collections.Generic.List[double]]::new()
+    GpuWaitMs  = [Collections.Generic.List[double]]::new()
+    CopyBackMs = [Collections.Generic.List[double]]::new()
+}
 $report = ''
 $progressSamples = 0
 foreach ($line in [IO.File]::ReadLines($file)) {
@@ -63,6 +70,13 @@ foreach ($line in [IO.File]::ReadLines($file)) {
         $progressSamples++
         continue
     }
+    if ($TimingBreakdown) {
+        $timing = $timingPattern.Match($sample.Groups['timing'].Value)
+        if (-not $timing.Success) { continue }
+        foreach ($field in $timingSamples.Keys) {
+            $timingSamples[$field].Add([double]::Parse($timing.Groups[$field].Value, $culture))
+        }
+    }
     $rates.Add([double]::Parse($sample.Groups['fps'].Value, $culture))
     $times.Add([double]::Parse($sample.Groups['ms'].Value, $culture))
 }
@@ -70,7 +84,10 @@ if ($TextureProgress) {
     if ($progressSamples -eq 0) { throw 'No texture progress reports matched the selected interval and draw count.' }
     return
 }
-if ($rates.Count -eq 0) { throw 'No rendered frame reports matched the selected interval and draw count.' }
+if ($rates.Count -eq 0) {
+    $description = if ($TimingBreakdown) { 'rendered frame reports with submission timings' } else { 'rendered frame reports' }
+    throw "No $description matched the selected interval and draw count."
+}
 
 function Get-Median([Collections.Generic.List[double]]$sorted) {
     $upper = [int][math]::Floor($sorted.Count / 2)
@@ -79,9 +96,16 @@ function Get-Median([Collections.Generic.List[double]]$sorted) {
 }
 $rates.Sort()
 $times.Sort()
-[pscustomobject]@{
+$summary = [ordered]@{
     Samples           = $rates.Count
     MedianRenderedFps = Get-Median $rates
     P10RenderedFps    = $rates[[int][math]::Ceiling(0.1 * $rates.Count) - 1]
     MedianFrameMs     = Get-Median $times
 }
+if ($TimingBreakdown) {
+    foreach ($field in $timingSamples.Keys) {
+        $timingSamples[$field].Sort()
+        $summary["Median$field"] = Get-Median $timingSamples[$field]
+    }
+}
+[pscustomobject]$summary

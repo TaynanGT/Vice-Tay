@@ -15,6 +15,11 @@ threshold can exclude menu samples. Keep the same scene and check the sample
 count in both runs. The script reads console reports copied with line breaks
 between fields, including in the header.
 
+Pass `-TimingBreakdown` to include the median submission preparation time,
+GPU wait time and copy-back time. The script counts only reports with all
+three timings in this mode. GPU wait measures how long the runtime waits for
+submitted work to complete. Read these medians alongside the frame time.
+
 Pass `-TextureProgress` to report the indexed-texture counters from each
 matching frame report. Compare the UTC time, draws per frame, uploaded
 textures and MiB, waiting textures and slots passed over as unmapped.

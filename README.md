@@ -167,6 +167,12 @@ bash linux/wineserver/build.sh
 
 Restart Steam and pick `GE-Proton11-14-viewtree`. GE-Proton's `master` already carries an equivalent change ([`em-fixups/0078-server-store-process-views-in-an-rb-tree.patch`](https://github.com/GloriousEggroll/proton-ge-custom/blob/master/patches/wine-hotfixes/em-fixups/0078-server-store-process-views-in-an-rb-tree.patch)); once a GE-Proton release includes it, this build is no longer needed. On one RTX 5080 (Series S profile, the same build and settings), the opening area ran at 2.7 to 4 fps with 190 to 294 ms of copies a frame on stock GE-Proton11-14, and at about 20 fps with 22 to 25 ms on the patched server.
 
+[`linux/play.sh`](linux/play.sh) starts a build cross-compiled with `cargo xwin build --target x86_64-pc-windows-msvc` on GE-Proton11-14's Wine, outside Steam, with the launcher's NVIDIA settings and no network. It uses `GE-Proton11-14-viewtree` when built. The Wine prefix needs Microsoft's `d3dcompiler_47.dll`, because Wine's own compiler rejects the HLSL Vice-Tay compiles at runtime; the script's header shows the `winetricks` line.
+
+```sh
+GAME=/path/to/title linux/play.sh series-s
+```
+
 </details>
 
 ## Known problems

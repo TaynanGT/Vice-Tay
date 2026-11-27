@@ -178,9 +178,49 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
             }
         }
     }
-    let png = encode(w, h, &raw);
-    let path = folder.join(format!("{name}.png"));
-    match std::fs::write(&path, png) {
+    write_aside(folder.join(format!("{name}.png")), w, h, raw);
+}
+
+/// A picture to pack and write: its file, width, height and filtered rows.
+type Picture = (PathBuf, u32, u32, Vec<u8>);
+
+/// Packs and writes a picture on a thread of its own. The caller is the
+/// thread that prepares the submissions (a present stands in its line), the
+/// one a frame waits for: with `VICTORY_CAPTURE_WORLD` (every 8th frame)
+/// packing took 23% of its samples (a profile of the Series S prison scene
+/// at 22 fps), in the very runs the pictures are there to judge. What is
+/// still waiting when the process ends is lost.
+fn write_aside(path: PathBuf, w: u32, h: u32, raw: Vec<u8>) {
+    use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
+    static LINE: std::sync::OnceLock<Option<SyncSender<Picture>>> = std::sync::OnceLock::new();
+    let line = LINE.get_or_init(|| {
+        let (send, receive) = sync_channel::<Picture>(16);
+        std::thread::Builder::new()
+            .name("victory-capture".to_owned())
+            .spawn(move || {
+                for (path, w, h, raw) in receive {
+                    write(&path, w, h, &raw);
+                }
+            })
+            .ok()
+            .map(|_| send)
+    });
+    let picture = (path, w, h, raw);
+    // No thread, or the line is full (the disk is slower than the frames):
+    // here, as before.
+    let (path, w, h, raw) = match line {
+        Some(line) => match line.try_send(picture) {
+            Ok(()) => return,
+            Err(TrySendError::Full(picture) | TrySendError::Disconnected(picture)) => picture,
+        },
+        None => picture,
+    };
+    write(&path, w, h, &raw);
+}
+
+fn write(path: &std::path::Path, w: u32, h: u32, raw: &[u8]) {
+    let png = encode(w, h, raw);
+    match std::fs::write(path, png) {
         Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
         Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
     }
@@ -222,13 +262,28 @@ fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
     png.extend(crc.to_be_bytes());
 }
 
+/// The check values of the 256 bytes: a byte a step instead of a bit (the
+/// bit-by-bit loop was 5% of the thread that saved a picture).
+const CRC_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & (crc & 1).wrapping_neg());
+            bit += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
+
 fn crc32(bytes: &[u8]) -> u32 {
     let mut crc = !0u32;
     for &b in bytes {
-        crc ^= u32::from(b);
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0xedb8_8320 & (crc & 1).wrapping_neg());
-        }
+        crc = CRC_TABLE[((crc ^ u32::from(b)) & 0xff) as usize] ^ (crc >> 8);
     }
     !crc
 }
@@ -870,6 +925,8 @@ mod tests {
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
+        // The check value every CRC-32 implementation is tested with.
+        assert_eq!(super::crc32(b"123456789"), 0xcbf4_3926);
     }
 
     #[test]

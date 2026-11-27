@@ -152,6 +152,10 @@ fn build() -> [u8; 32] {
         if victory_shader::emit::constants_raw() {
             bytes.extend_from_slice(b"VICTORY_PORT_CBV=1");
         }
+        // Only active no-hit translations need a different key.
+        if victory_shader::emit::bvh_no_hit() {
+            bytes.extend_from_slice(b"VICTORY_BVH_NO_HIT=1\0");
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();
@@ -660,5 +664,48 @@ mod tests {
         // (Other tests count too; these at least.)
         let (s, r, c) = stale_counts();
         assert!(s >= stale + 2 && r > refreshed && c > changed, "{s} {r} {c}");
+    }
+
+    #[test]
+    fn bvh_no_hit_changes_the_shader_cache_key() {
+        // Each process initializes the cached policy and fixed key independently.
+        const CHILD: &str = "VICTORY_CACHE_BVH_NO_HIT_KEY_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            println!("bvh-cache-key={}", blake3::Hash::from_bytes(build()));
+            return;
+        }
+        let key = |no_hit: Option<&str>, builder: Option<&str>| {
+            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+            cmd.args([
+                "bvh_no_hit_changes_the_shader_cache_key",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env_remove("VICTORY_BVH_NO_HIT")
+            .env_remove("VICTORY_BVH_BUILDER");
+            if let Some(v) = no_hit {
+                cmd.env("VICTORY_BVH_NO_HIT", v);
+            }
+            if let Some(v) = builder {
+                cmd.env("VICTORY_BVH_BUILDER", v);
+            }
+            let output = cmd.output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .find_map(|line| line.split_once("bvh-cache-key=").map(|(_, k)| k.to_owned()))
+                .expect("child printed its cache key")
+        };
+        let default_key = key(None, None);
+        let explicit_off = key(Some("0"), None);
+        let explicit_on = key(Some("1"), None);
+        let explicit_on_builder_off = key(Some("1"), Some("0"));
+        let builder_on = key(Some("1"), Some("1"));
+        assert_eq!(default_key, explicit_off, "default keeps full-traversal cache key");
+        assert_eq!(default_key, builder_on, "builder=1 forces full-traversal cache key");
+        assert_eq!(explicit_on, explicit_on_builder_off, "opt-in no-hit uses one distinct key");
+        assert_ne!(default_key, explicit_on, "VICTORY_BVH_NO_HIT=1 must use a distinct key");
     }
 }

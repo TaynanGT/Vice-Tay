@@ -60,7 +60,116 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
         .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
 }
 
-fn left_out(shaders: &[Arc<Shader>], skip_hashes: &[String]) -> Option<&'static str> {
+/// Compute passes that feed or walk ray-tracing structures and can be skipped
+/// when the structure builder is off and every ray misses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeadRtKind {
+    Skin,
+    Hair,
+    ProbeTraceBvh,
+    RaytraceVBuffer,
+    PrimaryGatherCopy,
+}
+
+fn dead_rt_kind(container: &[u8]) -> Option<DeadRtKind> {
+    let has = |needle: &[u8]| container.windows(needle.len()).any(|w| w == needle);
+    if has(b"CSComputeSkinning") {
+        Some(DeadRtKind::Skin)
+    } else if has(b"CSGenerateHairVB") {
+        Some(DeadRtKind::Hair)
+    } else if has(b"CS_ScreenProbes_TraceRays")
+        && has(b"_BVH")
+        && !has(b"Voxels")
+        && !has(b"Fallback")
+    {
+        Some(DeadRtKind::ProbeTraceBvh)
+    } else if has(b"CS_RaytraceVBuffer") && !has(b"Voxels") && !has(b"Fallback") {
+        Some(DeadRtKind::RaytraceVBuffer)
+    } else if has(b"CS_Primary_GatherCopy") {
+        Some(DeadRtKind::PrimaryGatherCopy)
+    } else {
+        None
+    }
+}
+
+/// Both skips are opt-in, independent of `VICTORY_BVH_NO_HIT`, and disabled
+/// by `VICTORY_BVH_BUILDER=1`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DeadRtPolicy {
+    skip_dead: bool,
+    skip_gather_copy: bool,
+}
+
+impl DeadRtPolicy {
+    fn from_env(
+        builder_env: Option<&std::ffi::OsStr>,
+        skip_dead_env: Option<&std::ffi::OsStr>,
+        skip_gather_copy_env: Option<&std::ffi::OsStr>,
+    ) -> Self {
+        let builder_on = builder_env.is_some_and(|v| v == "1");
+        let skip_dead = !builder_on && skip_dead_env.is_some_and(|v| v == "1");
+        let skip_gather_copy = !builder_on && skip_gather_copy_env.is_some_and(|v| v == "1");
+        Self {
+            skip_dead,
+            skip_gather_copy,
+        }
+    }
+
+    fn current() -> Self {
+        static POLICY: OnceLock<DeadRtPolicy> = OnceLock::new();
+        *POLICY.get_or_init(|| {
+            let policy = Self::from_env(
+                std::env::var_os("VICTORY_BVH_BUILDER").as_deref(),
+                std::env::var_os("VICTORY_RT_SKIP_DEAD").as_deref(),
+                std::env::var_os("VICTORY_RT_SKIP_GATHER_COPY").as_deref(),
+            );
+            if policy.skip_dead || policy.skip_gather_copy {
+                tracing::info!(
+                    skip_dead = policy.skip_dead,
+                    skip_gather_copy = policy.skip_gather_copy,
+                    "opt-in ray-tracing compute pass skipping enabled while BVH builder is off"
+                );
+            }
+            policy
+        })
+    }
+}
+
+fn dead_rt_left_out(shaders: &[Arc<Shader>], policy: DeadRtPolicy) -> Option<&'static str> {
+    if !policy.skip_dead && !policy.skip_gather_copy {
+        return None;
+    }
+    for shader in shaders {
+        if shader.stage != "compute" {
+            continue;
+        }
+        match dead_rt_kind(&shader.container) {
+            Some(DeadRtKind::Skin) if policy.skip_dead => {
+                return Some("ray-tracing skinning pass without BVH, left out");
+            }
+            Some(DeadRtKind::Hair) if policy.skip_dead => {
+                return Some("ray-tracing hair geometry pass without BVH, left out");
+            }
+            Some(DeadRtKind::ProbeTraceBvh) if policy.skip_dead => {
+                return Some("screen-probe BVH trace pass without BVH, left out");
+            }
+            Some(DeadRtKind::RaytraceVBuffer) if policy.skip_dead => {
+                return Some("ray-tracing vbuffer pass without BVH, left out");
+            }
+            Some(DeadRtKind::PrimaryGatherCopy) if policy.skip_gather_copy => {
+                return Some("primary probe gather-copy pass without BVH, left out");
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn left_out(
+    shaders: &[Arc<Shader>],
+    skip_hashes: &[String],
+    dead_rt: DeadRtPolicy,
+) -> Option<&'static str> {
     static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
     let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
         let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
@@ -84,6 +193,9 @@ fn left_out(shaders: &[Arc<Shader>], skip_hashes: &[String]) -> Option<&'static 
     });
     if skip_activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
         return Some("ray activation shader without BVH, left out");
+    }
+    if let Some(reason) = dead_rt_left_out(shaders, dead_rt) {
+        return Some(reason);
     }
     if super::skipped_in_list(shaders, skip_hashes).is_some() {
         return Some("skipped by VICTORY_SKIP_PIPELINES");
@@ -121,7 +233,13 @@ unsafe impl Sync for Pending {}
 impl Pending {
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
         let protect_head_map = graphics.is_none() && head_map_wait();
-        Self::new_with_policy(shaders, graphics, super::skip_hashes(), protect_head_map)
+        Self::new_with_policy(
+            shaders,
+            graphics,
+            super::skip_hashes(),
+            protect_head_map,
+            DeadRtPolicy::current(),
+        )
     }
 
     fn new_with_policy(
@@ -129,6 +247,7 @@ impl Pending {
         graphics: Option<Box<GraphicsState>>,
         skip_hashes: &[String],
         protect_head_map: bool,
+        dead_rt: DeadRtPolicy,
     ) -> Pending {
         let mut key = blake3::Hasher::new();
         for s in &shaders {
@@ -145,7 +264,7 @@ impl Pending {
         let screen = (graphics.as_ref().is_some_and(|g| g.screen_pass())
             && shaders.iter().all(|s| s.stage != "mesh"))
             || scene_input;
-        let left_out = left_out(&shaders, skip_hashes);
+        let left_out = left_out(&shaders, skip_hashes, dead_rt);
         Pending {
             screen,
             scene_input,
@@ -925,7 +1044,13 @@ mod tests {
     }
 
     fn head_map_pipeline(wait: bool) -> Pending {
-        Pending::new_with_policy(vec![compute_shader("61e54e90adccaf6a")], None, &[], wait)
+        Pending::new_with_policy(
+            vec![compute_shader("61e54e90adccaf6a")],
+            None,
+            &[],
+            wait,
+            DeadRtPolicy::default(),
+        )
     }
 
     #[test]
@@ -937,6 +1062,7 @@ mod tests {
             None,
             &skips,
             true,
+            DeadRtPolicy::default(),
         ));
         assert_eq!(skipped.left_out, Some("skipped by VICTORY_SKIP_PIPELINES"));
         early(&skipped);
@@ -954,6 +1080,7 @@ mod tests {
             None,
             &skips,
             true,
+            DeadRtPolicy::default(),
         ));
         assert!(!normal.head_map && !normal.wait_for_head_map);
         assert_eq!(normal.left_out, None);
@@ -964,5 +1091,91 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(normal.made.get(), Some(None)));
+    }
+
+    #[test]
+    fn dead_rt_container_matcher_skips_only_rt_passes_and_never_non_rt_skinning() {
+        use DeadRtKind::*;
+        let cases: &[(&[u8], Option<DeadRtKind>)] = &[
+            (b"..\0CSComputeSkinningRigidVelocity_1c34db0a_Wrapped\0..", Some(Skin)),
+            (b"..\0CSComputeSkinningTreeAnimVelocity_a1b2c3d4_Wrapped\0..", Some(Skin)),
+            (b"..\0CSComputeSkinningPedSecMotionVelocity_deadbeef_Wrapped\0..", Some(Skin)),
+            (b"..\0CSGenerateHairVB_c88a8f19_Wrapped\0..", Some(Hair)),
+            (b"..\0CS_PedStandardSkinning_3_00aa11bb_Wrapped\0..", None),
+            (b"..\0CS_PosOnlyLodSkinning_01234567_Wrapped\0..", None),
+            (b"..\0computeclothSkinning\0..", None),
+            (b"..\0PS_PedSkin_0001\0..", None),
+            (b"..\0CS_ScreenProbes_TraceRays_RayBinning_BVH_Mixed\0..", Some(ProbeTraceBvh)),
+            (b"..\0CS_ScreenProbes_TraceRays_BVH_Voxels\0..", None),
+            (b"..\0CS_ScreenProbes_TraceRays_BVH_Fallback\0..", None),
+            (b"..\0CS_ScreenProbes_TemporalResolve_a911b49c_Wrapped\0..", None),
+            (b"..\0CS_RaytraceVBuffer_ShaderBinning_WithFar\0..", Some(RaytraceVBuffer)),
+            (b"..\0CS_RaytraceVBuffer_Voxels_RayBinning\0..", None),
+            (b"..\0CS_RaytraceVBuffer_Fallback\0..", None),
+            (b"..\0CS_Primary_GatherCopy_00112233_Wrapped\0..", Some(PrimaryGatherCopy)),
+        ];
+        for &(container, expected) in cases {
+            assert_eq!(dead_rt_kind(container), expected, "{container:?}");
+        }
+    }
+
+    #[test]
+    fn dead_rt_policy_is_opt_in_independent_and_blocked_when_builder_is_on() {
+        use std::ffi::OsStr;
+        let s = OsStr::new;
+        let off = DeadRtPolicy::default();
+        assert_eq!(DeadRtPolicy::from_env(None, None, None), off);
+        assert_eq!(DeadRtPolicy::from_env(Some(s("0")), Some(s("0")), Some(s("0"))), off);
+        assert_eq!(
+            DeadRtPolicy::from_env(None, Some(s("1")), None),
+            DeadRtPolicy { skip_dead: true, skip_gather_copy: false },
+        );
+        assert_eq!(
+            DeadRtPolicy::from_env(None, None, Some(s("1"))),
+            DeadRtPolicy { skip_dead: false, skip_gather_copy: true },
+        );
+        assert_eq!(
+            DeadRtPolicy::from_env(Some(s("0")), Some(s("1")), Some(s("1"))),
+            DeadRtPolicy { skip_dead: true, skip_gather_copy: true },
+        );
+        assert_eq!(DeadRtPolicy::from_env(Some(s("1")), Some(s("1")), Some(s("1"))), off);
+    }
+
+    #[test]
+    fn dead_rt_policy_gates_pending_pipelines_by_stage_and_opt_in() {
+        let pending = |stage: &'static str, name: &[u8], policy| {
+            let shader = Arc::new(Shader {
+                stage,
+                hash: "1122334455667788".to_owned(),
+                container: name.to_vec(),
+                ambient: None,
+                probe: None,
+                translated: OnceLock::from(None),
+            });
+            Arc::new(Pending::new_with_policy(vec![shader], None, &[], true, policy))
+        };
+        let dead_only = DeadRtPolicy { skip_dead: true, skip_gather_copy: false };
+        let gather_only = DeadRtPolicy { skip_dead: false, skip_gather_copy: true };
+        let off = DeadRtPolicy::default();
+        let skinning = b"CSComputeSkinningRigidVelocity_1";
+        let gather_copy = b"CS_Primary_GatherCopy_1";
+
+        let rt_skin = pending("compute", skinning, dead_only);
+        assert_eq!(rt_skin.left_out, Some("ray-tracing skinning pass without BVH, left out"));
+        early(&rt_skin);
+        assert!(ready(&rt_skin, true).is_none());
+        assert!(!now(&rt_skin));
+        assert_eq!(rt_skin.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
+        assert!(rt_skin.made.get().is_none());
+
+        assert_eq!(pending("vertex", skinning, dead_only).left_out, None);
+        assert_eq!(pending("compute", b"CS_PedStandardSkinning_3", dead_only).left_out, None);
+        assert_eq!(pending("compute", gather_copy, dead_only).left_out, None);
+        assert_eq!(pending("compute", skinning, gather_only).left_out, None);
+        assert_eq!(
+            pending("compute", gather_copy, gather_only).left_out,
+            Some("primary probe gather-copy pass without BVH, left out"),
+        );
+        assert_eq!(pending("compute", skinning, off).left_out, None);
     }
 }

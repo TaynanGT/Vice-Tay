@@ -37,6 +37,21 @@ thread_local! {
     /// and their directory.)
     pub(in crate::emit) static TEST_MEMORY: std::cell::Cell<Option<(u32, u64)>> =
         const { std::cell::Cell::new(None) };
+    /// Opt in for this test thread without changing the process environment.
+    pub(in crate::emit) static TEST_NO_HIT: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Whether to return a miss without reading node memory or recording faults.
+fn no_hit() -> bool {
+    #[cfg(test)]
+    {
+        TEST_NO_HIT.get()
+    }
+    #[cfg(not(test))]
+    {
+        crate::emit::bvh_no_hit()
+    }
 }
 
 /// Where the instruction's node is.
@@ -123,6 +138,20 @@ impl<'a> Lower<'a> {
             x.push(self.i32_of(v)?);
         }
         let pointer = x[0];
+        if no_hit() {
+            // Box kinds (4 and 5) enter no child; other kinds return a miss.
+            let c = self.cur;
+            let (k4, k6) = (self.s.m.i32(4), self.s.m.i32(6));
+            let pair = self.s.m.bin(c, Bin::And, pointer, k6);
+            let is_box = self.s.m.cmp(c, pred::EQ, pair, k4);
+            let none = self.s.m.i32(bvh::NONE);
+            for (k, miss) in bvh::MISS.into_iter().enumerate() {
+                let miss = self.s.m.i32(miss.to_bits());
+                let r = self.s.m.select(c, is_box, none, miss);
+                self.write(inst, Reg::V(dst + k as u8), r, guard);
+            }
+            return Ok(());
+        }
         let pointer_high = wide.then(|| x[1]);
         let f: Vec<V> = x[1 + usize::from(wide)..]
             .iter()

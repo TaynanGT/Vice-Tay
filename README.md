@@ -77,6 +77,7 @@ If the title reaches the menu but stops at world load, verify your title files b
 | `-Windowed` / `-NoPanel` | Start in a window or hide the diagnostics overlay at launch. |
 | `-RayTracing` | Enable the structures needed for the title's ray-traced indirect lighting. |
 | `-Fsr4K quality` / `-Dlss4K quality` | Upscale to 3840 × 2160 with PC FSR or DLSS on Series X. |
+| `-SeriesS4K` | Request 3840 × 2160 output with `-Console series-s`. |
 | `-FrameIntervalMs 16.67` | Set the frame interval in milliseconds. Use `0` to remove the limit or omit the option to keep the title's setting. |
 | `-WarmPipelines` | Warm pipelines used in previous runs before starting the title. |
 | `-Build release` | Use the executable built with `cargo build --locked --release -p victory`. The overlay requires a diagnostics build. |
@@ -89,6 +90,11 @@ build 1.0.2.1. They render at 2560 × 1440, 2258 × 1270 and 1920 × 1080
 respectively. For Series S, use `-Dlss` or `-Fsr` with the same three
 presets to keep the console profile's output size. These presets set the
 render scale, including when used with `-Machine laptop`.
+
+For Series S at 4K, add `-SeriesS4K`. With `-Dlss quality`, the renderer
+draws the scene at 2560 × 1440 and DLSS reconstructs the 3840 × 2160 output.
+`-Dlss dlaa` renders at the output resolution and applies NVIDIA's temporal
+anti-aliasing. Add `-FrameGen` to request AMD frame generation at either setting.
 
 For FSR, point `VICTORY_FIDELITYFX_DIR` or `[paths].fidelityfx_dir` at the
 folder containing `amd_fidelityfx_upscaler_dx12.dll`. The 4K mode prefers

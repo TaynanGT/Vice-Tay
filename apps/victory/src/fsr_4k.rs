@@ -8,6 +8,7 @@ const STOCK_SDR_MODE: [u8; 16] = [0, 15, 0, 0, 112, 8, 0, 0, 60, 0, 0, 0, 1, 0, 
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum FsrPreset {
+    Dlaa,
     Quality,
     Balanced,
     Performance,
@@ -21,9 +22,15 @@ impl FsrPreset {
             Err(std::env::VarError::NotPresent) => Ok(None),
             Ok(name) if name == "0" => Ok(None),
             Ok(name) => Self::from_name(&name.trim().to_ascii_lowercase())
+                .filter(|preset| *preset != Self::Dlaa || switch == "VICTORY_DLSS")
                 .map(Some)
                 .with_context(|| {
-                    format!("{switch}={name}: expected quality, balanced, performance or 0")
+                    let modes = if switch == "VICTORY_DLSS" {
+                        "dlaa, quality, balanced, performance or 0"
+                    } else {
+                        "quality, balanced, performance or 0"
+                    };
+                    format!("{switch}={name}: expected {modes}")
                 }),
             Err(error) => Err(error.into()),
         }
@@ -31,6 +38,7 @@ impl FsrPreset {
 
     pub(super) fn from_name(name: &str) -> Option<Self> {
         match name {
+            "dlaa" => Some(Self::Dlaa),
             "quality" => Some(Self::Quality),
             "balanced" => Some(Self::Balanced),
             "performance" => Some(Self::Performance),
@@ -40,6 +48,7 @@ impl FsrPreset {
 
     pub(super) fn name(self) -> &'static str {
         match self {
+            Self::Dlaa => "dlaa",
             Self::Quality => "quality",
             Self::Balanced => "balanced",
             Self::Performance => "performance",
@@ -49,6 +58,7 @@ impl FsrPreset {
     // AMD SDK FFX_UPSCALE_QUALITY_MODE values and ratios.
     pub(super) fn mode(self) -> u8 {
         match self {
+            Self::Dlaa => 0,
             Self::Quality => 1,
             Self::Balanced => 2,
             Self::Performance => 3,
@@ -60,6 +70,7 @@ impl FsrPreset {
     /// for FSR; this only names the mode its model was tuned for.
     pub(super) fn dlss_quality(self) -> i32 {
         match self {
+            Self::Dlaa => 5,
             Self::Quality => 2,
             Self::Balanced => 1,
             Self::Performance => 0,
@@ -68,6 +79,7 @@ impl FsrPreset {
 
     pub(super) fn render_scale(self) -> f32 {
         match self {
+            Self::Dlaa => 1.0,
             Self::Quality => 2.0 / 3.0,
             Self::Balanced => 1.0 / 1.7,
             Self::Performance => 0.5,
@@ -181,6 +193,16 @@ fn field<const N: usize>(image: &mut PreparedImage, rva: u32) -> Result<&mut [u8
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dlaa_keeps_the_full_render_extent() {
+        let preset = FsrPreset::from_name("dlaa").unwrap();
+        assert_eq!(preset, FsrPreset::Dlaa);
+        assert_eq!(preset.mode(), 0);
+        assert_eq!(preset.dlss_quality(), 5);
+        assert_eq!(preset.render_size(), [3840, 2160]);
+        assert_eq!(preset.series_s_patches()[0].1[0x64..0x68], 1.0f32.to_le_bytes());
+    }
 
     #[test]
     fn presets_name_their_render_sizes_and_dlss_modes() {

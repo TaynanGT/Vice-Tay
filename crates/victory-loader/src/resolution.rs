@@ -41,6 +41,9 @@
 use crate::frame_rate::Patched;
 
 #[cfg(any(windows, test))]
+mod pages;
+
+#[cfg(any(windows, test))]
 mod ui_plane;
 #[cfg(any(windows, test))]
 mod viewbox;
@@ -148,6 +151,55 @@ pub const POOL_CHECK: Site = Site {
     what: "back buffer pool's left-over check",
     bytes: &[0x48, 0x3d, 0xff, 0xff, 0x1f, 0x00, 0x76, 0x01, 0xcc], // cmp rax, 1FFFFFh ; jbe +1 ; int3
 };
+
+#[cfg(any(windows, test))]
+fn series_s_4k_pools(
+    output: Option<(u32, u32)>,
+    series_s: bool,
+) -> &'static [(Site, &'static [u8], &'static str)] {
+    if series_s && output == Some((3840, 2160)) {
+        &SERIES_S_4K_POOLS
+    } else {
+        &[]
+    }
+}
+
+// Four 31.875 MiB buffers fit in 128 MiB with the existing slack check.
+// The latter two entries take the 4K sizes already in the title's other
+// console profile while leaving the Series S renderer selected.
+#[cfg(any(windows, test))]
+const RENDER_PAGES_AT: usize = 0x1d488ac;
+
+#[cfg(any(windows, test))]
+const SERIES_S_4K_POOLS: [(Site, &[u8], &str); 3] = [
+    (
+        Site {
+            at: 0x247ad45,
+            what: "Series S display buffer pool",
+            bytes: &[0xb8, 0x00, 0x00, 0x20, 0x05, 0xb9, 0x00, 0x00, 0x00, 0x04],
+        },
+        &[0xb8, 0x00, 0x00, 0x00, 0x08],
+        "128 MiB",
+    ),
+    (
+        Site {
+            at: 0x6186268,
+            what: "Series S render texture memory",
+            bytes: &(1277u64 << 20).to_le_bytes(),
+        },
+        &(2199u64 << 20).to_le_bytes(),
+        "2199 MiB",
+    ),
+    (
+        Site {
+            at: RENDER_PAGES_AT,
+            what: "Series S render texture pages",
+            bytes: &[0xb8, 0x90, 0x12, 0x00, 0x00, 0xbe, 0x60, 0x2c, 0x00, 0x00],
+        },
+        &[0xb8, 0x60, 0x2c, 0x00, 0x00],
+        "710 MiB",
+    ),
+];
 
 /// What goes at [`POOL_CHECK`]: `jmp +1` in place of `jbe +1`.
 pub fn pool_check_code() -> Vec<u8> {
@@ -301,9 +353,28 @@ pub unsafe fn write(base: usize, size: usize, site: &Site, code: &[u8]) -> Patch
 /// The image of `size` bytes at `base` stays mapped and no thread runs its
 /// code yet.
 #[cfg(windows)]
-pub unsafe fn apply_asked(base: usize, size: usize) {
+pub unsafe fn apply_asked(
+    base: usize,
+    size: usize,
+    series_s: bool,
+    native_aa: bool,
+) -> anyhow::Result<()> {
     let mut asked: Vec<(&Site, Vec<u8>, String)> = Vec::new();
-    if let Some((w, h)) = asked_output() {
+    let output = asked_output();
+    let pools = series_s_4k_pools(output, series_s);
+    let own_scale = asked_render_scale();
+    let ffx_scale = asked_ffx_scale();
+    let full_size = !pools.is_empty() && (native_aa || own_scale == Some(1.0) || ffx_scale == Some(1.0));
+    for (site, code, value) in pools {
+        if full_size && site.at == RENDER_PAGES_AT {
+            let mut code = vec![site.bytes[0]];
+            code.extend_from_slice(&pages::NATIVE_PAGES.to_le_bytes());
+            asked.push((site, code, format!("{} MiB", pages::NATIVE_PAGES >> 4)));
+        } else {
+            asked.push((site, code.to_vec(), (*value).to_owned()));
+        }
+    }
+    if let Some((w, h)) = output {
         let split_code = ui_plane::requested(
             (w, h),
             std::env::var_os("VICTORY_UI_PLANE").as_deref(),
@@ -332,10 +403,10 @@ pub unsafe fn apply_asked(base: usize, size: usize) {
             }
         }
     }
-    if let Some(s) = asked_render_scale() {
+    if let Some(s) = own_scale {
         asked.push((&OWN_SCALE, own_scale_code(s), format!("{s}")));
     }
-    if let Some(s) = asked_ffx_scale() {
+    if let Some(s) = ffx_scale {
         asked.push((&FFX_SCALE, ffx_scale_code(s), format!("{s}")));
     }
     if let Some(kind) = asked_upscaler() {
@@ -351,7 +422,15 @@ pub unsafe fn apply_asked(base: usize, size: usize) {
             Patched::Failed(why) => tracing::warn!(site = %offset, what = site.what, why, "resolution: not patched"),
         }
         println!("resolution: {} ({value}) at title+{offset}: {done:?}", site.what);
+        if !pools.is_empty() && (site.at == OUTPUT.at || pools.iter().any(|(pool, ..)| pool.at == site.at)) {
+            anyhow::ensure!(done == Patched::Done, "Series S 4K: could not set {} ({done:?})", site.what);
+        }
     }
+    if full_size {
+        // SAFETY: the image remains mapped and the title has not started.
+        unsafe { pages::relocate(base, size) }?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -369,6 +448,21 @@ mod tests {
         assert_eq!(parse_render_scale("1"), Some(1.0));
         assert_eq!(parse_render_scale("0.4"), None);
         assert_eq!(parse_render_scale("1.5"), None);
+    }
+
+    #[test]
+    fn series_s_4k_reserves_space_for_four_display_buffers() {
+        let pools = series_s_4k_pools(Some((3840, 2160)), true);
+        let (site, code, _) = &pools[0];
+        assert_eq!(code[0], site.bytes[0]);
+        let capacity = u32::from_le_bytes(code[1..5].try_into().unwrap());
+        let back_buffers = 4 * 0x01fe_0000;
+        assert_eq!(capacity.checked_sub(back_buffers), Some(512 << 10));
+        assert_eq!(u64::from_le_bytes(pools[1].1.try_into().unwrap()), 2199 << 20);
+        assert_eq!(u32::from_le_bytes(pools[2].1[1..5].try_into().unwrap()) << 16, 710 << 20);
+        assert!(series_s_4k_pools(Some((3840, 2160)), false).is_empty());
+        assert!(series_s_4k_pools(Some((1920, 1080)), true).is_empty());
+        assert!(series_s_4k_pools(None, true).is_empty());
     }
 
     /// The calls and loads in the bytes compared are the ones the

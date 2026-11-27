@@ -9,6 +9,8 @@
 # -Console      series-x (the default) or series-s: the console the title takes this PC for
 # -FrameGen     AMD frame generation
 # -Fsr / -Dlss  PC upscaling in Series S (quality, balanced or performance)
+# -Dlss dlaa   NVIDIA DLAA in Series S at the output resolution
+# -SeriesS4K   3840x2160 output with the Series S console profile
 # -Fsr4K        PC FidelityFX at 3840x2160 (quality, balanced or performance)
 # -Dlss4K       NVIDIA DLSS at 3840x2160 (quality, balanced or performance); FSR if it cannot start
 # -FrameIntervalMs  use a frame interval in milliseconds (0 removes the limit)
@@ -34,14 +36,18 @@ param(
     [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x',
     [switch]$FrameGen,
     [ValidateSet('quality', 'balanced', 'performance')][string]$Fsr,
-    [ValidateSet('quality', 'balanced', 'performance')][string]$Dlss,
+    [ValidateSet('quality', 'balanced', 'performance', 'dlaa')][string]$Dlss,
     [ValidateSet('quality', 'balanced', 'performance')][string]$Fsr4K,
     [ValidateSet('quality', 'balanced', 'performance')][string]$Dlss4K,
     [ValidateRange(0.0, 1000.0)][double]$FrameIntervalMs,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [ValidateSet('auto', '7900xtx', '4070', '4070tisuper', '4090', '3060', 'laptop')][string]$Machine = 'auto',
-    [hashtable]$More = @{}
+    [hashtable]$More = @{},
+    [switch]$SeriesS4K
 )
+if ($SeriesS4K -and $Console -ne 'series-s') {
+    throw '-SeriesS4K requires -Console series-s.'
+}
 $settings = @{
     VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
     VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '1'; VICTORY_CARD_STEPS = '2'
@@ -243,6 +249,10 @@ if ($Fsr) { $settings.VICTORY_FSR = $Fsr.ToLowerInvariant() }
 if ($Dlss) { $settings.VICTORY_DLSS = $Dlss.ToLowerInvariant() }
 if ($Fsr4K) { $settings.VICTORY_FSR_4K = $Fsr4K.ToLowerInvariant() }
 if ($Dlss4K) { $settings.VICTORY_DLSS_4K = $Dlss4K.ToLowerInvariant() }
+if ($SeriesS4K) {
+    $settings.VICTORY_OUTPUT = '3840x2160'
+    $settings.VICTORY_DISPLAY_MODE = '3840x2160'
+}
 if ($PSBoundParameters.ContainsKey('FrameIntervalMs')) {
     $settings.VICTORY_FRAME_INTERVAL_MS = $FrameIntervalMs.ToString([Globalization.CultureInfo]::InvariantCulture)
 }

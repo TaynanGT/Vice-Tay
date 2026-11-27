@@ -163,7 +163,7 @@ pub fn run(
     if series_s_preset.is_some() {
         anyhow::ensure!(
             matches!(console, Console::SeriesS) && fsr.is_none() && dlss.is_none(),
-            "VICTORY_FSR and VICTORY_DLSS require Series S without a 4K profile"
+            "VICTORY_FSR and VICTORY_DLSS require Series S and cannot use a Series X 4K preset"
         );
         anyhow::ensure!(
             series_s_fsr.is_none() || series_s_dlss.is_none(),
@@ -412,7 +412,14 @@ pub fn run(
     if execute && profile.is_none() {
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped and nothing of it has run yet.
-        unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
+        unsafe {
+            victory_loader::resolution::apply_asked(
+                image.base(),
+                size,
+                matches!(console, Console::SeriesS),
+                series_s_dlss == Some(fsr_4k::FsrPreset::Dlaa),
+            )
+        }?;
     }
     if !execute {
         println!("not executing (pass --execute to start the title)");

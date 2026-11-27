@@ -242,28 +242,24 @@ fn wait_for_made<T>(made: &OnceLock<T>, started: Instant, allowance: Duration) -
 }
 
 /// Waiting for the prequeued head map is normally a matter of milliseconds.
-/// Keep one deadline for the shader so new frames or copies of the PSO
-/// cannot prolong a stalled driver call on the title's recording threads.
+/// After a timeout, later dispatches only poll. A successful wait leaves
+/// the budget available if the title creates another pipeline for the shader.
 struct HeadMapWait {
-    started: OnceLock<Instant>,
     allowance: Duration,
-    reported_timeout: AtomicBool,
+    timed_out: AtomicBool,
 }
 
 impl HeadMapWait {
     const fn new(allowance: Duration) -> Self {
-        Self { started: OnceLock::new(), allowance, reported_timeout: AtomicBool::new(false) }
+        Self { allowance, timed_out: AtomicBool::new(false) }
     }
 
     fn wait<'a>(&self, pipeline: &'a Pending) -> Option<&'a Option<HostPipeline>> {
-        if let Some(made) = pipeline.made.get() {
-            return Some(made);
+        if self.timed_out.load(Ordering::Acquire) {
+            return pipeline.made.get();
         }
-        let started = *self.started.get_or_init(Instant::now);
-        let made = wait_for_made(&pipeline.made, started, self.allowance);
-        if made.is_none() && !self.reported_timeout.load(Ordering::Relaxed)
-            && !self.reported_timeout.swap(true, Ordering::Relaxed)
-        {
+        let made = wait_for_made(&pipeline.made, Instant::now(), self.allowance);
+        if made.is_none() && !self.timed_out.swap(true, Ordering::AcqRel) {
             tracing::warn!(
                 key = pipeline.key,
                 frame = crate::frame::current(),
@@ -898,13 +894,11 @@ mod tests {
             }
             assert_eq!(expired, Ok(true));
         });
-        assert!(budget.reported_timeout.load(Ordering::Relaxed));
+        assert!(budget.timed_out.load(Ordering::Acquire));
         assert!(pending.made.get().is_none());
-        let started = budget.started.get().copied();
 
         let other = head_map_pipeline(true);
         assert!(budget.wait(&other).is_none());
-        assert_eq!(budget.started.get().copied(), started);
 
         pending.make_with(|| None);
         assert!(matches!(budget.wait(&pending), Some(None)));

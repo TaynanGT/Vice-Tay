@@ -55,9 +55,13 @@
 //! unpacked a second time, into garbage all over their neighbours).
 //!
 //! **Stores are bounded**: a structure the builder misreads makes it store
-//! anywhere. Pages of title buffers take its stores only once one of its
-//! dispatches was given that buffer as an unordered access view (its scratch
-//! memory, its results); what else a store reaches is an arena's.
+//! anywhere. With `VICTORY_BVH_OPEN_ALL=0`, pages of title buffers take its
+//! stores only once one of its dispatches was given that buffer as an
+//! unordered access view (its scratch memory, its results); what else a
+//! store reaches is an arena's. By default every title buffer's copy takes
+//! them ([`open_all`]): the builder writes structures into buffers it is
+//! given only by address, and closed those stores were dropped. Stores still
+//! go to the copies on the card, not back to title memory.
 //!
 //! A packed structure is gone when title memory has no header of it any more
 //! (looked at over [`SWEEP`] frames); the pages it alone has are given back.
@@ -354,21 +358,34 @@ impl Memory {
             // Every page the copy holds whole, not only the one asked for.
             // shortcut: a page of a title buffer inside this one that has a
             // copy of its own is given this copy too.
+            let open = open_all();
             if fresh {
+                if open {
+                    // (Its pages hold what the CPU writes beside the stores.)
+                    self.copies[n].keep_stores();
+                }
                 let (first, len) = shadow.span();
                 let mut at = first.next_multiple_of(PAGE);
                 while at + PAGE <= first + len && at / PAGE < u64::from(MEMORY_PAGES) - 1 {
                     let entry = self.entry(at / PAGE);
                     // SAFETY: an entry of the directory.
                     if unsafe { entry.read() } == 0 {
-                        close(entry, n, at - first);
+                        if open {
+                            fill(entry, n, at - first);
+                        } else {
+                            close(entry, n, at - first);
+                        }
                     }
                     at += PAGE;
                 }
             }
             // SAFETY: as above.
             if unsafe { self.entry(page).read() } == 0 {
-                close(self.entry(page), n, start - shadow.span().0);
+                if open {
+                    fill(self.entry(page), n, start - shadow.span().0);
+                } else {
+                    close(self.entry(page), n, start - shadow.span().0);
+                }
             }
             return true;
         }
@@ -670,6 +687,30 @@ impl Memory {
         }
     }
 
+    /// `VICTORY_MEMORY_CLOSED_NOTES=1`: a shader stored to `page`, which its
+    /// stores do not reach; by title buffer, how often (logged now and then).
+    fn closed_store(&mut self, page: u64) {
+        static SEEN: Mutex<Option<(HashMap<u64, u64>, u64)>> = Mutex::new(None);
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let (by_buffer, n) = seen.get_or_insert_with(|| (HashMap::new(), 0));
+        let at = page * PAGE;
+        let key = crate::shadow::in_buffer(at, 1).map_or(at, |b| b.0);
+        *by_buffer.entry(key).or_default() += 1;
+        *n += 1;
+        if *n <= 20 || n.is_power_of_two() {
+            let buffer = crate::shadow::in_buffer(at, 1);
+            tracing::info!(
+                frame = self.frame,
+                page = format_args!("{at:#x}"),
+                buffer = ?buffer.map(|b| (format!("{:#x}", b.0), b.1)),
+                in_arena = self.pages.contains_key(&page),
+                total = *n,
+                buffers = by_buffer.len(),
+                "title memory by address: a store dropped on a page stores do not reach"
+            );
+        }
+    }
+
     /// The pages shaders found empty since the last frame.
     fn take_faults(&mut self) {
         let mut pages = Vec::new();
@@ -679,7 +720,12 @@ impl Memory {
             let at = unsafe { self.faults.1.add(i) };
             // SAFETY: as above.
             let page = unsafe { at.read_volatile() };
-            if page != 0 {
+            if page & 0x8000_0000 != 0 {
+                // A store to a page stores do not reach (closed notes).
+                self.closed_store(u64::from(page & 0x7FFF_FFFF));
+                // SAFETY: as above.
+                unsafe { at.write_volatile(0) };
+            } else if page != 0 {
                 pages.push(u64::from(page));
                 // SAFETY: as above.
                 unsafe { at.write_volatile(0) };
@@ -883,6 +929,25 @@ pub(crate) fn asked_sizes<'a>(lists: impl Iterator<Item = &'a HostList>) -> bool
         }
     }
     asked
+}
+
+/// Whether stores by address reach every title buffer's copy, not only
+/// those a builder dispatch was given as unordered access views
+/// (`VICTORY_BVH_OPEN_ALL=0`: only those, as before).
+///
+/// Closed, the builder's stores into the other buffers were dropped: with
+/// `VICTORY_MEMORY_CLOSED_NOTES=1`, some 1,000 pages of 10 title buffers
+/// (1.5-12 MiB) in two minutes of ray tracing, and the structures built
+/// there came out with children outside them, wrong parent links and nodes
+/// reached twice. The trace programs then went round them until their loop
+/// limit (RTX 4070 Ti, the screen probes' trace at a limit of 4,096: 41.8 ms
+/// a frame closed, 6.0 open; the same opening's median 12.1 fps closed,
+/// 14.1 open, the slowest quarter 8.2 against 10.9). Open, a dump's
+/// compacted structures had 140 children outside them instead of 2,972 and
+/// 77 wrong parent links instead of 2,884.
+fn open_all() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_OPEN_ALL").is_none_or(|v| v != "0"))
 }
 
 /// [`fill`] of a page stores by address do not reach.

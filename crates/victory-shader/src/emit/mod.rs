@@ -150,6 +150,16 @@ pub fn loop_limit() -> u32 {
     })
 }
 
+/// `VICTORY_MEMORY_CLOSED_NOTES=1` (diagnostics builds): stores by address
+/// to pages they do not reach are noted with the faults (bit 31 set), so the
+/// host can say which title buffers drop the builder's stores.
+pub fn closed_notes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_MEMORY_CLOSED_NOTES").is_some_and(|v| v == "1")
+    })
+}
+
 /// The iteration count after which a compute program's loop is left when
 /// [`loop_limit`] is not overridden: 4,096.
 pub const DEFAULT_COMPUTE_LOOP_LIMIT: u32 = 1 << 12;

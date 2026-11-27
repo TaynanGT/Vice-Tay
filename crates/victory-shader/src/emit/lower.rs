@@ -3860,6 +3860,20 @@ impl<'a> Lower<'a> {
         if let Some(g) = guard {
             missing = self.s.m.bin(c, Bin::And, missing, g);
         }
+        // `VICTORY_MEMORY_CLOSED_NOTES=1` (diagnostics): a store to a page
+        // stores do not reach (a title buffer's, the builder not given it)
+        // is noted too, its number with bit 31 set: such a store is dropped.
+        let mut noted = page;
+        if store && super::closed_notes() {
+            let mut closed = self.s.m.cmp(c, pred::SLT, number, zero);
+            if let Some(g) = guard {
+                closed = self.s.m.bin(c, Bin::And, closed, g);
+            }
+            missing = self.s.m.bin(c, Bin::Or, missing, closed);
+            let high = k(self, 0x8000_0000);
+            let flag = self.s.m.select(c, closed, high, zero);
+            noted = self.s.m.bin(c, Bin::Or, page, flag);
+        }
         let places = k(self, MEMORY_FAULTS - 1);
         let faults = self.s.root_uav_handle(SLOT_FAULTS);
         let noting = self.begin_guarded(Some(missing));
@@ -3877,7 +3891,7 @@ impl<'a> Lower<'a> {
             Attr::NoUnwind,
             void,
             140,
-            &[faults, place, iu, page, iu, iu, iu, mask, align],
+            &[faults, place, iu, noted, iu, iu, iu, mask, align],
         );
         self.end_guarded(noting, &[]);
         let c = self.cur;

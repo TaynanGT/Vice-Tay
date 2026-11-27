@@ -4,7 +4,28 @@
 
 Vice-Tay builds on [VIctory](https://github.com/Marvisak/VIctory) to run an Xbox Series title from your own files. The title's x86-64 code runs on the host CPU. The compatibility layer provides the console APIs it calls and translates its graphics work to Direct3D 12.
 
-[Quick start](#getting-started) · [Gameplay](#gameplay) · [Measurements](#measurements) · [Benchmark dashboard](https://taynangt.github.io/Vice-Tay/)
+[Quick start](#getting-started) · [Experimental 4060 testing](#experimental-rtx-4060--16-gb-ram-testing) · [Gameplay](#gameplay) · [Measurements](#measurements) · [Benchmark dashboard](https://taynangt.github.io/Vice-Tay/)
+
+> [!NOTE]
+> **Experimental branch (`exp/perf-4060-16gb`):** Adds `-Machine 4060` (Ryzen 9 7900X + RTX 4060 8 GB + 16 GB RAM) plus ported descriptor (`DynamicBits`, `release_dynamic_many`, null templates), parallel texture readback (`texback::land_many`), and write-watch/journal optimizations (`SHARD_SHIFT=6`, coalesced `VirtualProtect`, single-pass `ask_once`). Live game-build A/B benchmarks are tracked in [Issue #1](https://github.com/swam122yam-glitch/Vice-Tay/issues/1).
+
+## Experimental RTX 4060 / 16 GB RAM testing
+
+1. Pre-warm the shader and pipeline cache once using your own copy of the title:
+
+   ```powershell
+   cargo build --locked --profile diag -p victory --features diagnostics
+   .\target\diag\victory.exe shaders
+   .\target\diag\victory.exe warm --used
+   ```
+
+2. Run the Series S profile with `-Machine 4060` (and compare against `main` with `-Machine laptop` on the same scene/route using [`scripts/measure-frames.ps1`](scripts/measure-frames.ps1)):
+
+   ```powershell
+   .\scripts\play.ps1 -Exe 'D:\victory-data\game\game.exe' -Console series-s -Machine 4060
+   ```
+
+   For DLSS + 2× FSR Frame Generation, pass `-Dlss quality -FrameGen` with `VICTORY_DLSS_DIR` and `VICTORY_FFX_FG_DIR` set. Record rendered FPS separately from `FG OUTPUT FPS` and report results in [Issue #1](https://github.com/swam122yam-glitch/Vice-Tay/issues/1).
 
 ## Measurements
 
@@ -73,6 +94,7 @@ Use [`Play-VIctory.cmd`](Play-VIctory.cmd) to pass the same options from Command
 | --- | --- |
 | `-Console series-s` | Select the lighter console profile used in the sessions above. |
 | `-Machine 4090` / `-Machine 4070` / `-Machine 7900xtx` | Select a GPU preset explicitly. See the [RTX 4070 test notes](docs/rtx4070-performance.md). |
+| `-Machine 4060` | Experimental preset for Ryzen 9 7900X (12C/24T), RTX 4060 (8 GB VRAM), and 16 GB RAM. |
 | `-Machine laptop` | Try the [16 GB NVIDIA laptop preset](docs/laptop-16gb.md), measured on one RTX 3050 laptop. |
 | `-Safe` | Launch with the conservative settings when investigating a graphics or stability issue. |
 | `-Windowed` / `-NoPanel` | Start in a window or hide the diagnostics overlay at launch. |

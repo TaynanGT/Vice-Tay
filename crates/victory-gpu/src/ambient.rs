@@ -29,6 +29,9 @@
 //! - `constant:<level>`: the constant, as beloooo's fork has it.
 //!
 //! `VICTORY_AMBIENT_SHADE=<strength>,<radius in metres>` sets the creases.
+//! `VICTORY_AMBIENT_FLAT=<level>` optionally supplies a diffuse minimum
+//! when the resolve's depth SRV is missing (positive finite, at most 2).
+//! It requires the stand-in to be on and does not reconstruct geometry.
 //!
 //! The air of a room is lit by the same probes: without rays they hold the
 //! sky's light indoors too, a brown veil at sunset. `VICTORY_AMBIENT_AIR`
@@ -117,6 +120,47 @@ fn parse(set: &str) -> Set {
     match set.strip_prefix("constant:") {
         Some(level) => number(level).map_or(Set::Off, Set::Constant),
         None => number(set).map_or(Set::Off, Set::Estimate),
+    }
+}
+
+fn parse_flat(set: &str) -> Option<f32> {
+    match parse(set) {
+        Set::Estimate(level) => Some(level.min(2.0)),
+        _ => None,
+    }
+}
+
+/// Optional diffuse minimum when the resolve's real depth is unavailable.
+pub(crate) fn flat_level() -> Option<f32> {
+    static LEVEL: OnceLock<Option<f32>> = OnceLock::new();
+    *LEVEL.get_or_init(|| parse_flat(&std::env::var("VICTORY_AMBIENT_FLAT").unwrap_or_default()))
+}
+
+/// Missing depth can use the flat minimum; an incompatible real view cannot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DepthPath {
+    Estimate,
+    Flat,
+    Missing,
+    Mismatch,
+}
+
+pub(crate) fn depth_path(
+    image: &D3D12_RESOURCE_DESC,
+    depth: Option<&D3D12_RESOURCE_DESC>,
+    flat: bool,
+) -> DepthPath {
+    match depth {
+        Some(seen)
+            if seen.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                || seen.SampleDesc.Count != 1
+                || (seen.Width, seen.Height) != (image.Width, image.Height) =>
+        {
+            DepthPath::Mismatch
+        }
+        Some(_) => DepthPath::Estimate,
+        None if flat => DepthPath::Flat,
+        None => DepthPath::Missing,
     }
 }
 
@@ -470,7 +514,7 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
 }
 #endif
 
-#if defined(RAISE) || defined(HOLD) || defined(HOLD_INDIRECT)
+#if defined(RAISE) || defined(FLAT) || defined(HOLD) || defined(HOLD_INDIRECT)
 RWTexture2D<uint> light : register(u0);
 float3 unpack(uint v) {
     return float3(v & 511, (v >> 9) & 511, (v >> 18) & 511) * exp2(float(v >> 27) - 24.0);
@@ -483,6 +527,18 @@ uint pack(float3 c) {
     if (top * scale >= 511.5) { e = min(e + 1, 31); scale = exp2(float(24 - e)); }
     uint3 m = min(uint3(c * scale + 0.5), 511u);
     return m.r | (m.g << 9) | (m.b << 18) | (uint(e) << 27);
+}
+#endif
+
+#ifdef FLAT
+// A diffuse minimum before materials are applied. No depth/normal reads,
+// colour rejection or luminance cap: valid existing illumination remains.
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void flat(uint3 at : SV_DispatchThreadID) {
+    if (at.x >= width || at.y >= height) return;
+    float3 floor_light = float3(1.0, 0.98, 0.94) * constant;
+    light[at.xy] = pack(max(unpack(light[at.xy]), floor_light));
 }
 #endif
 
@@ -623,6 +679,8 @@ struct Pass {
     place: ID3D12PipelineState,
     gather: ID3D12PipelineState,
     raise: ID3D12PipelineState,
+    /// Optional: failure must not disable the existing depth-based passes.
+    flat: Option<ID3D12PipelineState>,
     air: ID3D12PipelineState,
     /// Made only while the hold of the reflections is on.
     hold: Option<ID3D12PipelineState>,
@@ -640,12 +698,25 @@ fn make(
     device: &ID3D12Device,
     buffer: impl Fn(u64) -> Option<ID3D12Resource>,
     reflection_hold: bool,
+    flat: bool,
+) -> windows::core::Result<Pass> {
+    make_with_compiler(device, buffer, reflection_hold, flat, |part, entry| {
+        crate::host::compile(&format!("#define {part}\n{SOURCE}"), entry, s!("cs_5_1"))
+    })
+}
+
+fn make_with_compiler(
+    device: &ID3D12Device,
+    buffer: impl Fn(u64) -> Option<ID3D12Resource>,
+    reflection_hold: bool,
+    flat: bool,
+    mut compile: impl FnMut(&str, windows::core::PCSTR) -> windows::core::Result<Vec<u8>>,
 ) -> windows::core::Result<Pass> {
     let mut root: Option<ID3D12RootSignature> = None;
     let mut resolve_root: Option<ID3D12RootSignature> = None;
     let mut indirect_root: Option<ID3D12RootSignature> = None;
     let mut pipeline = |part: &str, entry| -> windows::core::Result<ID3D12PipelineState> {
-        let code = crate::host::compile(&format!("#define {part}\n{SOURCE}"), entry, s!("cs_5_1"))?;
+        let code = compile(part, entry)?;
         let root = match part {
             "PLACE" | "GATHER" | "RAISE" => &mut resolve_root,
             "HOLD_INDIRECT" => &mut indirect_root,
@@ -669,6 +740,13 @@ fn make(
     let place = pipeline("PLACE", s!("place"))?;
     let gather = pipeline("GATHER", s!("gather"))?;
     let raise = pipeline("RAISE", s!("raise"))?;
+    let flat = if flat {
+        pipeline("FLAT", s!("flat"))
+            .inspect_err(|e| tracing::warn!(%e, "no depth-free ambient floor; other ambient passes remain available"))
+            .ok()
+    } else {
+        None
+    };
     let air = pipeline("AIR", s!("clear_air"))?;
     // Not made unless the hold is on, and on its own: without it the rest
     // of the stand-in still runs.
@@ -695,6 +773,7 @@ fn make(
         place,
         gather,
         raise,
+        flat,
         air,
         hold,
         hold_indirect: indirect_root.zip(hold_indirect),
@@ -708,7 +787,7 @@ fn pass() -> Option<&'static Pass> {
     static PASS: OnceLock<Option<Pass>> = OnceLock::new();
     PASS.get_or_init(|| {
         let host = host()?;
-        make(&host.device, |bytes| host.uav_buffer(bytes), !reflect_in().is_empty())
+        make(&host.device, |bytes| host.uav_buffer(bytes), !reflect_in().is_empty(), flat_level().is_some())
             .inspect_err(|e| tracing::warn!(error = %e, "no stand-in for the indirect light"))
             .ok()
     })
@@ -871,11 +950,23 @@ pub(crate) fn after(
     let Some(pass) = pass() else {
         return false;
     };
-    let (level, constant) = match set() {
+    // Reject an unavailable optional pass before recording or changing roots.
+    let depth_free = if role == Role::Resolve && views.depth.is_none() {
+        let Some(flat) = pass.flat.as_ref() else { return false };
+        Some(flat)
+    } else {
+        None
+    };
+    let (mut level, mut constant) = match set() {
         Set::Off => return false,
         Set::Estimate(level) => (level, 0.0f32),
         Set::Constant(level) => (0.0, level),
     };
+    if role == Role::Resolve && views.depth.is_none() {
+        let Some(flat) = flat_level() else { return false };
+        level = 0.0;
+        constant = flat;
+    }
     if role != Role::Radiance && constant == 0.0 && !KEPT.load(Ordering::Relaxed) {
         return false;
     }
@@ -968,6 +1059,14 @@ pub(crate) fn after(
                 }
             }
             Role::Resolve => {
+                if let Some(flat) = depth_free {
+                    run(flat, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
+                    static FLAT_RECORDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if !FLAT_RECORDED.swap(true, Ordering::Relaxed) {
+                        tracing::info!(size = ?views.size, level = constant, "depth-free ambient floor dispatch recorded");
+                    }
+                    return true;
+                }
                 if constant == 0.0 {
                     run(&pass.place, 8, 9, 1);
                     run(&pass.gather, 20, 45, 1);
@@ -982,6 +1081,52 @@ pub(crate) fn after(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flat_settings_are_optional_finite_positive_and_bounded() {
+        for off in ["", "0", "off", "-0.1", "nan", "inf", "-inf", "bad", "constant:0.3"] {
+            assert_eq!(parse_flat(off), None, "{off:?}");
+        }
+        assert_eq!(parse_flat(" 0.3 "), Some(0.3));
+        assert_eq!(parse_flat("1.2"), Some(1.2));
+        assert_eq!(parse_flat("2"), Some(2.0));
+        assert_eq!(parse_flat("200"), Some(2.0));
+    }
+
+    #[test]
+    fn flat_only_replaces_the_missing_depth_path_when_enabled() {
+        let image = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 1280,
+            Height: 720,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        assert_eq!(depth_path(&image, None, false), DepthPath::Missing);
+        assert_eq!(depth_path(&image, None, true), DepthPath::Flat);
+        for enabled in [false, true] {
+            assert_eq!(depth_path(&image, Some(&image), enabled), DepthPath::Estimate);
+            let wrong_width = D3D12_RESOURCE_DESC { Width: 640, ..image };
+            let wrong_height = D3D12_RESOURCE_DESC { Height: 360, ..image };
+            let volume = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE3D,
+                ..image
+            };
+            let multisampled = D3D12_RESOURCE_DESC {
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                    Count: 4,
+                    Quality: 0,
+                },
+                ..image
+            };
+            for invalid in [wrong_width, wrong_height, volume, multisampled] {
+                assert_eq!(depth_path(&image, Some(&invalid), enabled), DepthPath::Mismatch);
+            }
+        }
+    }
 
     #[test]
     fn settings() {
@@ -1032,7 +1177,36 @@ mod tests {
         let Some(host) = host() else {
             return;
         };
-        make(&host.device, |bytes| host.uav_buffer(bytes), true).expect("the passes");
+        make(&host.device, |bytes| host.uav_buffer(bytes), true, false).expect("the passes");
+    }
+
+    #[test]
+    fn disabled_or_rejected_flat_pipeline_does_not_disable_existing_passes() {
+        use crate::indirect::tests::WarpHarness;
+
+        let gpu = WarpHarness::new().expect("a D3D12 WARP adapter");
+        for requested in [false, true] {
+            let mut flat_attempts = 0;
+            let pass = make_with_compiler(
+                &gpu.device,
+                |bytes| Some(gpu.default_uav(bytes)),
+                true,
+                requested,
+                |part, entry| {
+                    if part == "FLAT" {
+                        flat_attempts += 1;
+                        // A rejected optional shader takes the same error path
+                        // as a driver rejecting its pipeline state.
+                        return Err(windows::core::Error::empty());
+                    }
+                    crate::host::compile(&format!("#define {part}\n{SOURCE}"), entry, s!("cs_5_1"))
+                },
+            ).expect("existing ambient pipelines survive an optional failure");
+            assert_eq!(flat_attempts, usize::from(requested));
+            assert!(pass.flat.is_none());
+            assert!(pass.hold.is_some(), "other optional passes are still built");
+            assert!(pass.hold_indirect.is_some());
+        }
     }
 
     /// The hold of the reflections compiles with the system's compiler too
@@ -1042,6 +1216,112 @@ mod tests {
         let source = format!("#define HOLD\n{SOURCE}");
         let code = crate::host::compile(&source, s!("hold"), s!("cs_5_1")).expect("the hold");
         assert!(!code.is_empty());
+    }
+
+    #[test]
+    fn depth_free_floor_preserves_bright_and_colored_light_and_bounds() {
+        use crate::indirect::tests::WarpHarness;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_UINT, DXGI_SAMPLE_DESC};
+
+        let mut gpu = WarpHarness::new().expect("a D3D12 WARP adapter");
+        let pass = make(&gpu.device, |bytes| Some(gpu.default_uav(bytes)), false, true).unwrap();
+        let (initial, initial_bytes, _) = gpu.shared_buffer(256);
+        let (readback, readback_bytes, _) = gpu.shared_buffer(256);
+        // Synthetic RGB9E5: ~0.6 gray, bright gray, saturated RGB and magenta.
+        // These catch both accidental luminance caps and colour rejection.
+        let gray = (15u32 << 27) | 307 | (307 << 9) | (307 << 18);
+        let bright = (19u32 << 27) | 256 | (256 << 9) | (256 << 18);
+        let red = (19u32 << 27) | 256;
+        let green = (19u32 << 27) | (256 << 9);
+        let blue = (19u32 << 27) | (256 << 18);
+        let magenta = red | blue;
+        let sentinel = 0xdeadbeef;
+        // SAFETY: live mapped buffers and D3D12 objects, all kept until the
+        // submitted command list completes. No depth descriptor exists here.
+        unsafe {
+            std::ptr::copy_nonoverlapping([0, gray, bright, red, green, blue, magenta, sentinel].as_ptr(), initial_bytes.cast(), 8);
+            let mut texture = None;
+            gpu.device.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                    Width: 8, Height: 1, DepthOrArraySize: 1, MipLevels: 1,
+                    Format: DXGI_FORMAT_R32_UINT,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    ..Default::default()
+                },
+                D3D12_RESOURCE_STATE_COPY_DEST, None, &mut texture,
+            ).unwrap();
+            let texture: ID3D12Resource = texture.unwrap();
+            let heap: ID3D12DescriptorHeap = gpu.device.CreateDescriptorHeap(
+                &D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, NumDescriptors: 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, ..Default::default()
+                },
+            ).unwrap();
+            gpu.device.CreateUnorderedAccessView(
+                &texture, None::<&ID3D12Resource>, None, heap.GetCPUDescriptorHandleForHeapStart(),
+            );
+            let placed = |r: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(r),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: DXGI_FORMAT_R32_UINT, Width: 8, Height: 1, Depth: 1, RowPitch: 256,
+                        },
+                    },
+                },
+            };
+            let image = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&texture),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            let l = &gpu.list;
+            l.CopyTextureRegion(&image, 0, 0, 0, &placed(&initial), None);
+            l.ResourceBarrier(&[transition(&texture, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+            l.SetDescriptorHeaps(&[Some(heap.clone())]);
+            l.SetComputeRootSignature(&pass.root);
+            let mut words = [0u32; 16];
+            words[1] = 0.3f32.to_bits();
+            words[6] = 7;
+            words[7] = 1;
+            l.SetComputeRoot32BitConstants(0, 16, words.as_ptr().cast(), 0);
+            l.SetComputeRootDescriptorTable(1, heap.GetGPUDescriptorHandleForHeapStart());
+            l.SetComputeRootUnorderedAccessView(2, pass.cells.GetGPUVirtualAddress());
+            l.SetComputeRootUnorderedAccessView(3, pass.points.GetGPUVirtualAddress());
+            l.SetComputeRootUnorderedAccessView(4, pass.stats.GetGPUVirtualAddress());
+            l.SetPipelineState(pass.flat.as_ref().expect("the requested flat pipeline"));
+            l.Dispatch(1, 1, 1);
+            l.ResourceBarrier(&[transition(&texture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            l.CopyTextureRegion(&placed(&readback), 0, 0, 0, &image, None);
+            gpu.submit_and_wait();
+            let pixels = std::slice::from_raw_parts(readback_bytes.cast::<u32>(), 8);
+            let rgb = |v: u32| {
+                let scale = 2.0f32.powi((v >> 27) as i32 - 24);
+                [v & 511, (v >> 9) & 511, (v >> 18) & 511].map(|n| n as f32 * scale)
+            };
+            for (v, wanted) in rgb(pixels[0]).iter().zip([0.3, 0.294, 0.282]) {
+                assert!((v - wanted).abs() < 0.002, "ambient floor {:?}", rgb(pixels[0]));
+            }
+            assert_eq!(pixels[1], gray, "existing illumination stays intact");
+            assert_eq!(pixels[2], bright, "bright light is not capped");
+            for (pixel, original) in pixels[3..7].iter().zip([red, green, blue, magenta]) {
+                for (value, was) in rgb(*pixel).into_iter().zip(rgb(original)) {
+                    if was > 0.0 {
+                        assert_eq!(value, was, "saturated light is preserved");
+                    } else {
+                        assert!((0.25..=0.325).contains(&value), "missing channels receive the floor");
+                    }
+                }
+            }
+            assert_eq!(pixels[7], sentinel, "pixels outside the declared size stay intact");
+            eprintln!("depth-free ambient readback: {:?}", rgb(pixels[0]));
+        }
     }
 
     #[test]
@@ -1060,7 +1340,7 @@ mod tests {
             }
         }
         let mut warp = WarpHarness::new().expect("a D3D12 WARP adapter");
-        let pass = make(&warp.device, |bytes| Some(warp.default_uav(bytes)), true).unwrap();
+        let pass = make(&warp.device, |bytes| Some(warp.default_uav(bytes)), true, false).unwrap();
         let (root, pso) = pass.hold_indirect.as_ref().expect("the guarded hold PSO");
         let (initial, initial_bytes, _) = warp.shared_buffer(256);
         let (readback, readback_bytes, _) = warp.shared_buffer(256);

@@ -185,6 +185,38 @@ The counters also report direct dispatches with zero groups, counted indirect
 dispatches and indirect dispatches with multiple records.
 [Original reflection hold](https://github.com/avatarmanz/VIctory-7900XTX/pull/314)
 
+## Optional diffuse minimum without resolve depth
+
+`VICTORY_AMBIENT_FLAT=0.3` supplies a uniform minimum diffuse illumination
+when the ambient resolve's expected depth SRV cannot be found. It requires
+the ambient stand-in to be enabled, for example with `VICTORY_AMBIENT=1`,
+and follows the same builder gate. With valid depth the existing estimate is
+unchanged; a depth view with mismatched dimensions is still rejected.
+
+The setting is off by default. It accepts a positive finite number capped
+at 2; zero, negative and invalid values disable it. Restart after changing
+it. The pass uses the existing diffuse-light UAV and a root signature with
+no depth SRV, without creating dummy depth or reconstructing normals. It
+raises each channel to at least the slightly warm neutral floor, before
+the title applies materials. Existing light is neither rejected by color
+nor capped in brightness; RGB9E5 packing still quantizes the result.
+
+This is a visibility approximation, not restored ray tracing, occlusion or
+light direction. It can flatten shadowed materials and brighten regions
+that should remain dark. It does not replace colored probe irradiance or
+modify the final display image. Matched scene and performance verification
+is required before selecting a level for a particular setup.
+
+Synthetic D3D12 readback tests cover the absent depth descriptor, the floor
+on black pixels, preserved bright and saturated light, and dispatch bounds.
+Settings and routing tests cover disabled or invalid levels, the maximum
+clamp, valid depth, and incompatible dimensions, samples or texture type.
+
+The flat pipeline is created only when the option is requested. If its
+creation fails, the existing ambient passes remain available; the missing-depth
+resolve is left unchanged instead. A synthetic setup test rejects the optional
+shader to verify this failure path and verifies it is never attempted when off.
+
 ## Where to look
 
 - `crates/victory-shader/src/bvh.rs`: the reference for the node test.

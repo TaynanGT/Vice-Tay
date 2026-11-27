@@ -111,6 +111,11 @@ How each of these was found, with the numbers:
 - **Scripted keys** (`VICTORY_KEYS_FILE`): the file is taken by renaming it before
   it is read, so a batch written meanwhile is never deleted unread.
 
+- **DSP convolution.** Add `-More @{VICTORY_DSP_CONVOLUTION='1'}` to test the
+  host convolution path for phone calls and other filtered audio. Compare
+  the same call with the option off and on, at the same volume.
+  [Upstream test](https://github.com/Marvisak/VIctory/pull/3332)
+
 ## Measuring
 
 With a diagnostics build, add `-More @{VICTORY_JOIN_REASONS='1'}` to log why

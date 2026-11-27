@@ -574,14 +574,14 @@ fn wave_pairs_listed(input: &[u8]) -> bool {
 /// - the shadow mask, `CS_ShadowRenderTiled*` (18 programs): whole 16x16 tiles black or lit
 ///   (stair-stepped shadows on the ground and squares on characters);
 /// - the water's transmission volumetrics, `CS_TransmissionVolumetrics_Tiled`,
-///   `_Tiled_LocalLights` and `_Submerged`: dark blocks on open water and a broken view under
+///   `_Tiled_LocalLights`, `_GenerateTiles` and `_Submerged`: dark blocks on open water and a broken view under
 ///   water;
 /// - the atmospheric diffusion and its depth scan, `CS_GatherDiffusion`, `CS_ScanMip0..3`, with
 ///   `CS_DeferredFallbacksAlpha_SkyProbe` and `CS_TemporalResolve2_Opaque_FrameStatistics`: a
 ///   halo around dark silhouettes against the sky.
 ///
-/// Together they cost about 0.1 ms of card time a frame (a timing run on an RTX 4090).
-const DEFAULT_WAVE_PAIRS_HASHES: [&str; 28] = [
+/// A timing run on an RTX 4090 measured about 0.1 ms per frame for the first 28 programs.
+const DEFAULT_WAVE_PAIRS_HASHES: [&str; 29] = [
     // shadow mask
     "191ecaed66eea3b1", "1d44a723bdebbf27", "20b78ee12ecdb57d", "240cb516c1af0bc3",
     "31d703207b51549a", "466ec41d3f9d24c0", "56f3bf2d9388e5a7", "65de113e23fa4fdd",
@@ -589,7 +589,7 @@ const DEFAULT_WAVE_PAIRS_HASHES: [&str; 28] = [
     "b4b0427232707598", "be6ce5d849d51127", "ce79e9eba7ae0348", "d7db57731ada919b",
     "f133e35efed2a48a", "fa0bd10a35bfef3c",
     // water
-    "5dc3b25986622949", "6f225b641c5b0708", "926c46bab3b86bd6",
+    "5dc3b25986622949", "6f225b641c5b0708", "926c46bab3b86bd6", "1aa247ed3653b616",
     // diffusion / sky
     "ce2378e5e8711aad", "b7953a05b189dfc1", "71883e40620a567a",
     "3c196d81eca7ff15", "acf14a70f37fb012", "f79824724d8e2daf", "f0aa2b1e79275592",

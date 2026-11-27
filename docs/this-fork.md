@@ -89,17 +89,16 @@ How each of these was found, with the numbers:
   - **paired lanes**: a console wave of 64 runs in one host wave of 32, each thread
     lowering two console lanes, so wave-wide sums, first-lane reads and LDS shared
     within the console wave are exact (after ByFxbian's #1397 and #1419 on
-    fxceless/victory-fork). 28 programs take this form by default, the ones whose
+    fxceless/victory-fork). 29 programs take this form by default, the ones whose
     other forms left the picture wrong: the tiled shadow mask (stair-stepped shadow
-    tiles), the water's transmission volumetrics (dark blocks on open water, the
-    view under water) and the atmospheric diffusion with its depth scan (a halo at
+    tiles), the water's transmission volumetrics and tile generation (dark blocks on
+    open water, the view under water) and atmospheric diffusion with its depth scan (a halo at
     silhouettes against the sky). `VICTORY_WAVE_PAIRS_ONLY=<log hashes>` names other
     programs (`none`: none), `VICTORY_WAVE_PAIRS=1` tries the form for every wave64
     compute program that needs it, and `VICTORY_WAVE_PAIRS_FP32=non-ieee-rne-ftz`
     confirms the guest float mode for the ordered FP32 reductions of programs that
     are not on the default list.
-- The translator's version is 2: the shader cache translates again what version 1
-  made.
+- The shader cache rebuilds entries when the translator version changes.
 
 ## Loading and the runtime
 

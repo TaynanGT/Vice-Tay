@@ -514,6 +514,7 @@ fn note_shown(hwnd: HWND) {
             .is_ok()
     {
         super::gameinput::mouse::attach(hwnd);
+        super::gameinput::mouse::sync_cursor(hwnd);
     }
 }
 
@@ -523,9 +524,12 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    use super::gameinput::mouse;
+
     // A user close (close button, Alt+F4, window or taskbar menu); a
     // console title never sees one, nor a WM_CLOSE from it.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_CLOSE as usize {
+        mouse::release_cursor(hwnd);
         note_close("SC_CLOSE");
         end_title("window closed", Box::new(|| {}));
         return 0;
@@ -536,16 +540,33 @@ extern "system" fn window_proc(
     note_shown(hwnd);
     let title_window = TITLE_WINDOW.load(std::sync::atomic::Ordering::Relaxed) == hwnd as usize;
     if message == wm::WM_CLOSE && title_window {
+        mouse::release_cursor(hwnd);
         note_close("WM_CLOSE to the title's window");
         end_title("window closed", Box::new(|| {}));
         return 0;
     }
     if title_window && switches_full_screen(message, wparam, lparam) {
         toggle_full_screen(hwnd);
+        mouse::sync_cursor(hwnd);
         return 0;
     }
-    if title_window && message == wm::WM_INPUT {
-        super::gameinput::mouse::receive(hwnd, wparam, lparam);
+    if title_window {
+        match message {
+            wm::WM_INPUT => mouse::receive(hwnd, wparam, lparam),
+            wm::WM_KILLFOCUS => mouse::release_cursor(hwnd),
+            wm::WM_ENTERSIZEMOVE => mouse::move_or_size(hwnd, true),
+            wm::WM_EXITSIZEMOVE => mouse::move_or_size(hwnd, false),
+            wm::WM_ACTIVATE if wparam & 0xffff == wm::WA_INACTIVE as usize => {
+                mouse::release_cursor(hwnd);
+            }
+            wm::WM_ACTIVATE | wm::WM_SETFOCUS | wm::WM_WINDOWPOSCHANGED => mouse::sync_cursor(hwnd),
+            wm::WM_SETCURSOR
+                if lparam & 0xffff == wm::HTCLIENT as LPARAM && mouse::hide_cursor(hwnd) =>
+            {
+                return 1;
+            }
+            _ => {}
+        }
     }
     if message == wm::WM_NCDESTROY {
         WINDOWS.lock().unwrap_or_else(|e| e.into_inner()).remove(&(hwnd as usize));

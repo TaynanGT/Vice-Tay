@@ -2,9 +2,13 @@
 
 use std::io;
 use std::ptr::null_mut;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
 
-use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, HWND, LPARAM, WPARAM};
+use windows_sys::Win32::Foundation::{
+    ERROR_INSUFFICIENT_BUFFER, HWND, LPARAM, POINT, RECT, WPARAM,
+};
+use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON, VK_XBUTTON1, VK_XBUTTON2,
 };
@@ -14,7 +18,8 @@ use windows_sys::Win32::UI::Input::{
     RegisterRawInputDevices,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, RI_MOUSE_HWHEEL, RI_MOUSE_WHEEL, RIM_INPUT,
+    ClipCursor, GetClientRect, GetClipCursor, GetForegroundWindow, IsIconic, RI_MOUSE_HWHEEL,
+    RI_MOUSE_WHEEL, RIM_INPUT, SetCursor,
 };
 
 use super::{MouseState, lock};
@@ -31,9 +36,164 @@ struct Capture {
     state: MouseState,
 }
 
-static ENABLED: LazyLock<bool> =
+static GAMEINPUT_MOUSE: LazyLock<bool> =
     LazyLock::new(|| std::env::var_os("VICTORY_GAMEPAD_MOUSE").is_some_and(|v| v == "1"));
+static LOOK_SENSITIVITY: LazyLock<Option<f32>> = LazyLock::new(|| {
+    std::env::var_os("VICTORY_MOUSE_LOOK")
+        .is_some_and(|v| v == "1")
+        .then(|| {
+            std::env::var("VICTORY_MOUSE_SENS")
+                .ok()
+                .and_then(|value| value.trim().parse::<f32>().ok())
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .unwrap_or(0.045)
+        })
+});
 static CAPTURE: LazyLock<Mutex<Capture>> = LazyLock::new(|| Mutex::new(Capture::default()));
+
+static CLIP_ENABLED: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("VICTORY_MOUSE_CAPTURE").is_some_and(|v| v == "1"));
+
+#[derive(Clone, Copy)]
+struct CursorClip {
+    window: usize,
+    rect: RECT,
+}
+
+static CURSOR_CLIP: Mutex<Option<CursorClip>> = Mutex::new(None);
+static MOVING_OR_SIZING: AtomicUsize = AtomicUsize::new(0);
+
+fn same_rect(a: &RECT, b: &RECT) -> bool {
+    (a.left, a.top, a.right, a.bottom) == (b.left, b.top, b.right, b.bottom)
+}
+
+fn current_clip() -> Option<RECT> {
+    let mut current = RECT::default();
+    // SAFETY: plain query into our rectangle.
+    ((unsafe { GetClipCursor(&mut current) }) != 0).then_some(current)
+}
+
+pub(in crate::modules) fn release_cursor(window: HWND) {
+    if !*CLIP_ENABLED {
+        return;
+    }
+    let clip = {
+        let mut active = lock(&CURSOR_CLIP);
+        if !active.is_some_and(|clip| clip.window == window as usize) {
+            return;
+        }
+        active.take().unwrap()
+    };
+    if current_clip().is_some_and(|current| same_rect(&current, &clip.rect)) {
+        // SAFETY: release the clip we set before giving focus away.
+        unsafe { ClipCursor(std::ptr::null()) };
+    }
+}
+
+pub(in crate::modules) fn sync_cursor(window: HWND) {
+    if !*CLIP_ENABLED || MOVING_OR_SIZING.load(Ordering::Relaxed) == window as usize {
+        return;
+    }
+    let mut rect = RECT::default();
+    // SAFETY: plain window queries with a live rectangle as output.
+    if unsafe {
+        GetForegroundWindow() != window
+            || IsIconic(window) != 0
+            || GetClientRect(window, &mut rect) == 0
+    } {
+        release_cursor(window);
+        return;
+    }
+    let mut first = POINT {
+        x: rect.left,
+        y: rect.top,
+    };
+    let mut last = POINT {
+        x: rect.right,
+        y: rect.bottom,
+    };
+    // SAFETY: the window is live and both coordinates are initialized.
+    if unsafe { ClientToScreen(window, &mut first) == 0 || ClientToScreen(window, &mut last) == 0 }
+        || first.x >= last.x
+        || first.y >= last.y
+    {
+        release_cursor(window);
+        return;
+    }
+    let rect = RECT {
+        left: first.x,
+        top: first.y,
+        right: last.x,
+        bottom: last.y,
+    };
+    if lock(&CURSOR_CLIP)
+        .is_some_and(|clip| clip.window == window as usize && same_rect(&clip.rect, &rect))
+        && current_clip().is_some_and(|current| same_rect(&current, &rect))
+    {
+        return;
+    }
+    // SAFETY: screen-coordinate clipping rectangle remains live for the call.
+    if unsafe { ClipCursor(&rect) } != 0 {
+        let Some(rect) = current_clip() else {
+            // SAFETY: we just set the clip. Drop it if its bounds cannot be tracked.
+            unsafe { ClipCursor(std::ptr::null()) };
+            release_cursor(window);
+            return;
+        };
+        *lock(&CURSOR_CLIP) = Some(CursorClip {
+            window: window as usize,
+            rect,
+        });
+        hide_cursor(window);
+        // SAFETY: focus may change while applying the rectangle.
+        if unsafe { GetForegroundWindow() } != window {
+            release_cursor(window);
+        }
+    }
+}
+
+/// Let Windows move the pointer with the window's resize handle.
+pub(in crate::modules) fn move_or_size(window: HWND, active: bool) {
+    if !*CLIP_ENABLED {
+        return;
+    }
+    if active {
+        MOVING_OR_SIZING.store(window as usize, Ordering::Relaxed);
+        release_cursor(window);
+    } else {
+        let _ = MOVING_OR_SIZING.compare_exchange(
+            window as usize,
+            0,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+        sync_cursor(window);
+    }
+}
+
+pub(in crate::modules) fn hide_cursor(window: HWND) -> bool {
+    if !*CLIP_ENABLED || !lock(&CURSOR_CLIP).is_some_and(|clip| clip.window == window as usize) {
+        return false;
+    }
+    // SAFETY: only set the cursor for our foreground window; null hides it.
+    if unsafe { GetForegroundWindow() } != window {
+        return false;
+    }
+    unsafe { SetCursor(null_mut()) };
+    true
+}
+
+pub(super) fn gameinput_enabled() -> bool {
+    *GAMEINPUT_MOUSE
+}
+
+pub(super) fn look_sensitivity() -> Option<f32> {
+    *LOOK_SENSITIVITY
+}
+
+fn enabled() -> bool {
+    gameinput_enabled() || look_sensitivity().is_some()
+}
 
 /// Raw Input is process-wide. Inspect the registrations before adding ours.
 fn registered_mouse() -> io::Result<Option<RAWINPUTDEVICE>> {
@@ -76,7 +236,7 @@ fn register(window: HWND, flags: u32) -> io::Result<()> {
 }
 
 pub(in crate::modules) fn attach(window: HWND) {
-    if !*ENABLED {
+    if !enabled() {
         return;
     }
     match registered_mouse() {
@@ -101,7 +261,10 @@ pub(in crate::modules) fn attach(window: HWND) {
 }
 
 pub(in crate::modules) fn detach(window: HWND) {
-    if !*ENABLED {
+    release_cursor(window);
+    let _ =
+        MOVING_OR_SIZING.compare_exchange(window as usize, 0, Ordering::Relaxed, Ordering::Relaxed);
+    if !enabled() {
         return;
     }
     {
@@ -122,7 +285,7 @@ pub(in crate::modules) fn detach(window: HWND) {
 
 /// Observe a foreground mouse packet without taking it from the title's procedure.
 pub(in crate::modules) fn receive(window: HWND, wparam: WPARAM, lparam: LPARAM) {
-    if !*ENABLED || wparam & 0xff != RIM_INPUT as usize {
+    if !enabled() || wparam & 0xff != RIM_INPUT as usize {
         return;
     }
     let mut capture = lock(&CAPTURE);
@@ -181,7 +344,7 @@ fn accumulate(state: &mut MouseState, mouse: RAWMOUSE) {
 }
 
 pub(super) fn sample() -> Option<MouseState> {
-    if !*ENABLED {
+    if !enabled() {
         return None;
     }
     // SAFETY: plain foreground window and physical button queries.

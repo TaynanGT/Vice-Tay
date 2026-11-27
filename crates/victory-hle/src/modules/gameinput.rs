@@ -126,6 +126,33 @@ struct MouseState {
 const _: () =
     assert!(size_of::<MouseState>() == 40 && std::mem::offset_of!(MouseState, position_x) == 8);
 
+/// Converts focused mouse samples into the fallback pad's right stick.
+#[cfg(any(windows, test))]
+#[derive(Default)]
+struct MouseLook {
+    previous: Option<(i64, i64)>,
+}
+
+#[cfg(any(windows, test))]
+impl MouseLook {
+    fn sample(&mut self, mouse: Option<MouseState>, sensitivity: f32) -> PadState {
+        let Some(mouse) = mouse else {
+            self.previous = None;
+            return PadState::default();
+        };
+        let (x, y) = (mouse.position_x, mouse.position_y);
+        let (old_x, old_y) = self.previous.replace((x, y)).unwrap_or((x, y));
+        PadState {
+            right_x: (x.saturating_sub(old_x) as f32 * sensitivity).clamp(-1.0, 1.0),
+            right_y: (-(y.saturating_sub(old_y) as f32) * sensitivity).clamp(-1.0, 1.0),
+            // The first two GameInput mouse button bits are left and right.
+            right_trigger: if mouse.buttons & 1 != 0 { 1.0 } else { 0.0 },
+            left_trigger: if mouse.buttons & 2 != 0 { 1.0 } else { 0.0 },
+            ..PadState::default()
+        }
+    }
+}
+
 /// Host input, or a fake in tests.
 trait Source: Send {
     /// The pad in host slot `slot`, `None` when the slot is empty.
@@ -136,6 +163,9 @@ trait Source: Send {
     /// The mouse while the title window has focus, if enabled.
     fn mouse(&mut self) -> Option<MouseState> {
         None
+    }
+    fn mouse_stick(&mut self, _mouse: Option<MouseState>) -> PadState {
+        PadState::default()
     }
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
@@ -458,14 +488,17 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys, mouse) = {
+        let (pads, keys, mouse, mouse_stick) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys(), source.mouse())
+            let keys = source.keys();
+            let mouse = source.mouse();
+            let mouse_stick = source.mouse_stick(mouse);
+            (pads, keys, mouse, mouse_stick)
         };
         let events = self
             .state()
-            .poll(&self.devices, self.one_pad, pads, keys, mouse);
+            .poll(&self.devices, self.one_pad, pads, keys, mouse, mouse_stick);
         self.deliver(events);
     }
 
@@ -512,21 +545,35 @@ impl State {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
         mouse: Option<MouseState>,
+        mouse_stick: PadState,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
         self.update(devices, MOUSE, mouse.map(Value::Mouse), now, &mut events);
+        let any_pad = pads.iter().any(Option::is_some);
+        #[cfg(feature = "diagnostics")]
+        if !any_pad && (mouse_stick.right_x != 0.0 || mouse_stick.right_y != 0.0) {
+            static REPORTED: std::sync::Once = std::sync::Once::new();
+            REPORTED.call_once(|| tracing::info!("mouse motion reached the fallback gamepad right stick"));
+        }
+        let stand_in = || {
+            let keyboard = fallback(&keys);
+            if any_pad {
+                keyboard
+            } else {
+                merged(keyboard, mouse_stick)
+            }
+        };
         if one_pad {
-            let pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
+            let pad = pads.into_iter().flatten().fold(stand_in(), merged);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
             self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
             return events;
         }
-        let any_pad = pads.iter().any(Option::is_some);
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then(|| Value::Pad(stand_in()));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1236,6 +1283,7 @@ mod host {
         /// The input snapshot for this poll and the HID connection owning each slot.
         pads: [Option<PadState>; PADS],
         hid_slots: [Option<u64>; PADS],
+        mouse_look: super::MouseLook,
     }
 
     impl Host {
@@ -1311,7 +1359,19 @@ mod host {
         }
 
         fn mouse(&mut self) -> Option<MouseState> {
-            super::mouse::sample()
+            if super::mouse::gameinput_enabled() {
+                super::mouse::sample()
+            } else {
+                None
+            }
+        }
+
+        fn mouse_stick(&mut self, mouse: Option<MouseState>) -> PadState {
+            let Some(sensitivity) = super::mouse::look_sensitivity() else {
+                return PadState::default();
+            };
+            self.mouse_look
+                .sample(mouse.or_else(super::mouse::sample), sensitivity)
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
@@ -1547,11 +1607,59 @@ mod tests {
     use victory_loader::Provenance;
     use victory_pe::ImportSymbol;
 
+    #[test]
+    fn mouse_look_clamps_deltas_and_resets_on_focus_loss() {
+        let mut look = MouseLook::default();
+        let at = |position_x, position_y| {
+            Some(MouseState {
+                position_x,
+                position_y,
+                ..Default::default()
+            })
+        };
+        assert_eq!(look.sample(at(100, 200), 0.25), PadState::default());
+        let moved = look.sample(at(102, 199), 0.25);
+        assert_eq!((moved.right_x, moved.right_y), (0.5, 0.25));
+        let large = look.sample(at(12, 299), 0.25);
+        assert_eq!((large.right_x, large.right_y), (-1.0, -1.0));
+        assert_eq!(look.sample(at(12, 299), 0.25), PadState::default());
+        assert_eq!(look.sample(None, 0.25), PadState::default());
+        assert_eq!(look.sample(at(999, 1120), 0.25), PadState::default());
+        let buttons = Some(MouseState { buttons: 3, ..Default::default() });
+        let pressed = look.sample(buttons, 0.25);
+        assert_eq!((pressed.left_trigger, pressed.right_trigger), (1.0, 1.0));
+        assert_eq!(look.sample(None, 0.25), PadState::default());
+    }
+
+    #[test]
+    fn mouse_stick_has_effect_only_without_a_physical_pad() {
+        for one_pad in [false, true] {
+            let (hub, host) = fake_with(one_pad);
+            host.lock().unwrap().mouse_stick.right_x = 0.5;
+            hub.poll();
+            let state = hub.state();
+            let reading = state.slots[FALLBACK].history.back().unwrap();
+            assert!(matches!(&reading.value, Value::Pad(pad) if pad.right_x == 0.5));
+            drop(state);
+
+            host.lock().unwrap().pads[0] = Some(PadState {
+                right_x: -0.25,
+                ..PadState::default()
+            });
+            hub.poll();
+            let state = hub.state();
+            let active = if one_pad { FALLBACK } else { 0 };
+            let reading = state.slots[active].history.back().unwrap();
+            assert!(matches!(&reading.value, Value::Pad(pad) if pad.right_x == -0.25));
+        }
+    }
+
     #[derive(Default)]
     struct FakeHost {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
         mouse: Option<MouseState>,
+        mouse_stick: PadState,
         rumble: Vec<(usize, u16, u16)>,
     }
 
@@ -1566,6 +1674,9 @@ mod tests {
         }
         fn mouse(&mut self) -> Option<MouseState> {
             self.0.lock().unwrap().mouse
+        }
+        fn mouse_stick(&mut self, _mouse: Option<MouseState>) -> PadState {
+            self.0.lock().unwrap().mouse_stick
         }
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
             self.0.lock().unwrap().rumble.push((slot, low, high));

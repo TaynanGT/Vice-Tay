@@ -32,7 +32,7 @@ param(
     [ValidateSet('quality', 'balanced', 'performance')][string]$Fsr4K,
     [ValidateSet('quality', 'balanced', 'performance')][string]$Dlss4K,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
-    [ValidateSet('auto', '7900xtx', '4070', '4070tisuper', '4090', 'laptop')][string]$Machine = 'auto',
+    [ValidateSet('auto', '7900xtx', '3060ti', '4070', '4070tisuper', '4090', 'laptop')][string]$Machine = 'auto',
     [hashtable]$More = @{}
 )
 $settings = @{
@@ -110,6 +110,24 @@ if ($Machine -eq '4070tisuper') {
         $settings.VICTORY_CARD_RESERVE_BUDGETS = '1'
         $settings.VICTORY_CARD_BUFFERS_MIN_KB = '64'; $settings.VICTORY_CARD_BUFFERS_MB = '1536'
         $settings.VICTORY_CARD_WINDOWS_MB = '1024'; $settings.VICTORY_WINDOWS_BAR_MB = '4096'
+    }
+}
+if ($Machine -eq '3060ti') {
+    # RTX 3060 Ti (8 GB VRAM)
+    # Conservative memory budgets for 8 GB cards.
+    $settings.VICTORY_THIN_THREADS = '8'
+    $settings.VICTORY_UNDER_THREADS = '6'
+    $settings.VICTORY_LAND_THREADS = '4'
+
+    $settings.VICTORY_MAP_THREADS = '1'
+    $settings.VICTORY_PIPELINE_WORKERS = '3'
+
+    if (-not $Safe) {
+        $settings.VICTORY_CARD_RESERVE_BUDGETS = '1'
+        $settings.VICTORY_CARD_BUFFERS_MIN_KB = '64'
+        $settings.VICTORY_CARD_BUFFERS_MB = '1024'
+        $settings.VICTORY_CARD_WINDOWS_MB = '512'
+        $settings.VICTORY_WINDOWS_BAR_MB = '1024'
     }
 }
 if ($Machine -eq 'laptop') {

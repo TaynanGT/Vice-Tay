@@ -72,8 +72,7 @@ Use [`Play-VIctory.cmd`](Play-VIctory.cmd) to pass the same options from Command
 | Option | Use it to |
 | --- | --- |
 | `-Console series-s` | Select the lighter console profile used in the sessions above. |
-| `-Machine 4090` / `-Machine 4070` / `-Machine 7900xtx` | Select a GPU preset explicitly. See the [RTX 4070 test notes](docs/rtx4070-performance.md). |
-| `-Machine 4070tisuper` | The RTX 4070 Ti SUPER (16 GB) preset, asked for explicitly. With Resizable BAR on, it moves up to 4 GB of shader-read windows from RAM into the card's memory. |
+| `-Machine 4090` / `-Machine 3060ti` / `-Machine 4070` / `-Machine 4070tisuper` / `-Machine 7900xtx` | Select a GPU preset explicitly. See the [RTX 4070 test notes](docs/rtx4070-performance.md). |
 | `-Machine laptop` | Try the [16 GB NVIDIA laptop preset](docs/laptop-16gb.md), measured on one RTX 3050 laptop. |
 | `-Safe` | Launch with the conservative settings when investigating a graphics or stability issue. |
 | `-Windowed` / `-NoPanel` | Start in a window or hide the diagnostics overlay at launch. |

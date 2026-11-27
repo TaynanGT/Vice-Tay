@@ -677,7 +677,7 @@ void main() {
         }
 
         /// On the software adapter, or the first one (for measurements).
-        fn on(software: bool) -> Option<Self> {
+        pub(crate) fn on(software: bool) -> Option<Self> {
             let turn = warp_turn();
             // SAFETY: plain DXGI query and D3D12 test harness setup.
             unsafe {

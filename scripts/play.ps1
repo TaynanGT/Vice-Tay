@@ -156,6 +156,19 @@ if ($Machine -eq '7900xtx') {
         $autoAdds = Get-AutoNvidiaSettings $cardGb $coreCount ([bool]$Safe)
         foreach ($k in $autoAdds.Keys) { $settings[$k] = $autoAdds[$k] }
     }
+    # Ten or more physical cores: the guards' shared lock (renderer port 6) and the journal's
+    # shared notes (renderer port 7). On a Ryzen 9 7900X (12 cores) with an RTX 4070 Ti, Series S,
+    # in the prison cell, each took 1.2-1.6 ms off a 44-45 ms frame and both together 1.9-2.0 ms,
+    # in two runs switching every 5 s (VICTORY_AB); across separate runs, port 6 took the median
+    # from 21.9 to 22.9 fps. On an eight-core 9800X3D port 6 measured slower (issue #364), so
+    # fewer cores keep the defaults.
+    $physical = if ($coreCount) { $coreCount } else {
+        (Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Measure-Object -Property NumberOfCores -Sum).Sum
+    }
+    # (This branch is the NVIDIA presets': -Machine auto without an NVIDIA card is 7900xtx.)
+    if (-not $Safe -and $physical -ge 10) {
+        $settings.VICTORY_PORT_GUARD = '1'; $settings.VICTORY_PORT_JOURNAL = '1'
+    }
 }
 if ($Machine -in '4070', '3060') {
     # Ryzen 7 7800X3D: eight physical cores, versus the 4090 test PC's sixteen.

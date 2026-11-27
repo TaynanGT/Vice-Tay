@@ -37,15 +37,33 @@ $settings = @{
     VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = 'light'
 }
 $ram = (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).TotalPhysicalMemory
+$controllers = @(if ($Machine -in 'auto', '7900xtx') {
+    Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue
+})
+$hasNvidia = [bool]($controllers.PNPDeviceID -match 'VEN_10DE')
 if ($Machine -eq 'auto') {
     # Use the existing vendor defaults. The 4070 / 7800X3D profile is explicit.
-    $cards = @(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | ForEach-Object { $_.PNPDeviceID })
-    $Machine = if ($cards -match 'VEN_10DE') { '4090' } else { '7900xtx' }
+    $Machine = if ($hasNvidia) { '4090' } else { '7900xtx' }
 }
 if ($Machine -eq '7900xtx') {
     # i9-12900K, RX 7900 XTX, 64 GB: the page-mapping lock was fastest with one
     # thread, and the AMD driver lowers its clocks between submissions.
     $settings.VICTORY_MAP_THREADS = '1'; $settings.VICTORY_CARD_AWAKE = '1'
+
+    # Issue #138 reported device resets in relay modes 1 and 2 on these drivers.
+    if (-not $hasNvidia -and -not $More.ContainsKey('VICTORY_RELAY')) {
+        $affected = $controllers | Where-Object {
+            $_.PNPDeviceID -match 'VEN_1002' -and $_.Name -match '\bRX\s+6700\s+XT\b' -and
+                $_.DriverVersion -in '32.0.21045.26001', '32.0.32029.2010'
+        } | Select-Object -First 1
+        if ($affected) {
+            $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+            if (($os.BuildNumber -as [int]) -ge 22000 -and $os.Caption -match '\bLTSC\b') {
+                $settings.VICTORY_RELAY = '0'
+                Write-Host "Using relay mode 0 for the RX 6700 XT on Windows 11 LTSC (driver $($affected.DriverVersion), issue #138)."
+            }
+        }
+    }
 } else {
     # RTX 4090, Ryzen 9 9950X3D (16 cores of one kind, two caches), 48 GB.
     # NVIDIA sets its clocks by the driver's power mode: no spinner on the

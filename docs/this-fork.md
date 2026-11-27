@@ -25,6 +25,15 @@ where there is one; the default is the behaviour described.
   estimate from the queue's idle time when Windows has no sample (`EST`). The
   HUD is Belo's.
 
+- **A chosen monitor** (`VICTORY_MONITOR`): the device name (`DISPLAY3`) or the
+  monitor's 1-based number in Windows' enumeration order (the order
+  `EnumDisplayMonitors` lists them, not the numbers in Windows' display settings).
+  The title's own top-level window is centred on that monitor's work area (a size
+  left to Windows becomes three quarters of it, then `VICTORY_WINDOW_MAX` applies),
+  and with `VICTORY_FULLSCREEN=1` full screen covers that monitor. Tool, child and
+  owned windows stay where Windows puts them; the separate DXGI fallback window
+  keeps its own placement. Example: `scripts\play.ps1 -Exe <exe> -More @{VICTORY_MONITOR='DISPLAY3'}`.
+
 ## Memory and frame rate
 
 How each of these was found, with the numbers:

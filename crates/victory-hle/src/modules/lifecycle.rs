@@ -163,10 +163,11 @@ fn place(
     width: i32,
     height: i32,
 ) -> (Windowed, Option<WindowState>) {
-    let windowed = (ex_style, style, fit(parent, x, y, width, height));
-    // The monitor `VICTORY_MONITOR` names (whole area), else the primary.
-    let chosen = chosen_monitor().map(|(_, whole)| whole);
-    let (origin, screen) = match chosen {
+    // The monitor `VICTORY_MONITOR` names, looked up once: its work area for
+    // the window, its whole area for full screen.
+    let chosen = chosen_monitor();
+    let windowed = (ex_style, style, fit(ex_style, style, parent, x, y, width, height, chosen.map(|(work, _)| work)));
+    let (origin, screen) = match chosen.map(|(_, whole)| whole) {
         Some(m) => ((m.left, m.top), (m.right - m.left, m.bottom - m.top)),
         // SAFETY: plain queries of the primary monitor's size.
         None => ((0, 0), unsafe { (wm::GetSystemMetrics(wm::SM_CXSCREEN), wm::GetSystemMetrics(wm::SM_CYSCREEN)) }),
@@ -280,11 +281,18 @@ fn full_screen_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_FULLSCREEN").is_some_and(|v| v == "1"))
 }
 
+/// Whether a window the title makes is its own top-level window, the kind that
+/// goes full screen or onto the chosen monitor: not one with a parent or
+/// owner, not a child, not a tool window.
+fn placeable(ex_style: u32, style: u32, parented: bool) -> bool {
+    !parented && style & wm::WS_CHILD == 0 && ex_style & wm::WS_EX_TOOLWINDOW == 0
+}
+
 /// The styles and place of a full-screen window on a screen of `screen`
 /// pixels: a frameless popup over all of it. None for a window that keeps
 /// its own (one with a parent or owner, a child, a tool window).
 fn full_screen(ex_style: u32, style: u32, parented: bool, screen: (i32, i32)) -> Option<(u32, u32, (i32, i32, i32, i32))> {
-    if parented || style & wm::WS_CHILD != 0 || ex_style & wm::WS_EX_TOOLWINDOW != 0 || screen.0 <= 0 || screen.1 <= 0 {
+    if !placeable(ex_style, style, parented) || screen.0 <= 0 || screen.1 <= 0 {
         return None;
     }
     let kept = wm::WS_VISIBLE | wm::WS_DISABLED | wm::WS_CLIPCHILDREN | wm::WS_CLIPSIBLINGS;
@@ -298,18 +306,25 @@ fn full_screen(ex_style: u32, style: u32, parented: bool, screen: (i32, i32)) ->
 /// its proportions, and centred; what it shows is scaled to it (the swap
 /// chain stretches). `VICTORY_WINDOW_MAX=WIDTHxHEIGHT` applies a smaller
 /// limit without changing the title's render targets.
-fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32, i32) {
-    // A monitor named by `VICTORY_MONITOR`: the window goes there, fitted
-    // and centred, whatever the title asked for.
-    if parent.is_null()
-        && let Some((area, _)) = chosen_monitor()
+#[allow(clippy::too_many_arguments)]
+fn fit(
+    ex_style: u32,
+    style: u32,
+    parent: HWND,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    chosen: Option<RECT>,
+) -> (i32, i32, i32, i32) {
+    // A monitor named by `VICTORY_MONITOR` (its work area, `chosen`): the
+    // title's own top-level window goes there, fitted and centred.
+    if placeable(ex_style, style, !parent.is_null())
+        && let Some(area) = chosen
+        && let Some(placed) = on_monitor(&area, width, height, window_limit())
     {
-        let (w, h) = fit_with_limit(&area, width, height, window_limit());
-        let (w, h) = if w > 0 && h > 0 { (w, h) } else { (area.right - area.left, area.bottom - area.top) };
-        let left = area.left + (area.right - area.left - w) / 2;
-        let top = area.top + (area.bottom - area.top - h) / 2;
-        tracing::info!(width, height, to = ?(left, top, w, h), "title window put on the monitor VICTORY_MONITOR names");
-        return (left, top, w, h);
+        tracing::info!(width, height, to = ?placed, "title window put on the monitor VICTORY_MONITOR names");
+        return placed;
     }
     let mut area = RECT::default();
     // SAFETY: `area` receives the primary monitor's work area.
@@ -325,6 +340,25 @@ fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32,
     let left = area.left + (area.right - area.left - w) / 2;
     let top = area.top + (area.bottom - area.top - h) / 2;
     (left, top, w, h)
+}
+
+/// Where a window of `width` x `height` goes on the work area `area` of the
+/// chosen monitor: a size the title left to Windows (`CW_USEDEFAULT`) is
+/// first made three quarters of the area (as the restore path does), then
+/// the size is fitted to the area and to `limit` (`VICTORY_WINDOW_MAX`) and
+/// centred. `None` for a window with no size of its own (a zero-sized
+/// helper keeps what it asked for).
+fn on_monitor(area: &RECT, width: i32, height: i32, limit: Option<(i32, i32)>) -> Option<(i32, i32, i32, i32)> {
+    let (aw, ah) = (area.right - area.left, area.bottom - area.top);
+    if aw <= 0 || ah <= 0 {
+        return None;
+    }
+    let (width, height) = if width == wm::CW_USEDEFAULT { ((aw * 3 / 4).max(1), (ah * 3 / 4).max(1)) } else { (width, height) };
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    let (w, h) = fit_with_limit(area, width, height, limit);
+    Some((area.left + (aw - w) / 2, area.top + (ah - h) / 2, w, h))
 }
 
 /// The monitor `VICTORY_MONITOR` names: its device name (`DISPLAY3` or
@@ -691,6 +725,36 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A window on a monitor left of and above the primary (negative origin),
+    /// whose size the title left to Windows, with a 1280x720 cap: a default
+    /// size resolved on that monitor first, then capped and centred; that is
+    /// also the rectangle the first exit from full screen restores.
+    #[test]
+    fn a_default_sized_window_on_the_chosen_monitor_is_resolved_then_capped() {
+        let area = RECT { left: -2560, top: -200, right: 0, bottom: 1240 };
+        let default = wm::CW_USEDEFAULT;
+        let placed = on_monitor(&area, default, default, Some((1280, 720))).unwrap();
+        assert_eq!(placed, (-1920, 160, 1280, 720));
+        // Without the cap: three quarters of the work area, centred.
+        assert_eq!(on_monitor(&area, default, default, None), Some((-2240, -20, 1920, 1080)));
+        // A size of its own, larger than the cap: fitted, centred.
+        assert_eq!(on_monitor(&area, 2560, 1440, Some((1280, 720))), Some((-1920, 160, 1280, 720)));
+        // A zero-sized helper keeps what it asked for.
+        assert_eq!(on_monitor(&area, 0, 0, None), None);
+        // The first exit from full screen restores that rectangle.
+        let windowed = (wm::WS_EX_WINDOWEDGE, wm::WS_OVERLAPPEDWINDOW, placed);
+        assert_eq!(toggled(true, windowed, area).2, placed);
+    }
+
+    /// Only the title's own top-level windows are moved or made full screen.
+    #[test]
+    fn tool_child_and_owned_windows_are_not_placed() {
+        assert!(placeable(wm::WS_EX_APPWINDOW, wm::WS_OVERLAPPEDWINDOW, false));
+        assert!(!placeable(wm::WS_EX_TOOLWINDOW, wm::WS_POPUP, false));
+        assert!(!placeable(0, wm::WS_CHILD, false));
+        assert!(!placeable(0, wm::WS_OVERLAPPEDWINDOW, true));
+    }
 
     /// `VICTORY_MONITOR`: a device name with or without its prefix, any
     /// case, or a 1-based place; anything else names none.

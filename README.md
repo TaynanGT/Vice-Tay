@@ -154,6 +154,19 @@ For a Windows runtime that rejects root signature flags `c00` or `c01`, use the 
 
 </details>
 
+<details>
+<summary>Linux and Proton: a faster wineserver</summary>
+
+Under Proton the title keeps 90,000 to 136,000 mapped views alive and maps or unmaps about a thousand a second. Stock `wineserver` keeps a process's views in a list and searches it from the front on every request, so everything that waits on the server slows down. [`linux/wineserver`](linux/wineserver) builds GE-Proton11-14's `wineserver` with a red-black tree of views and puts it in a copy of the GE-Proton folder, `GE-Proton11-14-viewtree`.
+
+```sh
+bash linux/wineserver/build.sh
+```
+
+Restart Steam and pick `GE-Proton11-14-viewtree`. GE-Proton's `master` already carries an equivalent change ([`em-fixups/0078-server-store-process-views-in-an-rb-tree.patch`](https://github.com/GloriousEggroll/proton-ge-custom/blob/master/patches/wine-hotfixes/em-fixups/0078-server-store-process-views-in-an-rb-tree.patch)); once a GE-Proton release includes it, this build is no longer needed. On one RTX 5080 (Series S profile, the same build and settings), the opening area ran at 2.7 to 4 fps with 190 to 294 ms of copies a frame on stock GE-Proton11-14, and at about 20 fps with 22 to 25 ms on the patched server.
+
+</details>
+
 ## Known problems
 
 - **RX 6700 XT on Windows 11 LTSC.** Drivers 32.0.21045.26001 and 32.0.32029.2010 can reset the device while loading the world. The AMD launcher profile defaults to relay mode 0 on those drivers. See [#138](https://github.com/TaynanGT/Vice-Tay/issues/138) for the reported runs. The launcher still accepts an explicit relay mode through its settings override.

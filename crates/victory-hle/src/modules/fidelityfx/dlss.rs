@@ -599,12 +599,14 @@ type Create = unsafe extern "C" fn(*mut c_void, u32, *mut NgxParameter, *mut *mu
 type Evaluate = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut NgxParameter, usize) -> u32;
 type Release = unsafe extern "C" fn(*mut c_void) -> u32;
 type Shutdown = unsafe extern "C" fn(*mut c_void) -> u32;
+type DestroyParameters = unsafe extern "C" fn(*mut NgxParameter) -> u32;
 
 struct Ngx {
     create: Create,
     evaluate: Evaluate,
     release: Release,
     shutdown: Shutdown,
+    destroy_parameters: Option<DestroyParameters>,
     /// Shared by every context; NGX reads it during each call.
     parameters: Mutex<Parameters>,
     quality: i32,
@@ -763,6 +765,10 @@ pub(super) fn start(
             std::mem::transmute::<*const c_void, Shutdown>(find(c"NVSDK_NGX_D3D12_Shutdown1")?),
         )
     };
+    // SAFETY: the optional core export has the signature declared by nvsdk_ngx.h.
+    let destroy_parameters = find(c"NVSDK_NGX_D3D12_DestroyParameters")
+        .ok()
+        .map(|address| unsafe { std::mem::transmute::<*const c_void, DestroyParameters>(address) });
     let device = victory_gpu::external::host_device().ok_or("there is no host GPU")?;
 
     std::fs::create_dir_all(logs).map_err(|e| format!("{}: {e}", logs.display()))?;
@@ -852,6 +858,7 @@ pub(super) fn start(
         evaluate,
         release,
         shutdown,
+        destroy_parameters,
         parameters: Mutex::new(parameters),
         quality,
         ffx_quality,
@@ -1188,11 +1195,9 @@ pub(super) fn destroy_context(context: *mut *mut c_void) -> u32 {
     OK
 }
 
-/// Shuts NGX down once nothing evaluates any more and the GPU has run
-/// what was submitted: the features lists let go of while it waits are
-/// released first, `Shutdown1` takes the rest. Later calls do nothing. (A
-/// list recorded before and never submitted is not run before the process
-/// ends.)
+/// Drains DLSS and releases pending features and capability parameters
+/// during process exit. `VICTORY_DLSS_SHUTDOWN=1` also calls the SDK's
+/// device shutdown. Later calls have no work to do.
 pub(super) fn shut_down() {
     let Some(ngx) = NGX.get() else { return };
     {
@@ -1205,9 +1210,25 @@ pub(super) fn shut_down() {
     }
     tracing::info!("DLSS: waiting for submitted work before NGX shutdown");
     victory_gpu::external::finish_submitted();
-    let parameters = ngx.parameters.lock().unwrap_or_else(|e| e.into_inner());
+    let mut parameters = ngx.parameters.lock().unwrap_or_else(|e| e.into_inner());
     tracing::info!("DLSS: draining pending NGX features");
     release_pending(ngx, &parameters);
+    if let Some(destroy) = ngx.destroy_parameters {
+        tracing::info!("DLSS: releasing NGX capability parameters");
+        // SAFETY: GetCapabilityParameters returned this map. Evaluation
+        // has stopped, and the lock excludes other NGX calls.
+        let result = unsafe { destroy(parameters.object) };
+        if succeeded(result) {
+            parameters.object = std::ptr::null_mut();
+        } else {
+            tracing::warn!(result = result_name(result), "DLSS: releasing capability parameters failed");
+        }
+    }
+    if !std::env::var_os("VICTORY_DLSS_SHUTDOWN").is_some_and(|value| value == "1") {
+        NGX_GONE.store(true, Ordering::Release);
+        tracing::info!("DLSS: leaving remaining NGX resources to process exit");
+        return;
+    }
     tracing::info!("DLSS: calling NGX Shutdown1");
     // SAFETY: NGX was started on this device; nothing of it is used after.
     let result = unsafe { (ngx.shutdown)(ngx.device.as_raw()) };

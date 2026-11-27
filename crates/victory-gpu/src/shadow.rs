@@ -466,6 +466,10 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// With `crate::sparse_va` (`VICTORY_SPARSE_WINDOWS=1`): `buffer` is a
+    /// reserved resource backed by shared 64 KiB physical tiles from the
+    /// sparse VA page table, with `data == null`.
+    sparse: Option<crate::sparse_va::SparseShadow>,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -1088,7 +1092,7 @@ pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let mut all: Vec<Arc<Shadow>> = buffers_read().values().filter_map(|e| e.shadow.clone()).collect();
     all.extend(LOOSE.read().unwrap_or_else(|e| e.into_inner()).values().cloned());
-    all.retain(|s| s.place.is_none() && s.watched.load(Ordering::Relaxed) == 1);
+    all.retain(|s| s.place.is_none() && s.sparse.is_none() && s.watched.load(Ordering::Relaxed) == 1);
     all.sort_by_key(|s| s.id);
     let next = NEXT.load(Ordering::Relaxed);
     let turn = all.partition_point(|s| s.id < next);
@@ -2385,6 +2389,8 @@ static SNAPS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
 /// its lists go to the card: takes the snapshots [`Shadow::writing`] noted.
 /// Nothing to do without the switch.
 pub(crate) fn take_snapshots() {
+    // Flush any sparse VA tile mappings and staged uploads ahead of submission lists.
+    crate::sparse_va::flush_pending();
     let snaps = std::mem::take(&mut *SNAPS.lock().unwrap_or_else(|e| e.into_inner()));
     if snaps.is_empty() {
         return;
@@ -2435,6 +2441,9 @@ pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, 
     let scans = work
         .iter()
         .map(|(shadow, address, end)| {
+            if shadow.sparse.is_some() {
+                return (0, 0, 0, 0, 0);
+            }
             let (from, to) = shadow.inside(*address, end.saturating_sub(*address));
             // The snapshot's memory stays until the range is done with
             // (`copy_back_done`), which comes after this.
@@ -2444,7 +2453,20 @@ pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, 
             }
         })
         .collect();
-    find_pieces(scans)
+    let mut found = find_pieces(scans);
+    for (slot, (shadow, address, end)) in found.iter_mut().zip(work) {
+        if shadow.sparse.is_some() {
+            let (from, to) = shadow.inside(*address, end.saturating_sub(*address));
+            let start = shadow.start as usize;
+            let mut at = from;
+            while at < to {
+                let n = (PIECE - (start + at) % PIECE).min(to - at);
+                slot.push((at, n));
+                at += n;
+            }
+        }
+    }
+    found
 }
 
 /// For each of `scans` (where a copy's bytes are, where its snapshot's
@@ -3466,6 +3488,11 @@ impl Drop for Shadow {
             crate::inplace::gone(self.window, self.len);
             return;
         }
+        if self.sparse.is_some() {
+            // Never counted in `LIVE` (`Shadow::sparse_backed`); `SparseShadow::drop`
+            // unmaps and schedules fence-safe tile reclamation.
+            return;
+        }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(self.len, Ordering::Relaxed);
         if self.kept.get_mut().unwrap_or_else(|e| e.into_inner()).1 {
@@ -3758,7 +3785,7 @@ pub(crate) fn window_use() -> [u64; 8] {
         let copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
         let pages = copied.copied_count() as u64;
         out[0] += (pages * PAGE as u64).min(s.len);
-        if crate::host::references(&s.buffer) > 1 {
+        if crate::host::references(&s.buffer) > s.own_buffer_refs() {
             out[1] += 1;
             out[2] += s.len;
         }
@@ -3793,7 +3820,7 @@ fn window_budget() -> Option<u64> {
 /// The bytes of title memory a loose copy holds a copy of: none for one in
 /// place (`crate::inplace`), which is the title's own memory.
 fn copy_bytes(shadow: &Shadow) -> u64 {
-    if shadow.in_place() { 0 } else { shadow.len }
+    if shadow.in_place() || shadow.sparse.is_some() { 0 } else { shadow.len }
 }
 
 /// The unique bytes of every loose copy, eligible to go or not
@@ -3850,6 +3877,7 @@ static WINDOW_BAND: std::sync::Mutex<crate::host::RamBand> =
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     const IDLE_FRAMES: u64 = 4;
+    crate::sparse_va::reclaim_idle();
     // Before the windows: their table may be empty while the pool is not.
     let_go_idle_snapshots();
     let budget = window_budget();
@@ -3875,6 +3903,10 @@ pub(crate) fn let_go_idle() {
             }
         }
     }
+    let_go_idle_with(idle_ms, due_ms, IDLE_FRAMES, keep, crate::host::retire);
+}
+
+fn let_go_idle_with(idle_ms: u64, due_ms: u64, idle_frames: u64, keep: u64, dispose: fn(Arc<Shadow>)) {
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
@@ -3886,12 +3918,12 @@ pub(crate) fn let_go_idle() {
             .iter()
             .filter(|(_, s)| {
                 Arc::strong_count(s) == 1
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
-                    && crate::host::references(&s.buffer) == 1
+                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, idle_frames)
+                    && crate::host::references(&s.buffer) <= s.own_buffer_refs()
             })
             .map(|(&key, s)| {
                 let used = s.used.load(Ordering::Relaxed);
-                let due = crate::host::long_ago(used, due_ms, IDLE_FRAMES);
+                let due = crate::host::long_ago(used, due_ms, idle_frames);
                 (used, key, Arc::as_ptr(s) as usize, copy_bytes(s), due)
             })
             .collect();
@@ -3918,8 +3950,24 @@ pub(crate) fn let_go_idle() {
         LET_GO[1].fetch_add(shadow.len, Ordering::Relaxed);
         // Nothing runs now and nothing names it: freed at once unless a
         // submission is running after all.
-        crate::host::retire(shadow);
+        dispose(shadow);
     }
+}
+
+#[cfg(test)]
+pub(crate) fn insert_loose_test(shadow: Arc<Shadow>) {
+    let key = (shadow.start, shadow.len);
+    LOOSE.write().unwrap_or_else(|e| e.into_inner()).insert(key, shadow);
+}
+
+#[cfg(test)]
+pub(crate) fn loose_contains_test(start: u64, len: u64) -> bool {
+    LOOSE.read().unwrap_or_else(|e| e.into_inner()).contains_key(&(start, len))
+}
+
+#[cfg(test)]
+pub(crate) fn let_go_idle_now_test() {
+    let_go_idle_with(0, 0, 0, u64::MAX, drop);
 }
 
 /// For the memory line: host copies alive and their bytes, of them the
@@ -4025,6 +4073,35 @@ impl Shadow {
         shadow
     }
 
+    /// COM reference count on `self.buffer` owned solely by this `Shadow` (plus
+    /// the sparse-VA window registry for sparse windows) when no descriptor
+    /// slot holds a clone.
+    pub(crate) fn own_buffer_refs(&self) -> u32 {
+        if self.sparse.is_some() { 2 } else { 1 }
+    }
+
+    /// A loose window backed by [`crate::sparse_va`] (`CreateReservedResource` +
+    /// pooled 64 KiB physical tiles shared across overlapping windows).
+    fn sparse_backed(buffer: ID3D12Resource, sparse: crate::sparse_va::SparseShadow, start: u64, len: u64) -> Shadow {
+        let mut shadow = Shadow::new(buffer, std::ptr::null_mut(), sparse.gpu_va(), start, len);
+        LIVE[0].fetch_sub(1, Ordering::Relaxed);
+        LIVE[1].fetch_sub(len, Ordering::Relaxed);
+        shadow.copied = Mutex::new(CopiedPages::new(0));
+        shadow.window = true;
+        shadow.sparse = Some(sparse);
+        shadow
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sparse_backed_test(
+        buffer: ID3D12Resource,
+        sparse: crate::sparse_va::SparseShadow,
+        start: u64,
+        len: u64,
+    ) -> Shadow {
+        Self::sparse_backed(buffer, sparse, start, len)
+    }
+
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
@@ -4073,6 +4150,7 @@ impl Shadow {
             changes_only: Default::default(),
             mapped: false,
             place: None,
+            sparse: None,
         }
     }
 
@@ -4136,6 +4214,16 @@ impl Shadow {
         if self.card.is_some() {
             pending.push(range);
             self.has_pending.store(true, Ordering::Release);
+            return;
+        }
+        if let Some(sparse) = &self.sparse {
+            pending.push(range);
+            self.has_pending.store(true, Ordering::Release);
+            drop(pending);
+            let (from, to) = self.inside(address, len);
+            if from < to {
+                sparse.declare_uav_write(self.start as usize + from, self.start as usize + to);
+            }
             return;
         }
         // The parts no declared range holds yet: their bytes are taken now,
@@ -4239,6 +4327,11 @@ impl Shadow {
         if self.place.is_some() {
             return 0;
         }
+        if let Some(sparse) = &self.sparse {
+            let (from, to) = self.inside(address, len);
+            self.compared(from, to);
+            return sparse.copy_back_range(&self.buffer, self.start, from, to, put_changed);
+        }
         let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
         let (from, to) = self.inside(address, len);
@@ -4337,6 +4430,12 @@ impl Shadow {
     /// never see each other half done. `now` and `title` are scratch
     /// memory. Returns the bytes written to title memory.
     pub(crate) fn relay_merge(&self, at: usize, n: usize, now: &mut Vec<u8>, title: &mut Vec<u8>) -> usize {
+        if let Some(sparse) = &self.sparse {
+            if n == 0 || at + n > self.len as usize {
+                return 0;
+            }
+            return sparse.copy_back_range(&self.buffer, self.start, at, at + n, put_changed);
+        }
         let start = self.start as usize;
         if self.card.is_some() || n == 0 || at + n > self.len as usize {
             return 0;
@@ -4445,14 +4544,37 @@ impl Shadow {
             return;
         }
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        if relay() {
+        let freed: Vec<(usize, usize)> = if relay() {
             let free = self.flights.lock().unwrap_or_else(|e| e.into_inner()).done(ranges);
             pending.retain(|r| free.binary_search(r).is_err());
+            free
         } else {
-            pending.retain(|r| !ranges.contains(r));
+            let mut removed = Vec::new();
+            pending.retain(|r| {
+                if ranges.contains(r) {
+                    removed.push(*r);
+                    false
+                } else {
+                    true
+                }
+            });
+            removed
+        };
+        let still_pending = !pending.is_empty();
+        self.has_pending.store(still_pending, Ordering::Release);
+        drop(pending);
+        if let Some(sparse) = &self.sparse {
+            let clamped: Vec<(usize, usize)> = freed
+                .into_iter()
+                .filter_map(|(a, e)| {
+                    let (from, to) = self.inside(a, e.saturating_sub(a));
+                    (from < to).then_some((self.start as usize + from, self.start as usize + to))
+                })
+                .collect();
+            sparse.finish_uav_ranges(&clamped);
+            return;
         }
-        self.has_pending.store(!pending.is_empty(), Ordering::Release);
-        if !pending.is_empty() || self.card.is_some() {
+        if still_pending || self.card.is_some() {
             return;
         }
         if keeps() {
@@ -4509,12 +4631,21 @@ impl Shadow {
     /// Whether shaders of a submission not yet copied back may be writing
     /// the copy.
     pub(crate) fn writes_pending(&self) -> bool {
+        if let Some(sparse) = &self.sparse {
+            return self.has_pending.load(Ordering::Acquire)
+                || sparse.has_active_uav_in(self.start as usize, (self.start + self.len) as usize);
+        }
         self.has_pending.load(Ordering::Acquire)
     }
 
     /// Whether one of those submissions may be writing in title memory
     /// `[from, to)`.
     pub(crate) fn writes_pending_in(&self, from: usize, to: usize) -> bool {
+        if let Some(sparse) = &self.sparse {
+            let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+            let (lo, hi) = (from.max(start), to.min(end));
+            return lo < hi && sparse.has_active_uav_in(lo, hi);
+        }
         self.has_pending.load(Ordering::Acquire)
             && self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
     }
@@ -4531,6 +4662,11 @@ impl Shadow {
     /// (`crate::host::late`): the ranges are those of flights in the air,
     /// which are then settled before this refresh.
     pub(crate) fn stale_under_writes(&self, address: usize, len: usize) -> bool {
+        if let Some(sparse) = &self.sparse {
+            let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+            let (from, to) = (address.max(start), (address + len).min(end));
+            return from < to && sparse.has_active_uav_in(from, to);
+        }
         if !self.has_pending.load(Ordering::Acquire) {
             return false;
         }
@@ -4578,6 +4714,11 @@ impl Shadow {
     /// cannot say what was written, a snapshot is missing, or `runs_left`
     /// ran out. Pages done before that stay done.
     pub(crate) fn merge_under_writes(&self, address: usize, len: usize, runs_left: &mut usize) -> bool {
+        if let Some(sparse) = &self.sparse {
+            let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+            let (from, to) = (address.max(start), (address + len).min(end));
+            return from < to && sparse.has_active_uav_in(from, to);
+        }
         if !self.has_pending.load(Ordering::Acquire) {
             return false;
         }
@@ -4839,6 +4980,23 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        if let Some(sparse) = &self.sparse {
+            let busy = sparse.active_uav_ranges_in(from, to);
+            if busy.is_empty() {
+                return self.update_free(from, to);
+            }
+            let (mut at, mut bytes) = (from, 0);
+            for (a, e) in busy {
+                if a > at {
+                    bytes += self.update_free(at, a);
+                }
+                at = at.max(e);
+            }
+            if at < to {
+                bytes += self.update_free(at, to);
+            }
+            return bytes;
+        }
         if !self.has_pending.load(Ordering::Acquire) {
             return self.update_free(from, to);
         }
@@ -4891,6 +5049,16 @@ impl Shadow {
         {
             return false;
         }
+        if let Some(sparse) = &self.sparse {
+            let same = sparse.nothing_new(from, to);
+            #[cfg(feature = "diagnostics")]
+            if same {
+                use crate::copystat::{C, add};
+                add(C::Checked, (to - from) as u64);
+                add(C::Unchanged, (to - from) as u64);
+            }
+            return same;
+        }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let ranged = self.ranged(from, to);
         let base = start / PAGE;
@@ -4915,6 +5083,24 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
+        if let Some(sparse) = &self.sparse {
+            if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
+                if let Some((now, written)) = crate::watch::writes(from, to, true) {
+                    let guarded = crate::watch::guarded(from, to) || self.watched.load(Ordering::Relaxed) == GUARDED;
+                    self.watched.store(if guarded { GUARDED } else { 1 }, Ordering::Relaxed);
+                    let copied = sparse.update(from, to, now, Some(&written));
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        use crate::copystat::{C, add};
+                        add(C::Checked, (to - from) as u64);
+                        add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
+                    }
+                    return copied;
+                }
+                self.watched.store(NOT_WATCHED, Ordering::Relaxed);
+            }
+            return sparse.update(from, to, 0, None);
+        }
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 // (A range whose blocks rest after a write has no guard now.)
@@ -5276,6 +5462,10 @@ impl Shadow {
             return;
         }
         let bytes = &bytes[self.start as usize + from - address..][..to - from];
+        if let Some(sparse) = &self.sparse {
+            sparse.placed_copy(self.start as usize + from, bytes);
+            return;
+        }
         let _merging = self.merging.write().unwrap_or_else(|e| e.into_inner());
         if self.card.is_some() {
             // SAFETY: inside the mapping of the CPU's side, in a range no
@@ -5699,6 +5889,9 @@ impl Shadow {
     pub(crate) fn land_back(&self, at: usize, n: usize, notes: &mut crate::land::Notes) -> u64 {
         if self.card.is_some() || n == 0 || at + n > self.len as usize {
             return 0;
+        }
+        if let Some(sparse) = &self.sparse {
+            return sparse.copy_back_range(&self.buffer, self.start, at, at + n, put_changed) as u64;
         }
         let waiting = std::time::Instant::now();
         let _merging = self.merging.read().unwrap_or_else(|e| e.into_inner());
@@ -6457,6 +6650,10 @@ fn pending_ticket(table: &PendingTickets, key: (u64, u64)) -> Arc<Mutex<()>> {
 }
 
 enum LooseBacking {
+    Sparse {
+        buffer: ID3D12Resource,
+        sparse: crate::sparse_va::SparseShadow,
+    },
     Mapped {
         buffer: ID3D12Resource,
         data: *mut u8,
@@ -6468,7 +6665,12 @@ enum LooseBacking {
     },
 }
 
-fn make_loose_backing(len: u64) -> Option<LooseBacking> {
+fn make_loose_backing(start: u64, len: u64) -> Option<LooseBacking> {
+    // Hardware virtual page table (`VICTORY_SPARSE_WINDOWS=1`): reserved buffer
+    // backed by pooled 64 KiB GPU tiles shared across overlapping loose views.
+    if let Some((buffer, sparse)) = crate::sparse_va::create_loose_window(start, len) {
+        return Some(LooseBacking::Sparse { buffer, sparse });
+    }
     // One buffer in the card's memory, filled by the CPU through the bus.
     if let Some((buffer, data)) = window_mapped_for(len) {
         return Some(LooseBacking::Mapped { buffer, data });
@@ -6482,6 +6684,9 @@ fn make_loose_backing(len: u64) -> Option<LooseBacking> {
 
 fn build_loose_shadow(start: u64, len: u64, backing: LooseBacking) -> Arc<Shadow> {
     match backing {
+        LooseBacking::Sparse { buffer, sparse } => {
+            Arc::new(Shadow::sparse_backed(buffer, sparse, start, len))
+        }
         LooseBacking::Mapped { buffer, data } => {
             crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} mapped on the card"));
             // SAFETY: a live buffer.
@@ -6550,7 +6755,7 @@ fn loose_key_with(map: &LooseTable, cell: u64, named: (u64, u64), q: LooseQuery)
 }
 
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
-    loose_with(
+    loose_with_range(
         LooseQuery {
             address,
             end,
@@ -6563,9 +6768,17 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     )
 }
 
+#[cfg(test)]
 fn loose_with(
     q: LooseQuery,
     make: impl Fn(u64) -> Option<LooseBacking>,
+) -> Option<Arc<Shadow>> {
+    loose_with_range(q, |_, len| make(len))
+}
+
+fn loose_with_range(
+    q: LooseQuery,
+    make: impl Fn(u64, u64) -> Option<LooseBacking>,
 ) -> Option<Arc<Shadow>> {
     let (cell, _) = window_of(q.address, q.end, WINDOW);
     let named = window_of(q.address, q.end, q.grid);
@@ -6615,7 +6828,7 @@ fn loose_with(
                 map.insert((start, len), shadow.clone());
                 return Some(shadow);
             }
-            let shadow = build_loose_shadow(start, len, make(len)?);
+            let shadow = build_loose_shadow(start, len, make(start, len)?);
             if shadow.card.is_some() {
                 CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
             }
@@ -6639,7 +6852,7 @@ fn loose_with(
                 continue;
             }
         }
-        let candidate = build_loose_shadow(key.0, key.1, make(key.1)?);
+        let candidate = build_loose_shadow(key.0, key.1, make(key.0, key.1)?);
         let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
         let selected = loose_key_with(&map, cell, named, q);
         if let Some(existing) = map.get(&selected) {

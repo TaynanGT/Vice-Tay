@@ -754,7 +754,13 @@ static CARD_DIRTY_BETWEEN: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(
 
 /// `VICTORY_CARD_DIRTY_SCAN=1`: [`card_dirty`] looks at every copy in the
 /// card's memory at each submission, as before [`CARD_QUEUE`] (to compare).
+/// A/B-able in one run (`VICTORY_AB=<s>,VICTORY_CARD_DIRTY_SCAN`): copies are
+/// queued either way, and a full look clears `queued` of every copy it takes.
 fn card_dirty_scan() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_CARD_DIRTY_SCAN") {
+        return on;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_DIRTY_SCAN").is_some_and(|v| v == "1"))
 }

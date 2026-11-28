@@ -488,6 +488,14 @@ struct Card {
     /// `land_card` readers observing `has_dirty == false` are guaranteed to
     /// observe `has_sent == true`.
     has_dirty: AtomicBool,
+    /// Whether the copy is in [`CARD_QUEUE`] (or about to be): set by the
+    /// first change after the queue was last taken, so [`card_dirty`] looks
+    /// only at copies that changed instead of every copy in the card's
+    /// memory.
+    queued: AtomicBool,
+    /// The copy itself, for [`CARD_QUEUE`]: set when it is tracked
+    /// ([`track_carded`]).
+    me: std::sync::OnceLock<std::sync::Weak<Shadow>>,
     /// With [`relay`]: the offsets that went from `dirty` to the card's
     /// side, each with the number of the send that took it
     /// ([`card_dirty`]), kept until a fetch sent after it has been merged.
@@ -729,6 +737,37 @@ fn remaining_card_room(buffers: u64, used: u64, refused: u64, windows: u64, wind
 
 /// The copies in the card's memory.
 static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+
+/// The copies in the card's memory whose CPU side changed since
+/// [`card_dirty`] last took them: each added once, by the change that found
+/// it not queued ([`Shadow::card_changed_runs`]).
+static CARD_QUEUE: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+
+/// A change to a copy that was not tracked yet (no [`Card::me`]): the next
+/// [`card_dirty`] looks at every copy, as before the queue.
+static CARD_SCAN_ALL: AtomicBool = AtomicBool::new(false);
+
+/// `VICTORY_CARD_DIRTY_SCAN=1`: [`card_dirty`] looks at every copy in the
+/// card's memory at each submission, as before [`CARD_QUEUE`] (to compare).
+fn card_dirty_scan() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_DIRTY_SCAN").is_some_and(|v| v == "1"))
+}
+
+/// Tracks a copy in the card's memory: [`CARDED`], and its own handle for
+/// [`CARD_QUEUE`]. A change made before this is found by one full look:
+/// the copy is in [`CARDED`] before that look is asked for, so the look
+/// that answers it sees the copy.
+fn track_carded(shadow: &Arc<Shadow>) {
+    let weak = Arc::downgrade(shadow);
+    CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(weak.clone());
+    if let Some(card) = &shadow.card {
+        let _ = card.me.set(weak);
+        if card.has_dirty.load(Ordering::Acquire) {
+            CARD_SCAN_ALL.store(true, Ordering::Release);
+        }
+    }
+}
 
 /// Since the last frame line: bytes copied to card sides and the ranges
 /// they were; pieces compared on the card, pieces fetched and their
@@ -1043,38 +1082,70 @@ impl SentRuns {
 /// ([`Shadow::card_merge_relay`]). Notes of sends that every fetch still to
 /// be merged came after are dropped.
 pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
     let mut out = Vec::new();
-    let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
     let relay_on = relay();
-    carded.retain(|weak| {
-        let Some(shadow) = weak.upgrade() else {
-            return false;
-        };
-        let Some(c) = shadow.card.as_ref() else {
-            return true;
-        };
+    let take = |c: &Card| -> Vec<(usize, usize)> {
+        // Before the ranges (and reading the change that queued it): a
+        // change after this queues the copy again.
+        c.queued.swap(false, Ordering::AcqRel);
         if !c.has_dirty.load(Ordering::Acquire) {
-            return true;
+            return Vec::new();
         }
-        let ranges = {
-            let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
-            let ranges = joined(std::mem::take(&mut *dirty));
-            if relay_on {
-                let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
-                sent.forget(fetched);
-                sent.note_joined(sent_as, ranges.clone());
-                // Publish the sent ranges before clearing the dirty state.
-                c.has_sent.store(!sent.is_empty(), Ordering::Release);
+        let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        let ranges = joined(std::mem::take(&mut *dirty));
+        if relay_on {
+            let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
+            sent.forget(fetched);
+            sent.note_joined(sent_as, ranges.clone());
+            // Publish the sent ranges before clearing the dirty state.
+            c.has_sent.store(!sent.is_empty(), Ordering::Release);
+        }
+        c.has_dirty.store(false, Ordering::Release);
+        ranges
+    };
+    // Taken first: a full look below clears `queued` of every copy it takes,
+    // and what was queued before it is in what it looks at. A copy queued
+    // again meanwhile is in the next queue as well, and is taken once here.
+    let queue = std::mem::take(&mut *CARD_QUEUE.lock().unwrap_or_else(|e| e.into_inner()));
+    let calls = CALLS.fetch_add(1, Ordering::Relaxed);
+    if card_dirty_scan() || CARD_SCAN_ALL.swap(false, Ordering::AcqRel) {
+        CARDED.lock().unwrap_or_else(|e| e.into_inner()).retain(|weak| {
+            let Some(shadow) = weak.upgrade() else {
+                return false;
+            };
+            if let Some(c) = shadow.card.as_ref() {
+                let ranges = take(c);
+                if !ranges.is_empty() {
+                    out.push((shadow, ranges));
+                }
             }
-            c.has_dirty.store(false, Ordering::Release);
-            ranges
+            true
+        });
+        return out;
+    }
+    // A copy queued twice (a full look cleared `queued` while it was in the
+    // next queue) is taken once: the caller gets each copy at most once.
+    let mut seen = std::collections::HashSet::with_capacity(queue.len());
+    for weak in queue {
+        let Some(shadow) = weak.upgrade() else {
+            continue;
         };
-        if !ranges.is_empty() {
-            out.push((shadow, ranges));
+        if !seen.insert(Arc::as_ptr(&shadow)) {
+            continue;
         }
-        true
-    });
+        if let Some(c) = shadow.card.as_ref() {
+            let ranges = take(c);
+            if !ranges.is_empty() {
+                out.push((shadow, ranges));
+            }
+        }
+    }
+    // The full look dropped copies that are gone; without it, now and then.
+    if calls % 1024 == 1023 {
+        CARDED.lock().unwrap_or_else(|e| e.into_inner()).retain(|weak| weak.strong_count() > 0);
+    }
     out
 }
 
@@ -5257,6 +5328,15 @@ impl Shadow {
         }
         // (Under the lock: what takes the list sees it or finds it set.)
         card.has_dirty.store(true, Ordering::Release);
+        drop(dirty);
+        // After the ranges: `card_dirty` clears `queued` before it takes
+        // them, so a change it did not take queues the copy again.
+        if !card.queued.swap(true, Ordering::AcqRel) {
+            match card.me.get() {
+                Some(me) => CARD_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).push(me.clone()),
+                None => CARD_SCAN_ALL.store(true, Ordering::Release),
+            }
+        }
     }
 
     /// Whether shaders were ever declared to write it.
@@ -5566,6 +5646,8 @@ impl Shadow {
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 has_dirty: AtomicBool::new(false),
+                queued: AtomicBool::new(false),
+                me: std::sync::OnceLock::new(),
                 sent: Mutex::default(),
                 has_sent: AtomicBool::new(false),
                 size: len.next_multiple_of(PIECE as u64),
@@ -5584,9 +5666,8 @@ impl Shadow {
                 CARDED.lock().unwrap().retain(|weak| !weak.ptr_eq(&self.0));
             }
         }
-        let weak = Arc::downgrade(self);
-        CARDED.lock().unwrap().push(weak.clone());
-        Tracked(weak)
+        track_carded(self);
+        Tracked(Arc::downgrade(self))
     }
 
     /// What shaders wrote goes into title memory ([`put_changed`]).
@@ -5763,6 +5844,8 @@ mod land_tests {
             before: Mutex::default(),
             dirty: Mutex::default(),
             has_dirty: AtomicBool::new(false),
+            queued: AtomicBool::new(false),
+            me: std::sync::OnceLock::new(),
             sent: Mutex::default(),
             has_sent: AtomicBool::new(false),
             size: len as u64,
@@ -6191,6 +6274,8 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     before: Mutex::default(),
                     dirty: Mutex::default(),
                     has_dirty: AtomicBool::new(false),
+                    queued: AtomicBool::new(false),
+                    me: std::sync::OnceLock::new(),
                     sent: Mutex::default(),
                     has_sent: AtomicBool::new(false),
                     size,
@@ -6218,7 +6303,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         shadow.card = card;
         let shadow = Arc::new(shadow);
         if shadow.card.is_some() {
-            CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+            track_carded(&shadow);
         }
         entry.shadow = Some(shadow);
     }
@@ -6423,12 +6508,14 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         before: Mutex::default(),
         dirty: Mutex::default(),
         has_dirty: AtomicBool::new(false),
+        queued: AtomicBool::new(false),
+        me: std::sync::OnceLock::new(),
         sent: Mutex::default(),
         has_sent: AtomicBool::new(false),
         size: len,
     });
     let shadow = Arc::new(shadow);
-    CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+    track_carded(&shadow);
     Some(shadow)
 }
 
@@ -6501,6 +6588,8 @@ fn build_loose_shadow(start: u64, len: u64, backing: LooseBacking) -> Arc<Shadow
                         before: Mutex::default(),
                         dirty: Mutex::default(),
                         has_dirty: AtomicBool::new(false),
+                        queued: AtomicBool::new(false),
+                        me: std::sync::OnceLock::new(),
                         sent: Mutex::default(),
                         has_sent: AtomicBool::new(false),
                         size: len,
@@ -6617,7 +6706,7 @@ fn loose_with(
             }
             let shadow = build_loose_shadow(start, len, make(len)?);
             if shadow.card.is_some() {
-                CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+                track_carded(&shadow);
             }
             note(&shadow);
             map.insert((start, len), shadow.clone());
@@ -6659,7 +6748,7 @@ fn loose_with(
             continue;
         }
         if candidate.card.is_some() {
-            CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&candidate));
+            track_carded(&candidate);
         }
         note(&candidate);
         map.insert(key, candidate.clone());
@@ -7363,8 +7452,50 @@ mod copied_and_take_tests {
         }
     }
 
+    /// Tests that take [`card_dirty`] (one queue for the whole process).
+    static CARD_DIRTY_TEST: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn card_dirty_takes_queued_copies_once_and_requeues_later_changes() {
+        let _one = CARD_DIRTY_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let title = vec![0x22u8; PAGE];
+        let mut side = vec![0x22u8; PAGE];
+        let start = title.as_ptr() as usize;
+        let shadow = Shadow::unbacked(start as u64, side.as_mut_ptr(), side.len() as u64, true);
+        let _tracked = shadow.track_carded_test();
+        let card = shadow.card.as_ref().expect("carded copy");
+        let mine = |taken: Vec<(Arc<Shadow>, Vec<(usize, usize)>)>| -> Vec<Vec<(usize, usize)>> {
+            taken.into_iter().filter(|(s, _)| Arc::ptr_eq(s, &shadow)).map(|(_, r)| r).collect()
+        };
+        let _ = card_dirty(20);
+
+        // Two changes queue the copy once; one take returns both.
+        shadow.card_changed(0, 16);
+        assert!(card.queued.load(Ordering::Acquire));
+        shadow.card_changed(64, 80);
+        assert_eq!(mine(card_dirty(21)), [vec![(0, 16), (64, 80)]]);
+        assert!(!card.queued.load(Ordering::Acquire));
+
+        // Nothing changed: nothing taken.
+        assert!(mine(card_dirty(22)).is_empty());
+
+        // A change after the take queues it again.
+        shadow.card_changed(128, 144);
+        assert_eq!(mine(card_dirty(23)), [vec![(128, 144)]]);
+
+        // A change to a copy not tracked yet is found by a full look.
+        let mut side2 = vec![0x33u8; PAGE];
+        let other = Shadow::unbacked(start as u64 + PAGE as u64, side2.as_mut_ptr(), side2.len() as u64, true);
+        other.card_changed(8, 24);
+        let _tracked2 = other.track_carded_test();
+        let taken = card_dirty(24);
+        assert!(taken.iter().any(|(s, r)| Arc::ptr_eq(s, &other) && r == &[(8, 24)]));
+        drop(title);
+    }
+
     #[test]
     fn lock_free_card_dirty_and_sent_mirrors_match_transitions() {
+        let _one = CARD_DIRTY_TEST.lock().unwrap_or_else(|e| e.into_inner());
         let mut title = vec![0x11u8; PAGE];
         let mut side = vec![0x11u8; PAGE];
         let start = title.as_ptr() as usize;

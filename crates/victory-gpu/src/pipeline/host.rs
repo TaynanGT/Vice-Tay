@@ -247,17 +247,29 @@ impl GraphicsState {
     /// Everything the state holds, as text: part of a pipeline's name in
     /// the library and of the key a title pipeline is started early by.
     pub(crate) fn describe(&self) -> String {
-        let inputs: Vec<String> = self
-            .inputs
-            .iter()
-            .zip(&self.names)
-            .map(|(e, name)| {
-                format!(
-                    "{name:?} {} {} {} {} {} {}",
-                    e.SemanticIndex, e.Format.0, e.InputSlot, e.AlignedByteOffset, e.InputSlotClass.0, e.InstanceDataStepRate
-                )
-            })
-            .collect();
+        struct InputDescriptions<'a>(&'a GraphicsState);
+
+        impl std::fmt::Debug for InputDescriptions<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                use std::fmt::Write as _;
+
+                let mut list = f.debug_list();
+                let mut entry = String::new();
+                for (e, name) in self.0.inputs.iter().zip(&self.0.names) {
+                    entry.clear();
+                    write!(
+                        &mut entry,
+                        "{name:?} {} {} {} {} {} {}",
+                        e.SemanticIndex, e.Format.0, e.InputSlot, e.AlignedByteOffset,
+                        e.InputSlotClass.0, e.InstanceDataStepRate
+                    )?;
+                    list.entry(&entry);
+                }
+                list.finish()
+            }
+        }
+
+        let inputs = InputDescriptions(self);
         let bounds = if self.depth_bounds {
             " depth-bounds"
         } else {
@@ -1596,6 +1608,23 @@ mod tests {
             InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
             InstanceDataStepRate: 0,
         }
+    }
+
+    #[test]
+    fn pipeline_description_keeps_input_order_and_escaping() {
+        let state = GraphicsState {
+            names: vec![CString::new("POSITION").unwrap(), CString::new(b"A\"B\\C\xff").unwrap()],
+            inputs: vec![
+                element(DXGI_FORMAT_R32_FLOAT, 0),
+                element(DXGI_FORMAT_R32G32_FLOAT, 16),
+            ],
+            ..GraphicsState::default()
+        };
+        let expected = [
+            r#""POSITION" 0 41 0 0 0 0"#,
+            r#""A\"B\\C\xff" 0 16 0 16 0 0"#,
+        ];
+        assert!(state.describe().contains(&format!("{expected:?}")));
     }
 
     fn offsets(inputs: &[D3D12_INPUT_ELEMENT_DESC]) -> Vec<u32> {

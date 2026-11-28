@@ -417,6 +417,15 @@ pub(crate) struct Shadow {
     /// Lock-free mirror of `!pending.is_empty()` so read-only windows and
     /// buffers skip acquiring `pending` on refreshes and flight checks.
     has_pending: AtomicBool,
+    /// With [`merge_after_landing`]: parts of title memory (`(from, to)`,
+    /// each in one page and in a range a flight not landed may write) that
+    /// the title wrote while the flight was in the air, left out of the copy
+    /// until a refresh after the landing takes them ([`settle_deferred`]).
+    /// Counted only: the pages stay stale in `copied`, which is what brings
+    /// them in.
+    deferred: Mutex<Vec<(usize, usize)>>,
+    /// Lock-free mirror of `!deferred.is_empty()`.
+    has_deferred: AtomicBool,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -1500,6 +1509,90 @@ fn for_outside(
     }
     if at < to {
         part(at, to);
+    }
+}
+
+#[cfg(test)]
+mod after_landing_tests {
+    use super::{PAGE, deferred_parts, outside, settle_deferred};
+
+    /// A cut taken out of a range leaves exactly the bytes no cut holds,
+    /// whatever the order of the cuts and however they overlap.
+    #[test]
+    fn subtraction_leaves_the_bytes_no_cut_holds() {
+        assert_eq!(outside(100, 200, vec![]), vec![(100, 200)]);
+        assert_eq!(outside(100, 200, vec![(0, 100), (200, 300)]), vec![(100, 200)]);
+        assert_eq!(outside(100, 200, vec![(0, 300)]), vec![]);
+        assert_eq!(outside(100, 200, vec![(150, 160), (120, 130)]), vec![(100, 120), (130, 150), (160, 200)]);
+        assert_eq!(outside(100, 200, vec![(110, 150), (140, 170), (90, 105)]), vec![(105, 110), (170, 200)]);
+        assert_eq!(outside(100, 200, vec![(100, 100), (199, 400)]), vec![(100, 199)]);
+        // Against a byte map, many shapes.
+        for seed in 0..200u64 {
+            let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+            let mut next = |m: u64| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x % m) as usize
+            };
+            let (from, to) = (next(50), 50 + next(50));
+            let cuts: Vec<(usize, usize)> = (0..next(6))
+                .map(|_| {
+                    let a = next(110);
+                    (a, a + next(30))
+                })
+                .collect();
+            let mut held = [false; 140];
+            for &(a, e) in &cuts {
+                held[a..e].iter_mut().for_each(|h| *h = true);
+            }
+            let left = outside(from, to, cuts.clone());
+            let mut seen = [false; 140];
+            for w in left.windows(2) {
+                assert!(w[0].1 <= w[1].0, "in order: {left:?}");
+            }
+            for &(a, e) in &left {
+                assert!(from <= a && a < e && e <= to);
+                seen[a..e].iter_mut().for_each(|s| *s = true);
+            }
+            for i in 0..140 {
+                assert_eq!(seen[i], (from..to).contains(&i) && !held[i], "byte {i}, [{from}, {to}) less {cuts:?}");
+            }
+        }
+    }
+
+    /// Of the pages the title wrote, only their parts in the flights'
+    /// ranges are deferred: a page across a range's edge gives its inside
+    /// part, a page two ranges hold gives two parts, pages outside none.
+    #[test]
+    fn only_the_parts_in_the_flights_ranges_are_deferred() {
+        let p = |n: usize| n * PAGE;
+        let ranges = [(p(2) + 100, p(4) - 8), (p(4) + 16, p(4) + 32), (p(6), p(7))];
+        let parts = deferred_parts(&ranges, &[1, 2, 3, 4, 5, 6]);
+        assert_eq!(parts, vec![(p(2) + 100, p(3)), (p(3), p(4) - 8), (p(4) + 16, p(4) + 32), (p(6), p(7))]);
+        assert!(deferred_parts(&ranges, &[0, 5, 7]).is_empty());
+        assert!(deferred_parts(&[], &[2]).is_empty());
+    }
+
+    /// A refresh after the landing settles the parts it covers whole: those
+    /// it copied bytes of are applied, those it copied nothing of were found
+    /// current; parts it covers only in part stay deferred.
+    #[test]
+    fn a_refresh_after_landing_settles_what_it_covers() {
+        let mut deferred = vec![(100, 200), (300, 400), (500, 600), (900, 1100)];
+        // [0, 1000) refreshed; copied runs 150..350 and 520..530.
+        let (applied, bytes, uncopied) = settle_deferred(&mut deferred, 0, 1000, &[(520, 530), (150, 350)]);
+        assert_eq!((applied, bytes, uncopied), (3, 50 + 50 + 10, 0));
+        assert_eq!(deferred, vec![(900, 1100)]);
+        let (applied, bytes, uncopied) = settle_deferred(&mut deferred, 1000, 2000, &[]);
+        assert_eq!((applied, bytes, uncopied), (0, 0, 0));
+        assert_eq!(deferred, vec![(900, 1100)]);
+        let (applied, bytes, uncopied) = settle_deferred(&mut deferred, 800, 1200, &[]);
+        assert_eq!((applied, bytes, uncopied), (0, 0, 1));
+        assert!(deferred.is_empty());
+        // Overlapping runs count each byte once.
+        let mut deferred = vec![(0, 100)];
+        assert_eq!(settle_deferred(&mut deferred, 0, 100, &[(0, 60), (40, 80), (10, 20)]), (1, 80, 0));
     }
 }
 
@@ -2723,6 +2816,151 @@ fn back_piece(
 /// compared, changed runs put in, and their bytes.
 static MERGED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
+/// Whether title bytes are kept out of the ranges a flight not landed may
+/// write, in copies shaders write, until the flight has landed
+/// (`VICTORY_MERGE_AFTER_LANDING=1`; off by default: they are merged in
+/// beside the flights' writes, [`Shadow::merge_under_writes`]).
+///
+/// Why: run 831 (`VICTORY_PACE_SHADER_COPIES=1`, the refreshes and merges of
+/// such copies held until the card had run the frame before) had no wedges;
+/// its waits came from copies a flight not landed writes, and their merges
+/// went into 167 ranges a frame (951 MB of ranges) of such flights. Title
+/// memory there is older than the card's results until the flight lands,
+/// and a merged byte wins over the card's at the landing.
+///
+/// With it, [`Shadow::merge_under_writes`] (and [`Shadow::stale_under_writes`])
+/// put nothing in under a flight's writes and never ask for a settle: the
+/// copy keeps its own bytes there (what the card wrote or will write). The
+/// parts of pages the title wrote meanwhile stay stale in the copy's page
+/// state, and the first refresh of them after the last flight that declared
+/// them has landed takes them from title memory, which then holds the card's
+/// landed bytes and the title's own ([`Shadow::defer_under_writes`],
+/// [`settle_deferred`]). A title write there reaches the card a submission
+/// or more late; a byte both wrote is the card's. Bytes outside those ranges
+/// are refreshed as before. No wait anywhere.
+pub(crate) fn merge_after_landing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_MERGE_AFTER_LANDING").is_ok_and(|v| v.trim() == "1");
+        if on {
+            tracing::info!(
+                "VICTORY_MERGE_AFTER_LANDING=1: no title bytes go into ranges of copies a flight not landed may write; the title's \
+                 writes there wait for a refresh after the landing; nothing waits for the card"
+            );
+        }
+        on
+    })
+}
+
+/// Whether the line of [`merge_after_landing`] also tells how much of the
+/// title writes it deferred differ from the copy's reference
+/// (`VICTORY_HEAP_WRITERS=1`; off by default: that compare reads both).
+fn heap_writers() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_WRITERS").is_some_and(|v| v == "1"))
+}
+
+/// Counters of [`merge_after_landing`] since the last line, by index.
+const AL_COPIES: usize = 0;
+const AL_RANGES: usize = 1;
+const AL_RANGE_BYTES: usize = 2;
+const AL_UNKNOWN: usize = 3;
+const AL_DEFERRED: usize = 4;
+const AL_DEFERRED_BYTES: usize = 5;
+const AL_DIFFER_BYTES: usize = 6;
+const AL_AGAIN: usize = 7;
+const AL_APPLIED: usize = 8;
+const AL_APPLIED_BYTES: usize = 9;
+const AL_UNCOPIED: usize = 10;
+const AL_UNTRACKED: usize = 11;
+const AL_GONE: usize = 12;
+static AFTER_LANDING: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
+/// Deferred parts not yet settled, in all copies.
+static AFTER_LANDING_LEFT: AtomicU64 = AtomicU64::new(0);
+
+/// The most deferred parts a copy keeps count of; more are still left out
+/// (their pages stay stale) but not counted when applied.
+const DEFERRED_MOST: usize = 4096;
+
+/// The parts of `pages` (of title memory, [`PAGE`] bytes each, by number) that lie
+/// in `ranges` (in order, apart: [`joined`]), in order.
+fn deferred_parts(ranges: &[(usize, usize)], pages: &[usize]) -> Vec<(usize, usize)> {
+    let mut parts = Vec::new();
+    for &page in pages {
+        let (lo, hi) = (page * PAGE, (page + 1) * PAGE);
+        let first = ranges.partition_point(|&(_, e)| e <= lo);
+        for &(a, e) in &ranges[first..] {
+            if a >= hi {
+                break;
+            }
+            let (from, to) = (a.max(lo), e.min(hi));
+            if from < to {
+                parts.push((from, to));
+            }
+        }
+    }
+    parts
+}
+
+/// A refresh after the landing copied `copied` (runs of title memory, any
+/// order) of `[from, to)`: the deferred parts inside `[from, to)` are done
+/// with, and taken out of `deferred`. Returns those any of whose bytes were
+/// copied (count, bytes), and those none of whose bytes were (the page was
+/// found current: the title's write did not come in). Parts only partly in
+/// `[from, to)` stay.
+fn settle_deferred(deferred: &mut Vec<(usize, usize)>, from: usize, to: usize, copied: &[(usize, usize)]) -> (u64, u64, u64) {
+    let (mut applied, mut bytes, mut uncopied) = (0, 0, 0);
+    deferred.retain(|&(lo, hi)| {
+        if lo < from || hi > to {
+            return true;
+        }
+        let left: usize = outside(lo, hi, copied.to_vec()).iter().map(|&(a, e)| e - a).sum();
+        if left < hi - lo {
+            applied += 1;
+            bytes += (hi - lo - left) as u64;
+        } else {
+            uncopied += 1;
+        }
+        false
+    });
+    (applied, bytes, uncopied)
+}
+
+/// With the frame line, while [`merge_after_landing`] is on.
+pub(crate) fn after_landing_line(frames: f64) {
+    if !merge_after_landing() {
+        return;
+    }
+    let s = AFTER_LANDING.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
+    let f = |i: usize| s[i] as f64 / frames;
+    let mb = |i: usize| s[i] as f64 / (1u64 << 20) as f64 / frames;
+    tracing::info!(
+        "title bytes kept out of flights' ranges until they land (VICTORY_MERGE_AFTER_LANDING=1), per frame: {:.1} merges of copies \
+         a flight not landed writes, no bytes put in; {:.1} ranges skipped ({:.2} MB), {:.1} of them memory not watched or not \
+         answered (whole range next refresh after landing); title writes there deferred: {:.1} parts of pages ({:.3} MB{}), {:.1} \
+         found again still waiting; applied after landing: {:.1} ({:.3} MB), {:.1} found current with nothing copied, {:.1} not \
+         counted (over {DEFERRED_MOST} a copy), {:.1} of copies let go; {} waiting now",
+        f(AL_COPIES),
+        f(AL_RANGES),
+        mb(AL_RANGE_BYTES),
+        f(AL_UNKNOWN),
+        f(AL_DEFERRED),
+        mb(AL_DEFERRED_BYTES),
+        if heap_writers() {
+            format!(", {:.3} MB of it differing from the copy's reference", mb(AL_DIFFER_BYTES))
+        } else {
+            String::new()
+        },
+        f(AL_AGAIN),
+        f(AL_APPLIED),
+        mb(AL_APPLIED_BYTES),
+        f(AL_UNCOPIED),
+        f(AL_UNTRACKED),
+        f(AL_GONE),
+        AFTER_LANDING_LEFT.load(Ordering::Relaxed),
+    );
+}
+
 /// Why [`Shadow::merge_under_writes`] last left the caller to wait.
 static STALE_WHY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -3468,6 +3706,11 @@ impl Drop for Shadow {
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(self.len, Ordering::Relaxed);
+        let deferred = self.deferred.get_mut().unwrap_or_else(|e| e.into_inner());
+        if !deferred.is_empty() {
+            AFTER_LANDING[AL_GONE].fetch_add(deferred.len() as u64, Ordering::Relaxed);
+            AFTER_LANDING_LEFT.fetch_sub(deferred.len() as u64, Ordering::Relaxed);
+        }
         if self.kept.get_mut().unwrap_or_else(|e| e.into_inner()).1 {
             KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
@@ -4056,6 +4299,8 @@ impl Shadow {
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             has_pending: AtomicBool::new(false),
+            deferred: Mutex::default(),
+            has_deferred: AtomicBool::new(false),
             flights: Mutex::default(),
             before: Mutex::default(),
             merging: RwLock::default(),
@@ -4550,6 +4795,12 @@ impl Shadow {
         if busy.is_empty() {
             return false;
         }
+        // Left in the copy until the flights have landed, no settle asked
+        // (`VICTORY_MERGE_AFTER_LANDING`).
+        if merge_after_landing() {
+            self.defer_under_writes(busy);
+            return false;
+        }
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
             return true;
         }
@@ -4595,6 +4846,13 @@ impl Shadow {
             .map(|&(a, e)| (a.max(from), e.min(to)))
             .collect();
         if busy.is_empty() {
+            return false;
+        }
+        // Nothing of the title's goes in under a flight not landed: the
+        // copy's bytes there are the card's, newer than title memory
+        // (`VICTORY_MERGE_AFTER_LANDING`).
+        if merge_after_landing() {
+            self.defer_under_writes(busy);
             return false;
         }
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
@@ -4730,6 +4988,83 @@ impl Shadow {
             }
         }
         false
+    }
+
+    /// [`Shadow::merge_under_writes`] with [`merge_after_landing`]: of
+    /// `busy` (ranges of title memory in the copy that flights not landed
+    /// may write), nothing goes in. The parts of pages there the title wrote
+    /// since the copy last took them are noted as deferred: the pages are
+    /// not marked taken, so the first refresh of them once no flight holds
+    /// them any more ([`Shadow::update`] leaves ranges flights hold
+    /// alone) copies them from title memory, landed bytes and the title's
+    /// together; [`settle_deferred`] counts that.
+    fn defer_under_writes(&self, busy: Vec<(usize, usize)>) {
+        let busy = joined(busy);
+        AFTER_LANDING[AL_COPIES].fetch_add(1, Ordering::Relaxed);
+        AFTER_LANDING[AL_RANGES].fetch_add(busy.len() as u64, Ordering::Relaxed);
+        AFTER_LANDING[AL_RANGE_BYTES].fetch_add(busy.iter().map(|&(a, e)| (e - a) as u64).sum(), Ordering::Relaxed);
+        // Not watched: nothing says which pages the title wrote; such a
+        // refresh copies the whole range once no flight holds it.
+        if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            AFTER_LANDING[AL_UNKNOWN].fetch_add(busy.len() as u64, Ordering::Relaxed);
+            return;
+        }
+        let base = self.start as usize / PAGE;
+        let mut parts = Vec::new();
+        for &(a, e) in &busy {
+            let Some((_, written)) = crate::watch::writes(a, e, true) else {
+                AFTER_LANDING[AL_UNKNOWN].fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            let stale = self.copied.lock().unwrap_or_else(|e| e.into_inner()).stale_pages_in(base, a, e, &written);
+            parts.extend(deferred_parts(&[(a, e)], &stale));
+        }
+        if parts.is_empty() {
+            return;
+        }
+        let mut new = Vec::new();
+        {
+            let mut deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+            for part in parts {
+                if deferred.contains(&part) {
+                    AFTER_LANDING[AL_AGAIN].fetch_add(1, Ordering::Relaxed);
+                } else if deferred.len() >= DEFERRED_MOST {
+                    AFTER_LANDING[AL_UNTRACKED].fetch_add(1, Ordering::Relaxed);
+                } else {
+                    deferred.push(part);
+                    new.push(part);
+                }
+            }
+            self.has_deferred.store(!deferred.is_empty(), Ordering::Release);
+        }
+        AFTER_LANDING[AL_DEFERRED].fetch_add(new.len() as u64, Ordering::Relaxed);
+        AFTER_LANDING[AL_DEFERRED_BYTES].fetch_add(new.iter().map(|&(a, e)| (e - a) as u64).sum(), Ordering::Relaxed);
+        AFTER_LANDING_LEFT.fetch_add(new.len() as u64, Ordering::Relaxed);
+        // How much of it the title really changed against what the copy
+        // held when the range was given to the shaders: what a merge would
+        // have put in (`VICTORY_HEAP_WRITERS=1`; read only).
+        if heap_writers() && !new.is_empty() {
+            let _merging = self.merging.write().unwrap_or_else(|e| e.into_inner());
+            let before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+            let held = if self.card.is_some() { self.data as usize } else { before.as_ref().map_or(0, |b| b.as_ptr() as usize) };
+            if held != 0 {
+                let mut title = vec![0u8; PAGE];
+                let mut differ = 0u64;
+                for (lo, hi) in new {
+                    let n = hi - lo;
+                    if !crate::host::read_into(lo as *const u8, &mut title[..n]) {
+                        continue;
+                    }
+                    // SAFETY: the reference holds the copy's length and these
+                    // bytes are in it (a declared range); the locks held keep
+                    // out the landing and the merges, refreshes leave ranges
+                    // flights hold alone.
+                    let was = unsafe { std::slice::from_raw_parts((held as *const u8).add(lo - self.start as usize), n) };
+                    differ += changed_runs(&title[..n], was).iter().map(|r| r.1 as u64).sum::<u64>();
+                }
+                AFTER_LANDING[AL_DIFFER_BYTES].fetch_add(differ, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Of [`Shadow::merge_under_writes`]: title memory `[lo, lo + n)`, in one
@@ -4915,12 +5250,35 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
+        if !self.has_deferred.load(Ordering::Acquire) {
+            return self.update_free_runs(from, to, None);
+        }
+        // Title writes left out while a flight held them
+        // (`VICTORY_MERGE_AFTER_LANDING`): no flight holds `[from, to)` now.
+        let mut copied = Vec::new();
+        let bytes = self.update_free_runs(from, to, Some(&mut copied));
+        let (applied, applied_bytes, uncopied) = {
+            let mut deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+            let settled = settle_deferred(&mut deferred, from, to, &copied);
+            self.has_deferred.store(!deferred.is_empty(), Ordering::Release);
+            settled
+        };
+        AFTER_LANDING[AL_APPLIED].fetch_add(applied, Ordering::Relaxed);
+        AFTER_LANDING[AL_APPLIED_BYTES].fetch_add(applied_bytes, Ordering::Relaxed);
+        AFTER_LANDING[AL_UNCOPIED].fetch_add(uncopied, Ordering::Relaxed);
+        AFTER_LANDING_LEFT.fetch_sub(applied + uncopied, Ordering::Relaxed);
+        bytes
+    }
+
+    /// [`Shadow::update_free`] itself; `runs` gets the runs of title memory
+    /// copied.
+    fn update_free_runs(&self, from: usize, to: usize, runs: Option<&mut Vec<(usize, usize)>>) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 // (A range whose blocks rest after a write has no guard now.)
                 let guarded = crate::watch::guarded(from, to) || self.watched.load(Ordering::Relaxed) == GUARDED;
                 self.watched.store(if guarded { GUARDED } else { 1 }, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
+                let copied = self.copy_stale(from, to, now, &written, runs);
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
                 {
@@ -4937,6 +5295,9 @@ impl Shadow {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self.copy(from, to);
+        if let Some(runs) = runs {
+            runs.push((from, to));
+        }
         #[cfg(feature = "diagnostics")]
         crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
         to - from
@@ -5003,7 +5364,7 @@ impl Shadow {
     /// (`written`: last writes by page, in page order; `now`: this
     /// asking), whole pages within the buffer. Keeps the page state locked
     /// until the planned copies finish.
-    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
+    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)], seen: Option<&mut Vec<(usize, usize)>>) -> usize {
         let base = self.start as usize / PAGE;
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let light = crate::watch::light();
@@ -5017,6 +5378,9 @@ impl Shadow {
         } else {
             by_parts(runs, &again_at, &crate::watch::parts_written(&again_at))
         };
+        if let Some(seen) = seen {
+            seen.extend(runs.iter().map(|r| (r.0, r.1)));
+        }
         let bytes = self.take_all(runs);
         if light {
             // Publish the completed range with copied -> ranged lock order.

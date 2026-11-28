@@ -609,6 +609,8 @@ pub(crate) fn pipeline(
 /// the process that stored it. When the next process creates samplers in a
 /// different order, the pipeline can pick the wrong filter or address mode.
 /// `VICTORY_LIBRARY_STATIC_SAMPLERS=1` enables library reuse for comparison.
+/// Without it, a pipeline whose static samplers hold the places of the
+/// cache's list still uses the library ([`super::samplers::settled`]).
 pub(super) fn allows_static_samplers(host: &crate::host::Host) -> bool {
     const NVIDIA: u32 = 0x10DE;
     static ALLOWED: OnceLock<bool> = OnceLock::new();

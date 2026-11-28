@@ -468,6 +468,8 @@ impl HostPipeline {
         // signature is made.
         let mut ranges: Vec<Box<D3D12_DESCRIPTOR_RANGE1>> = Vec::new();
         let mut samplers = Vec::new();
+        // Whether every static sampler holds the list's place ([`super::samplers`]).
+        let mut samplers_settled = true;
         let mut bound = Vec::new();
         for &(shader, visibility) in &stages {
             let t = &shader.translated()?.host;
@@ -568,6 +570,8 @@ impl HostPipeline {
                     });
                 }
             }
+            super::samplers::know(&host.device, &t.static_samplers, aniso_point_mip_supported);
+            samplers_settled &= super::samplers::settled(&t.static_samplers, aniso_point_mip_supported);
             for (n, s) in t.static_samplers.iter().enumerate() {
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {
                     Filter: D3D12_FILTER(s.filter_for_host(aniso_point_mip_supported) as i32),
@@ -594,7 +598,11 @@ impl HostPipeline {
                 return None;
             }
         };
-        let use_library = samplers.is_empty() || super::library::allows_static_samplers(host);
+        // Static samplers in the list's order hold the same places in every
+        // process ([`super::samplers`]): their pipelines can be stored.
+        let use_library = samplers.is_empty()
+            || super::library::allows_static_samplers(host)
+            || samplers_settled;
         let code = |i: usize| {
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),

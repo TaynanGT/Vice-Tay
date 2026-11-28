@@ -4598,39 +4598,54 @@ impl<'a> Lower<'a> {
     /// `f` as an f16 in the low bits, rounded to nearest, ties to even, as the console's
     /// 16-bit float operations round, whatever the host's own conversion does: D3D lets
     /// `f32tof16` round toward zero, and the NVIDIA driver's does (measured on an RTX 4070:
-    /// `wave64_tests`). The conversion toward zero, or the next half away from zero where
-    /// that one is nearer, or as near and the first one odd. Past the largest half the next
-    /// one counts as 2^16, the bound IEEE rounds by, so 65520 and up become infinity.
+    /// `wave64_tests`; WARP's does too). Past the largest half the next one counts as 2^16,
+    /// the bound IEEE rounds by, so 65520 and up become infinity; a NaN stays a NaN.
     /// (`f` is an f32 result of two halves here; rounding it again to 16 bits gives the
     /// rounding of the exact result, 24 bits being more than twice 11 and two.)
+    ///
+    /// Done on the bits, as F. Giesen's `float_to_half_fast3_rtne` (public domain) does it,
+    /// with no conversion instruction (a quarter-rate one on NVIDIA; the form before took
+    /// four): a normal half is the magnitude's bits with the exponent rebased and the 13 bits
+    /// below the half's last place rounded off (half the step, less one, plus the last
+    /// place's own bit, added before the shift: ties go to even, and a carry out of the
+    /// mantissa steps the exponent, up to infinity). Below the smallest normal half the step
+    /// is 2^-24 whatever the exponent: an f32 add of 0.5 (2^-24 is its last place there)
+    /// rounds the magnitude to it, and the bits of 0.5 taken off as an integer leave the
+    /// half's. `alu_diff_tests` checks it against the ISA on the host GPU and WARP.
     fn f16_nearest(&mut self, f: V) -> V {
         let c = self.cur;
-        let f32t = self.s.t.f32;
-        let lo = self.f16_toward_zero(f);
-        let (one, zero) = (self.s.m.i32(1), self.s.m.i32(0));
-        let hi = self.s.m.bin(c, Bin::Add, lo, one);
-        let size = |l: &mut Self, h: V| {
-            let w = l.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
-            l.unary(6, w)
-        };
-        let (below, above) = (size(self, lo), size(self, hi));
-        let (magnitude, infinity) = (self.s.m.i32(0x7FFF), self.s.m.i32(0x7C00));
-        let m = self.s.m.bin(c, Bin::And, hi, magnitude);
-        let top = self.s.m.cmp(c, pred::EQ, m, infinity);
-        let bound = self.s.m.f32(65536.0f32.to_bits());
-        let above = self.s.m.select(c, top, bound, above);
-        let fa = self.unary(6, f);
-        // (both differences are exact: the three values lie within one half's step)
-        let under = self.s.m.bin(c, Bin::Sub, fa, below);
-        let over = self.s.m.bin(c, Bin::Sub, above, fa);
-        // Ordered: never for NaN, which stays what the conversion made of it.
-        let nearer = self.s.m.cmp(c, pred::OLT, over, under);
-        let tie = self.s.m.cmp(c, pred::OEQ, over, under);
-        let odd = self.s.m.bin(c, Bin::And, lo, one);
-        let odd = self.s.m.cmp(c, pred::NE, odd, zero);
-        let tie = self.s.m.bin(c, Bin::And, tie, odd);
-        let up = self.s.m.bin(c, Bin::Or, nearer, tie);
-        self.s.m.select(c, up, hi, lo)
+        let bits = self.as_int(f);
+        let k = |l: &mut Self, x: u32| l.s.m.i32(x);
+        let (sign_bit, k13, one) = (k(self, 0x8000_0000), k(self, 13), k(self, 1));
+        let sign = self.s.m.bin(c, Bin::And, bits, sign_bit);
+        let a = self.s.m.bin(c, Bin::Xor, bits, sign);
+        // A normal half (or the infinity a rounding up to 65536 makes).
+        let last = self.s.m.bin(c, Bin::LShr, a, k13);
+        let odd = self.s.m.bin(c, Bin::And, last, one);
+        // 0xFFF, and the exponent from f32's bias (127) to the half's (15).
+        let rebase = k(self, 0x0FFF_u32.wrapping_sub((127 - 15) << 23));
+        let n = self.s.m.bin(c, Bin::Add, a, rebase);
+        let n = self.s.m.bin(c, Bin::Add, n, odd);
+        let normal = self.s.m.bin(c, Bin::LShr, n, k13);
+        // A denormal half (or zero, or the smallest normal one).
+        let half_bits = k(self, 0x3F00_0000);
+        let magnitude = self.as_float(a);
+        let point_five = self.s.m.f32(0.5f32.to_bits());
+        let shifted = self.s.m.bin(c, Bin::Add, magnitude, point_five);
+        let shifted = self.as_int(shifted);
+        let denormal = self.s.m.bin(c, Bin::Sub, shifted, half_bits);
+        let (smallest, beyond, infinity) = (k(self, 0x3880_0000), k(self, 0x4780_0000), k(self, 0x7F80_0000));
+        let small = self.s.m.cmp(c, pred::IULT, a, smallest);
+        let r = self.s.m.select(c, small, denormal, normal);
+        // 65536 and more, infinities and NaNs.
+        let nan = self.s.m.cmp(c, pred::IUGT, a, infinity);
+        let (h_nan, h_inf) = (k(self, 0x7E00), k(self, 0x7C00));
+        let special = self.s.m.select(c, nan, h_nan, h_inf);
+        let big = self.s.m.cmp(c, pred::IUGE, a, beyond);
+        let r = self.s.m.select(c, big, special, r);
+        let k16 = k(self, 16);
+        let sign = self.s.m.bin(c, Bin::LShr, sign, k16);
+        self.s.m.bin(c, Bin::Or, r, sign)
     }
 
     /// `(a >> off[4:0]) & ((1 << width) - 1)`, sign-extended from the field's
@@ -6869,18 +6884,23 @@ impl<'a> Lower<'a> {
                     src32(self, 1)?
                 };
                 let r = self.s.m.bin(c, Bin::Add, a, b);
+                // SCC: the carry out, or for the signed forms the overflow.
                 let carry = if name == "s_add_u32" {
-                    Some(self.s.m.cmp(c, pred::IULT, r, a))
+                    self.s.m.cmp(c, pred::IULT, r, a)
                 } else {
-                    None
+                    self.signed_overflow(c, true, a, b, r)
                 };
-                (r, carry)
+                (r, Some(carry))
             }
             "s_sub_u32" | "s_sub_i32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
                 let r = self.s.m.bin(c, Bin::Sub, a, b);
-                let carry = (name == "s_sub_u32").then(|| self.s.m.cmp(c, pred::IULT, a, b));
-                (r, carry)
+                let carry = if name == "s_sub_u32" {
+                    self.s.m.cmp(c, pred::IULT, a, b)
+                } else {
+                    self.signed_overflow(c, false, a, b, r)
+                };
+                (r, Some(carry))
             }
             "s_addc_u32" | "s_subb_u32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
@@ -6973,9 +6993,18 @@ impl<'a> Lower<'a> {
             }
             "s_lshl1_add_u32" | "s_lshl2_add_u32" | "s_lshl3_add_u32" | "s_lshl4_add_u32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
-                let k = self.s.m.i32(u32::from(name.as_bytes()[6] - b'0'));
+                let n = u32::from(name.as_bytes()[6] - b'0');
+                let k = self.s.m.i32(n);
                 let t = self.s.m.bin(c, Bin::Shl, a, k);
-                (self.s.m.bin(c, Bin::Add, t, b), None)
+                let r = self.s.m.bin(c, Bin::Add, t, b);
+                // SCC: the carry of the sum taken in 64 bits, so the bits
+                // shifted out of the top count as well as the add's own carry
+                // (not "the result is not zero").
+                let (high, zero) = (self.s.m.i32(32 - n), self.s.m.i32(0));
+                let out = self.s.m.bin(c, Bin::LShr, a, high);
+                let lost = self.s.m.cmp(c, pred::NE, out, zero);
+                let wrapped = self.s.m.cmp(c, pred::IULT, r, t);
+                (r, Some(self.s.m.bin(c, Bin::Or, lost, wrapped)))
             }
             "s_min_u32" | "s_max_u32" | "s_min_i32" | "s_max_i32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
@@ -7072,6 +7101,19 @@ impl<'a> Lower<'a> {
             mask = self.s.m.bin(c, Bin::And, combined, keep);
         }
         mask
+    }
+
+    /// Whether `r`, the 32-bit `a + b` (`add`) or `a - b`, overflowed as a
+    /// signed number: SCC of `s_add_i32`, `s_addk_i32` and `s_sub_i32`.
+    fn signed_overflow(&mut self, c: usize, add: bool, a: V, b: V, r: V) -> V {
+        // An add overflows when both operands' sign differs from the
+        // result's; a subtract when the operands' signs differ and the
+        // result's differs from the first operand's.
+        let x = if add { self.s.m.bin(c, Bin::Xor, a, r) } else { self.s.m.bin(c, Bin::Xor, a, b) };
+        let y = if add { self.s.m.bin(c, Bin::Xor, b, r) } else { self.s.m.bin(c, Bin::Xor, a, r) };
+        let both = self.s.m.bin(c, Bin::And, x, y);
+        let zero = self.s.m.i32(0);
+        self.s.m.cmp(c, pred::SLT, both, zero)
     }
 
     /// `a + b (+ cin)` or `a - b (- cin)` with the carry (borrow) out, as the

@@ -70,6 +70,17 @@ How each of these was found, with the numbers:
   bytes to become available. This path is off by default; `scripts\play.ps1`
   sets it for NVIDIA cards outside `-Safe`, next to `VICTORY_PLACED_ORDER`
   ([measured in play on an RTX 5080](rtx5080-16gb.md#in-play-fills-behind-placed-copies)).
+- **Card memory left to other processes** with `VICTORY_VRAM_HEADROOM_MB`
+  (off by default, at most 8,192). Every rule that asks how much room the
+  card has sees the system's budget less this many MB, so the shares those
+  rules take (80 to 97 %, and eviction) come out of what is left. Under
+  Proton on Linux the budget is about this process's use plus all of the
+  card's free memory, and nothing moves this process's memory aside for
+  the compositor as WDDM does. On an 8 GB RTX 4070 Laptop the title used
+  5,823 MB of a 5,823 MB budget, the card had no memory free, and the
+  desktop compositor could not allocate its next buffer.
+  1024 is a starting value there. Render targets, the tiles pool and
+  vkd3d-proton's own memory stay outside these rules.
 - **Reuse lazy state preludes** with `VICTORY_PRELUDE_POOL=1`. The pool
   takes the allocator and command list back after the owning list resets,
   once its prior submission has finished. It holds up to 128 idle pairs.

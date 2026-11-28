@@ -1823,17 +1823,27 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         Some([budget, used, ..]) => {
             used.saturating_sub(crate::pool::texture_room().saturating_add(crate::tiles::free_bytes()))
                 .saturating_add(crate::shadow::card_room_kept())
-                .saturating_add(targets_room_kept())
+                .saturating_add(targets_room_kept(Some(budget)))
                 < budget / 100 * room_percent()
         }
         None => filled < WITHOUT_BUDGET,
     }
 }
 
+fn targets_room_kept_for(budget: Option<u64>, targets: u64, explicit_mb: Option<u64>) -> u64 {
+    const DEFAULT_CAP: u64 = 3072 << 20;
+    let most = match explicit_mb {
+        Some(mb) => mb.min(8192) << 20,
+        None => budget.map_or(DEFAULT_CAP, |b| DEFAULT_CAP.min(b / 100 * 30)),
+    };
+    most.saturating_sub(targets)
+}
+
 /// The bytes of the card's memory the texture queue leaves free for
 /// render targets and other host copies the host itself writes that are
-/// not made yet: `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (3,072; 0: none, as
-/// before) less what such copies hold now.
+/// not made yet: `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (up to 8,192 MiB; 0:
+/// none, as before) less what such copies hold now, or by default at most
+/// min(3,072 MiB, 30% of the card's `budget`).
 ///
 /// Measured (runs 193, 197, 198): 652 MB of them before the world, 2,255
 /// to 2,352 MB right after its first frame, 2,800 to 3,100 MB two minutes
@@ -1844,22 +1854,23 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
 /// of run 193, of which 2.3 GB were let go again within 13 seconds). The
 /// card then stood at 99 to 100.5 % of its budget, buffer copies were
 /// turned down for good (31 of 95 made: the frame 355 ms where 95 give
-/// 238), and the queue was refused from the first world frame on. With
-/// their room kept, the queue stops that much earlier while the world
-/// loads and gets it back as the targets are made.
+/// 238), and the queue was refused from the first world frame on. Capping
+/// the unconfigured default at 30% of `budget` preserves 3,072 MiB on
+/// budgets of at least 10 GiB (10,240 MiB) while preventing an 8 GB / Series
+/// S card (where targets reach ~1.3 GB) from holding ~1.7–1.8 GB of unused
+/// reserve.
 #[cfg(windows)]
-pub(crate) fn targets_room_kept() -> u64 {
+pub(crate) fn targets_room_kept(budget: Option<u64>) -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
-    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| {
+    static EXPLICIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let explicit = *EXPLICIT.get_or_init(|| {
         std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
     });
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
-    most.saturating_sub(targets)
+    targets_room_kept_for(budget, targets, explicit)
 }
 
 /// [`room`] as it was at most a tenth of a second ago, for a question
@@ -2179,7 +2190,7 @@ pub(crate) fn let_go_idle() {
             let used = used
                 .saturating_sub(crate::pool::texture_room().saturating_add(crate::tiles::free_bytes()))
                 .saturating_add(crate::shadow::card_room_kept())
-                .saturating_add(targets_room_kept());
+                .saturating_add(targets_room_kept(Some(budget)));
             crate::host::vram_keep(budget, used)
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
@@ -4962,6 +4973,32 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(texture_floor_bytes(Some(12 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(24 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(32 * GIB)), 2 * GIB);
+    }
+
+    #[test]
+    fn targets_room_scales_with_vram_budget() {
+        const MIB: u64 = 1 << 20;
+        const GIB: u64 = 1 << 30;
+        assert_eq!(targets_room_kept_for(None, 652 * MIB, None), (3072 - 652) * MIB);
+        assert_eq!(targets_room_kept_for(Some(12 * GIB), 1300 * MIB, None), (3072 - 1300) * MIB);
+        assert_eq!(
+            targets_room_kept_for(Some(5889 * MIB), 1300 * MIB, None),
+            (5889 * MIB) / 100 * 30 - 1300 * MIB,
+        );
+        assert_eq!(
+            targets_room_kept_for(Some(4865 * MIB), 1300 * MIB, None),
+            (4865 * MIB) / 100 * 30 - 1300 * MIB,
+        );
+        assert_eq!(targets_room_kept_for(Some(4865 * MIB), 1500 * MIB, None), 0);
+        assert_eq!(targets_room_kept_for(Some(12 * GIB), 500 * MIB, Some(0)), 0);
+        assert_eq!(
+            targets_room_kept_for(Some(5889 * MIB), 1300 * MIB, Some(4096)),
+            (4096 - 1300) * MIB,
+        );
+        assert_eq!(
+            targets_room_kept_for(Some(5889 * MIB), 1300 * MIB, Some(99_999)),
+            (8192 - 1300) * MIB,
+        );
     }
 
     /// A placed texture viewed from a later level has a host copy of that

@@ -747,6 +747,11 @@ static CARD_QUEUE: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 /// [`card_dirty`] looks at every copy, as before the queue.
 static CARD_SCAN_ALL: AtomicBool = AtomicBool::new(false);
 
+/// Tests: run once by [`card_dirty`] between clearing a copy's `queued` and
+/// taking its ranges, as a writer that comes in between would.
+#[cfg(test)]
+static CARD_DIRTY_BETWEEN: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+
 /// `VICTORY_CARD_DIRTY_SCAN=1`: [`card_dirty`] looks at every copy in the
 /// card's memory at each submission, as before [`CARD_QUEUE`] (to compare).
 fn card_dirty_scan() -> bool {
@@ -1090,6 +1095,10 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
         // Before the ranges (and reading the change that queued it): a
         // change after this queues the copy again.
         c.queued.swap(false, Ordering::AcqRel);
+        #[cfg(test)]
+        if let Some(between) = CARD_DIRTY_BETWEEN.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            between();
+        }
         if !c.has_dirty.load(Ordering::Acquire) {
             return Vec::new();
         }
@@ -7490,6 +7499,36 @@ mod copied_and_take_tests {
         let _tracked2 = other.track_carded_test();
         let taken = card_dirty(24);
         assert!(taken.iter().any(|(s, r)| Arc::ptr_eq(s, &other) && r == &[(8, 24)]));
+        drop(title);
+    }
+
+    #[test]
+    fn a_change_between_clearing_queued_and_taking_is_taken_once_in_two_drains() {
+        let _one = CARD_DIRTY_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let title = vec![0x44u8; PAGE];
+        let mut side = vec![0x44u8; PAGE];
+        let start = title.as_ptr() as usize;
+        let shadow = Shadow::unbacked(start as u64, side.as_mut_ptr(), side.len() as u64, true);
+        let _tracked = shadow.track_carded_test();
+        let mine = |taken: Vec<(Arc<Shadow>, Vec<(usize, usize)>)>| -> Vec<(usize, usize)> {
+            taken.into_iter().filter(|(s, _)| Arc::ptr_eq(s, &shadow)).flat_map(|(_, r)| r).collect()
+        };
+        let _ = card_dirty(30);
+
+        // The first change queues the copy; the second comes while the
+        // drain has cleared `queued` and not yet taken the ranges.
+        shadow.card_changed(0, 16);
+        let writer = shadow.clone();
+        *CARD_DIRTY_BETWEEN.lock().unwrap() = Some(Box::new(move || writer.card_changed(256, 272)));
+        let mut seen = mine(card_dirty(31));
+        assert!(CARD_DIRTY_BETWEEN.lock().unwrap().is_none(), "the drain ran the writer in between");
+        seen.extend(mine(card_dirty(32)));
+
+        // Each range exactly once over the two drains.
+        assert_eq!(seen.iter().filter(|r| **r == (0, 16)).count(), 1, "{seen:?}");
+        assert_eq!(seen.iter().filter(|r| **r == (256, 272)).count(), 1, "{seen:?}");
+        // And nothing left behind.
+        assert!(mine(card_dirty(33)).is_empty());
         drop(title);
     }
 

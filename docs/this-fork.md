@@ -106,8 +106,9 @@ How each of these was found, with the numbers:
   With `=2` a few wedges were still left (a dozen or two in a long free run);
   with `=3` none were seen in a 2.5-minute free run on an RTX 2080 Ti (one run,
   so "rarer or gone", not proven). `=1` puts nothing in until the landing
-  (simpler, short flashes possible). No wait for the card; `=2` costs about
-  0.3-0.5 fps. The frame line counts what was merged and what was left for the
+  (simpler, short flashes possible). No wait for the card; `=2` and `=3` cost
+  within run-to-run spread (`=3`: 19.64 / 19.41 fps café -> cell / cell
+  against 19.17 / 20.07 off). The frame line counts what was merged and what was left for the
   landing; `VICTORY_WEDGE_TRACE=1` (diagnostics builds) logs the copies and
   pipelines behind what is left.
 - **Heap pacing** (`VICTORY_HEAP_SYNC_PACE=1`, off by default), the first

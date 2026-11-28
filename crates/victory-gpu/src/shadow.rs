@@ -3169,6 +3169,198 @@ const AL_APPLIED_BYTES: usize = 9;
 const AL_UNCOPIED: usize = 10;
 const AL_UNTRACKED: usize = 11;
 const AL_GONE: usize = 12;
+/// Diagnostics (`VICTORY_WEDGE_TRACE=1`, off by default): the paths
+/// that may still put old bytes before the card while a flight has not
+/// landed, by copy, with the title pipelines whose dispatches declared
+/// writes to the copy (the pipeline bound last on the recording thread
+/// when the write was declared; steps of ours declared at submission name
+/// whatever that thread bound last).
+#[cfg(feature = "diagnostics")]
+pub(crate) mod wedge {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    /// A refresh of a copy a flight not landed writes ([`super::Shadow::update`]).
+    pub(crate) const K_REFRESH: usize = 0;
+    /// A page left for the landing: over the runs a submission sends up.
+    pub(crate) const K_BUDGET: usize = 1;
+    /// A part left for the landing: at bytes the card writes.
+    pub(crate) const K_OWNED: usize = 2;
+    /// A deferred part a refresh after the landing found current: nothing copied.
+    pub(crate) const K_LOST: usize = 3;
+    /// A refresh of a copy with stores not declared.
+    pub(crate) const K_UNDECLARED: usize = 4;
+    /// Bytes of a copy in the PC's memory outside every range its flights
+    /// declared that differ from title memory once they all landed (pages
+    /// the title did not write since they were taken): the card wrote
+    /// there without declaring it.
+    pub(crate) const K_OUTSIDE: usize = 5;
+    const KINDS: usize = 6;
+    const NAMES: [&str; KINDS] = [
+        "refreshes of copies a flight not landed writes",
+        "pages left for the landing over the run budget",
+        "parts left for the landing at the card's bytes",
+        "deferred parts found current after the landing (nothing copied)",
+        "refreshes of copies with stores not declared",
+        "bytes outside the declared ranges that differ after all flights landed (copies in the PC's memory)",
+    ];
+    /// Events logged one by one, each kind.
+    const LOGGED: u64 = 20;
+    /// Copies most named, each kind, in the line.
+    const TOP: usize = 6;
+    /// Copies in the PC's memory compared after landing, at most this long.
+    pub(crate) const OUTSIDE_MOST: usize = 8 << 20;
+    /// Bytes compared for [`K_OUTSIDE`] between two lines, at most.
+    const OUTSIDE_BUDGET: u64 = 256 << 20;
+
+    pub(crate) fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            let on = std::env::var_os("VICTORY_WEDGE_TRACE").is_some_and(|v| v == "1");
+            if on {
+                tracing::info!(
+                    "VICTORY_WEDGE_TRACE=1: refreshes of copies with flights not landed, pages left for the landing, deferred parts \
+                     found current, refreshes of undeclared-store copies and undeclared card writes are logged by copy with the \
+                     pipelines that write it"
+                );
+            }
+            on
+        })
+    }
+
+    thread_local! {
+        static CURRENT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// The pipeline a list on this thread binds (`crate::draw::State`).
+    pub(crate) fn set_pipeline(pipeline: usize) {
+        if on() {
+            CURRENT.with(|c| c.set(pipeline));
+        }
+    }
+
+    struct Writers {
+        /// (pipeline, its shaders, declarations).
+        by: Vec<(usize, String, u64)>,
+    }
+
+    static WRITERS: Mutex<Option<HashMap<u64, Writers>>> = Mutex::new(None);
+
+    /// Shaders of the pipeline bound now declared writes to copy `id`.
+    pub(crate) fn wrote(id: u64) {
+        let pipeline = CURRENT.with(std::cell::Cell::get);
+        let mut all = WRITERS.lock().unwrap_or_else(|e| e.into_inner());
+        let copy = all.get_or_insert_with(HashMap::new).entry(id).or_insert_with(|| Writers { by: Vec::new() });
+        if let Some(e) = copy.by.iter_mut().find(|e| e.0 == pipeline) {
+            e.2 += 1;
+        } else if copy.by.len() < 12 {
+            let shaders = if pipeline == 0 {
+                "none bound on the thread".to_string()
+            } else {
+                crate::pipeline::shader_hashes(pipeline as crate::object::This)
+            };
+            copy.by.push((pipeline, shaders, 1));
+        }
+    }
+
+    fn writers_of(all: &HashMap<u64, Writers>, id: u64) -> String {
+        all.get(&id).map_or_else(
+            || "no writes declared".to_string(),
+            |c| {
+                let mut by: Vec<&(usize, String, u64)> = c.by.iter().collect();
+                by.sort_by(|a, b| b.2.cmp(&a.2));
+                by.iter().map(|(_, s, n)| format!("[{s}] x{n}")).collect::<Vec<_>>().join(", ")
+            },
+        )
+    }
+
+    static COUNTS: [[AtomicU64; 2]; KINDS] = [const { [const { AtomicU64::new(0) }; 2] }; KINDS];
+    static SEEN: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
+    static OUTSIDE_COMPARED: AtomicU64 = AtomicU64::new(0);
+    /// (kind, copy) -> (events, bytes, start, len, card, first address).
+    type ByCopy = HashMap<(usize, u64), (u64, u64, u64, u64, bool, usize)>;
+    static BY_COPY: Mutex<Option<ByCopy>> = Mutex::new(None);
+
+    /// An event of `kind` in copy `id` (`[start, start + len)` of title
+    /// memory) at title address `at`, `bytes` long.
+    pub(crate) fn note(kind: usize, id: u64, start: u64, len: u64, card: bool, at: usize, bytes: u64) {
+        COUNTS[kind][0].fetch_add(1, Ordering::Relaxed);
+        COUNTS[kind][1].fetch_add(bytes, Ordering::Relaxed);
+        {
+            let mut by = BY_COPY.lock().unwrap_or_else(|e| e.into_inner());
+            let e = by.get_or_insert_with(HashMap::new).entry((kind, id)).or_insert((0, 0, start, len, card, at));
+            e.0 += 1;
+            e.1 += bytes;
+        }
+        if SEEN[kind].fetch_add(1, Ordering::Relaxed) < LOGGED {
+            let writers = WRITERS.lock().unwrap_or_else(|e| e.into_inner());
+            let writers = writers.as_ref().map_or_else(|| "no writes declared".to_string(), |all| writers_of(all, id));
+            tracing::info!(
+                "wedge trace, {} (one of the first {LOGGED}): copy {id} {start:#x}+{len:#x} in the {} memory, at {at:#x} \
+                 (+{:#x}), {bytes} bytes; written by {writers}",
+                NAMES[kind],
+                if card { "card's" } else { "PC's" },
+                at.saturating_sub(start as usize),
+            );
+        }
+    }
+
+    /// Takes `bytes` of the compare budget of [`K_OUTSIDE`]; false if spent.
+    pub(crate) fn outside_budget(bytes: u64) -> bool {
+        if OUTSIDE_COMPARED.fetch_add(bytes, Ordering::Relaxed) + bytes <= OUTSIDE_BUDGET {
+            return true;
+        }
+        OUTSIDE_COMPARED.fetch_sub(bytes, Ordering::Relaxed);
+        false
+    }
+
+    /// With the frame line.
+    pub(crate) fn line(frames: f64) {
+        if !on() {
+            return;
+        }
+        let compared = OUTSIDE_COMPARED.swap(0, Ordering::Relaxed);
+        let counts = COUNTS.each_ref().map(|c| [c[0].swap(0, Ordering::Relaxed), c[1].swap(0, Ordering::Relaxed)]);
+        let by = BY_COPY.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+        let writers = WRITERS.lock().unwrap_or_else(|e| e.into_inner());
+        let empty = HashMap::new();
+        let all = writers.as_ref().unwrap_or(&empty);
+        let per = counts
+            .iter()
+            .enumerate()
+            .map(|(k, c)| format!("{} {:.1} ({:.3} MB)", NAMES[k], c[0] as f64 / frames, c[1] as f64 / (1u64 << 20) as f64 / frames))
+            .collect::<Vec<_>>()
+            .join("; ");
+        tracing::info!(
+            "wedge trace per frame (VICTORY_WEDGE_TRACE=1): {per}; {:.1} MB compared outside declared ranges a frame",
+            compared as f64 / (1u64 << 20) as f64 / frames
+        );
+        for kind in 0..KINDS {
+            let mut copies: Vec<(&(usize, u64), &(u64, u64, u64, u64, bool, usize))> = by.iter().filter(|(k, _)| k.0 == kind).collect();
+            if copies.is_empty() {
+                continue;
+            }
+            copies.sort_by(|a, b| b.1.1.cmp(&a.1.1).then(b.1.0.cmp(&a.1.0)));
+            let top = copies
+                .iter()
+                .take(TOP)
+                .map(|((_, id), (n, bytes, start, len, card, at))| {
+                    format!(
+                        "copy {id} {start:#x}+{len:#x} ({}) {n}x {:.3} MB first at +{:#x}, written by {}",
+                        if *card { "card" } else { "PC" },
+                        *bytes as f64 / (1u64 << 20) as f64,
+                        at.saturating_sub(*start as usize),
+                        writers_of(all, *id)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            tracing::info!("wedge trace, {} since the last line, the most ({} copies): {top}", NAMES[kind], copies.len());
+        }
+    }
+}
+
 static AFTER_LANDING: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 /// Deferred parts not yet settled, in all copies.
 static AFTER_LANDING_LEFT: AtomicU64 = AtomicU64::new(0);
@@ -3223,6 +3415,8 @@ fn settle_deferred(deferred: &mut Vec<(usize, usize)>, from: usize, to: usize, c
 
 /// With the frame line, while [`merge_after_landing`] is on.
 pub(crate) fn after_landing_line(frames: f64) {
+    #[cfg(feature = "diagnostics")]
+    wedge::line(frames);
     if !merge_after_landing() {
         return;
     }
@@ -4682,6 +4876,10 @@ impl Shadow {
             return;
         }
         self.written.store(true, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        if wedge::on() {
+            wedge::wrote(self.id);
+        }
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
     }
@@ -5026,6 +5224,10 @@ impl Shadow {
             return;
         }
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        // All the flights' declared ranges, for the compare outside them
+        // once the last has landed (`VICTORY_WEDGE_TRACE=1`).
+        #[cfg(feature = "diagnostics")]
+        let declared_all = (wedge::on() && self.card.is_none() && self.len as usize <= wedge::OUTSIDE_MOST).then(|| pending.clone());
         if relay() {
             let free = self.flights.lock().unwrap_or_else(|e| e.into_inner()).done(ranges);
             pending.retain(|r| free.binary_search(r).is_err());
@@ -5033,6 +5235,12 @@ impl Shadow {
             pending.retain(|r| !ranges.contains(r));
         }
         self.has_pending.store(!pending.is_empty(), Ordering::Release);
+        #[cfg(feature = "diagnostics")]
+        if let Some(declared) = declared_all
+            && pending.is_empty()
+        {
+            self.wedge_outside(declared);
+        }
         if !pending.is_empty() || self.card.is_some() {
             return;
         }
@@ -5441,6 +5649,10 @@ impl Shadow {
                         let (put, out) = precise_runs(title, held, seen, |i| owned_any && self.card_wrote.owns(at + i));
                         if self.card.is_some() && put.len() > *runs_left {
                             PRECISE[MP_BUDGET].fetch_add(1, Ordering::Relaxed);
+                            #[cfg(feature = "diagnostics")]
+                            if wedge::on() {
+                                self.wedge_note(wedge::K_BUDGET, lo, (hi - lo) as u64);
+                            }
                             parts.push((lo, hi));
                             continue;
                         }
@@ -5475,6 +5687,10 @@ impl Shadow {
                             PRECISE[MP_OWNED_PARTS].fetch_add(1, Ordering::Relaxed);
                             PRECISE[MP_OWNED_BYTES].fetch_add(out_bytes as u64, Ordering::Relaxed);
                             owned_bytes += out_bytes as u64;
+                            #[cfg(feature = "diagnostics")]
+                            if wedge::on() {
+                                self.wedge_note(wedge::K_OWNED, lo, out_bytes as u64);
+                            }
                             parts.push((lo, hi));
                         }
                     }
@@ -5712,6 +5928,75 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        // A refresh of a copy a flight not landed writes
+        // (`VICTORY_WEDGE_TRACE=1`).
+        #[cfg(feature = "diagnostics")]
+        let unlanded = wedge::on() && self.has_pending.load(Ordering::Acquire);
+        let bytes = self.update_around(from, to);
+        #[cfg(feature = "diagnostics")]
+        if unlanded && bytes > 0 {
+            self.wedge_note(wedge::K_REFRESH, from, bytes as u64);
+        }
+        bytes
+    }
+
+    /// Diagnostics (`VICTORY_WEDGE_TRACE=1`): a copy in the PC's memory
+    /// all of whose flights have landed; `declared` the ranges they
+    /// declared. Its pages outside them that the title has not written
+    /// since they were taken should hold title memory's bytes: those that
+    /// differ the card wrote without declaring it ([`wedge::K_OUTSIDE`]).
+    /// (A landing of another copy over the same title memory, unseen by
+    /// the write watch, would count too.) Called under `pending`'s lock,
+    /// with `has_pending` false.
+    #[cfg(feature = "diagnostics")]
+    fn wedge_outside(&self, declared: Vec<(usize, usize)>) {
+        if !matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED) {
+            return;
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let outside = outside(start, end, joined(declared));
+        let bytes: usize = outside.iter().map(|&(a, e)| e - a).sum();
+        if bytes == 0 || !wedge::outside_budget(bytes as u64) {
+            return;
+        }
+        let base = start / PAGE;
+        let mut title = vec![0u8; PAGE];
+        let (mut differ, mut first) = (0u64, None);
+        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        for (a, e) in outside {
+            let mut at = a;
+            while at < e {
+                let n = (PAGE - at % PAGE).min(e - at);
+                let ranged = self.ranged(at, at + n);
+                if crate::watch::nothing_new(at, at + n, base, &copied.at, ranged)
+                    && crate::host::read_into(at as *const u8, &mut title[..n])
+                {
+                    // SAFETY: inside the copy's mapping.
+                    let copy = unsafe { std::slice::from_raw_parts(self.data.add(at - start).cast_const(), n) };
+                    let d = copy.iter().zip(&title[..n]).filter(|(x, y)| x != y).count() as u64;
+                    if d > 0 {
+                        differ += d;
+                        first.get_or_insert(at);
+                    }
+                }
+                at += n;
+            }
+        }
+        drop(copied);
+        if let Some(at) = first {
+            self.wedge_note(wedge::K_OUTSIDE, at, differ);
+        }
+    }
+
+    /// [`wedge::note`] for this copy.
+    #[cfg(feature = "diagnostics")]
+    fn wedge_note(&self, kind: usize, at: usize, bytes: u64) {
+        wedge::note(kind, self.id, self.start, self.len, self.card.is_some(), at, bytes);
+    }
+
+    /// [`Shadow::update`] of `[from, to)` (inside the buffer): around the
+    /// ranges shaders may be writing.
+    fn update_around(&self, from: usize, to: usize) -> usize {
         if !self.has_pending.load(Ordering::Acquire) {
             return self.update_free(from, to);
         }
@@ -5801,6 +6086,10 @@ impl Shadow {
             self.has_deferred.store(!deferred.is_empty(), Ordering::Release);
             settled
         };
+        #[cfg(feature = "diagnostics")]
+        if uncopied > 0 && wedge::on() {
+            self.wedge_note(wedge::K_LOST, from, uncopied);
+        }
         AFTER_LANDING[AL_APPLIED].fetch_add(applied, Ordering::Relaxed);
         AFTER_LANDING[AL_APPLIED_BYTES].fetch_add(applied_bytes, Ordering::Relaxed);
         AFTER_LANDING[AL_UNCOPIED].fetch_add(uncopied, Ordering::Relaxed);
@@ -6056,6 +6345,10 @@ impl Shadow {
             }
             return self.copy(from, to);
         };
+        #[cfg(feature = "diagnostics")]
+        if from < to && self.stores_undeclared() && wedge::on() {
+            self.wedge_note(wedge::K_UNDECLARED, from, (to - from) as u64);
+        }
         // (With stores not declared, `VICTORY_MERGE_AFTER_LANDING=2`: never
         // whole, the card's bytes stay where the title's did not change.)
         let whole = !known
@@ -6104,6 +6397,11 @@ impl Shadow {
         let (from, to) = (from.max(start), to.min(end));
         // The card stores in it without declaring it: only the bytes the
         // title changed go in (`VICTORY_MERGE_AFTER_LANDING=2`).
+        // (Bytes asked for, not bytes put in.)
+        #[cfg(feature = "diagnostics")]
+        if from < to && self.stores_undeclared() && wedge::on() {
+            self.wedge_note(wedge::K_UNDECLARED, from, (to - from) as u64);
+        }
         if from < to && self.has_title_known.load(Ordering::Acquire) {
             return self.copy_title_changes(from, to);
         }

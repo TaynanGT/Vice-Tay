@@ -22,6 +22,8 @@
 static HEAP: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[cfg(windows)]
+mod adapter;
+#[cfg(windows)]
 mod ambient;
 #[cfg(windows)]
 mod lightprobe;

@@ -58,6 +58,10 @@ pub(crate) struct Host {
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
     adapter: Option<IDXGIAdapter3>,
+    /// Probed `D3D12_FEATURE_DATA_ARCHITECTURE1` flags for UMA/APU detection.
+    arch: crate::adapter::ArchitectureInfo,
+    /// Active UMA fast-path policy (cards and copy-queue bounce suppression).
+    uma_policy: crate::adapter::UmaPolicy,
     /// 1-descriptor shader-visible fallback heaps bound when a command list
     /// omits a view or sampler heap while using directly-indexed root signatures.
     fallback_view: OnceLock<Option<ID3D12DescriptorHeap>>,
@@ -1461,7 +1465,7 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            device = Some(victory_shader::emit::host::create_preferred_device()?);
+            device = Some(crate::adapter::create_preferred_device(title_window())?);
             // Whether a GPU hang ends the run or freezes the PC (#1054).
             crate::tdr::log();
         }
@@ -1527,6 +1531,9 @@ fn create() -> windows::core::Result<Host> {
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
+        let arch = crate::adapter::probe_architecture(&device);
+        let uma_policy = crate::adapter::resolve_uma_policy_from_env(arch);
+        crate::adapter::set_runtime_telemetry(arch, uma_policy);
         if let Some(desc) = adapter.as_ref().and_then(|a| a.GetDesc1().ok()) {
             let name = String::from_utf16_lossy(&desc.Description);
             tracing::info!(
@@ -1534,9 +1541,18 @@ fn create() -> windows::core::Result<Host> {
                 vendor = format_args!("{:#06x}", desc.VendorId),
                 device = format_args!("{:#06x}", desc.DeviceId),
                 vram_mb = desc.DedicatedVideoMemory >> 20,
+                uma = arch.uma,
+                cache_coherent_uma = arch.cache_coherent_uma,
+                tile_based_renderer = arch.tile_based_renderer,
+                isolated_mmu = arch.isolated_mmu,
+                uma_fast_path = uma_policy.fast_path,
+                cards_allowed = uma_policy.allow_card_buffers,
+                bounce_copy_queue_allowed = uma_policy.allow_bounce_copy_queue,
+                smart_adapter = crate::adapter::smart_adapter_enabled(),
                 "host D3D12 adapter"
             );
         }
+        let _ = crate::adapter::check_output_luid(&device, title_window());
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
@@ -1554,6 +1570,8 @@ fn create() -> windows::core::Result<Host> {
             presenter: Mutex::new(None),
             title_stock: Default::default(),
             adapter,
+            arch,
+            uma_policy,
             fallback_view: OnceLock::new(),
             fallback_sampler: OnceLock::new(),
             texture_readbacks: ReadbackPool::new(),
@@ -1567,6 +1585,18 @@ impl Host {
         let adapter = self.adapter.as_ref();
         // SAFETY: a plain query.
         adapter.map_or(0, |a| unsafe { a.CheckInterfaceSupport(&IDXGIDevice::IID) }.unwrap_or(0))
+    }
+
+    /// Probed `D3D12_FEATURE_DATA_ARCHITECTURE1` telemetry for this device.
+    #[allow(dead_code)]
+    pub(crate) fn architecture(&self) -> crate::adapter::ArchitectureInfo {
+        self.arch
+    }
+
+    /// Effective UMA fast-path policy for this device.
+    #[allow(dead_code)]
+    pub(crate) fn uma_policy(&self) -> crate::adapter::UmaPolicy {
+        self.uma_policy
     }
 }
 
@@ -2621,6 +2651,9 @@ static BUDGET_NOTES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::ato
 /// every clamp; in mapped memory on a card of its own each of them
 /// crosses the bus.
 fn card_budget() -> bool {
+    if crate::adapter::uma_disables_card_buffers() {
+        return false;
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_CARD_BUDGET").is_none_or(|v| v != "0"))
 }
@@ -3760,6 +3793,9 @@ fn relay_mode() -> u8 {
 /// the title's, newer than what the flights wrote. A later flight's bytes
 /// may be in what is fetched, as before.
 fn relay_copy() -> bool {
+    if crate::adapter::uma_disables_bounce_copy_queue() {
+        return false;
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_RELAY_COPY").is_some_and(|v| v == "1"))
 }
@@ -5825,6 +5861,9 @@ impl Host {
     /// lists and the compare); made at the first ask. A copy goes to the
     /// card's memory only if it has.
     pub(crate) fn card_ready(&self) -> bool {
+        if !self.uma_policy.allow_card_buffers {
+            return false;
+        }
         static READY: OnceLock<bool> = OnceLock::new();
         *READY.get_or_init(|| match self.make_card_work() {
             Ok(work) => {
@@ -5909,7 +5948,7 @@ impl Host {
     /// (`crate::picked`).
     fn card_before(&self, declared: &[Declared], picked: &crate::picked::Ranges, flown: bool) -> Option<CardPlan> {
         use std::sync::Arc;
-        if !crate::shadow::cards() {
+        if !self.uma_policy.allow_card_buffers || !crate::shadow::cards() {
             return None;
         }
         // The ranges this submission's shaders may write, per copy.
@@ -11330,7 +11369,7 @@ impl Meter {
                     slow[1] as f64 / 1e3 / frames,
                     slow[2] as f64 / 1e3
                 );
-                if crate::shadow::cards() {
+                if crate::shadow::cards() && !crate::adapter::uma_disables_card_buffers() {
                     let per_frame = |i: usize| card[i] as f64 / frames;
                     tracing::info!(
                         "host copies in the card's memory: {} copies {} MB, their bytes from before {} MB; per frame: \
@@ -11855,6 +11894,7 @@ impl Host {
             Some(hwnd) => hwnd,
             None => window(width, height)?,
         };
+        let _ = crate::adapter::check_output_luid(&self.device, Some(hwnd));
         self.log_video_memory("right before the swap chain is made");
         // SAFETY: plain object creation for our window.
         unsafe {

@@ -532,6 +532,9 @@ struct Card {
 /// shaders, as before, and goes back to the title the next time a declared
 /// range holds its piece (before: never).
 pub(crate) fn cards() -> bool {
+    if crate::adapter::uma_disables_card_buffers() {
+        return false;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_BUFFERS").is_none_or(|v| v != "0"))
 }

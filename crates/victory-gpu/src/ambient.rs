@@ -1059,7 +1059,9 @@ mod tests {
                 layer.expect("the D3D12 debug layer").EnableDebugLayer();
             }
         }
-        let mut warp = WarpHarness::new().expect("a D3D12 WARP adapter");
+        let Some(mut warp) = WarpHarness::new() else {
+            return; // no WARP adapter (Wine/Proton)
+        };
         let pass = make(&warp.device, |bytes| Some(warp.default_uav(bytes)), true).unwrap();
         let (root, pso) = pass.hold_indirect.as_ref().expect("the guarded hold PSO");
         let (initial, initial_bytes, _) = warp.shared_buffer(256);

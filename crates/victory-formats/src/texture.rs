@@ -226,14 +226,27 @@ impl TilePlan {
         let mut runs = Vec::new();
         let mut first_linear = 0;
         let mut first_tiled = layout.column(m, 0) as usize;
-        for x in 1..m.width {
-            let offset = layout.column(m, x) as usize;
-            let at = x as usize * n;
-            if offset != first_tiled + (at - first_linear) {
-                runs.push((first_tiled, first_linear, at - first_linear));
-                first_tiled = offset;
-                first_linear = at;
+        let block_width = layout.block[0];
+        let shift = layout.alignment.trailing_zeros();
+        let tail_x = m.tail.map_or(0, |tail| tail.x);
+        let mut column = 1;
+        // The block base is shared by every column in this part of the row.
+        while column < m.width {
+            let x = column + tail_x;
+            let in_block = x % block_width;
+            let count = (m.width - column).min(block_width - in_block);
+            let base = u64::from(x / block_width) << shift;
+            let offsets = &layout.pattern[0][in_block as usize..(in_block + count) as usize];
+            for (index, &offset) in offsets.iter().enumerate() {
+                let offset = (base + u64::from(offset)) as usize;
+                let at = (column as usize + index) * n;
+                if offset != first_tiled + (at - first_linear) {
+                    runs.push((first_tiled, first_linear, at - first_linear));
+                    first_tiled = offset;
+                    first_linear = at;
+                }
             }
+            column += count;
         }
         runs.push((first_tiled, first_linear, m.width as usize * n - first_linear));
         // A mip can end partway through the last run.

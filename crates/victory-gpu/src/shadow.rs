@@ -3539,7 +3539,7 @@ pub(crate) mod wedge {
             || "no writes declared".to_string(),
             |c| {
                 let mut by: Vec<&(usize, String, u64)> = c.by.iter().collect();
-                by.sort_by(|a, b| b.2.cmp(&a.2));
+                by.sort_by_key(|a| std::cmp::Reverse(a.2));
                 by.iter().map(|(_, s, n)| format!("[{s}] x{n}")).collect::<Vec<_>>().join(", ")
             },
         )

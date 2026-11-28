@@ -160,7 +160,12 @@ on by default here:
 
 Others are off by default (`VICTORY_INPLACE`, `VICTORY_BVH_BUILDER`, ...).
 `VICTORY_CARD_BUFFERS_MIN_MB` and `VICTORY_CARD_BUFFERS_MB` are sizes, not
-switches: their defaults follow the card's memory budget.
+switches: their defaults follow the card's memory budget. On an NVIDIA card
+of 16 GB or 24 GB the least size is 64 KiB by default (every title buffer
+gets a copy in the card's memory; [rtx5080-16gb.md](rtx5080-16gb.md), and on
+an RTX 5090 D v2 with 24 GB 29.5 against 20.4 fps median, 34 per cent at
+equal world seconds, the picture unchanged); either variable set puts its
+own value in place of that default.
 `VICTORY_CARD_BUFFERS_MIN_KB`, when set above 0, wins over
 `VICTORY_CARD_BUFFERS_MIN_MB`. Each switch is described in a comment where it
 is read.

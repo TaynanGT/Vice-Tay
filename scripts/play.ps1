@@ -14,7 +14,8 @@
 # -FrameIntervalMs  use a frame interval in milliseconds (0 removes the limit)
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -Machine      auto (the default: by GPU vendor; on NVIDIA, worker counts sized to the CPU and,
-#               for a card of 10 to 19 GB, title buffers in the card's memory),
+#               for a card of 10 to 19 GB, the memory settings of -Machine 4070 or 4070tisuper:
+#               title buffers in the card's memory with that preset's budgets),
 #               7900xtx, 4070, 4070tisuper, 4090, 3060 or laptop
 #               (3060: a six-core NVIDIA desktop with 16 GB of RAM and a 12 GB card, docs/rtx3060-16gb.md;
 #               laptop: an NVIDIA PC with 16 GB of RAM and a 6-8 GB card, docs/laptop-16gb.md)
@@ -76,9 +77,12 @@ if ($Machine -eq 'auto') {
 
 # What -Machine auto adds to the NVIDIA defaults for a card of $CardGb GB and a CPU of $Cores cores.
 # - 10 to 19 GB: the memory settings of -Machine 4070 (and, from 15 GB, of -Machine 4070tisuper).
-#   Under a 20 GiB budget the defaults leave title buffers under 4 MiB in the PC's memory, where
-#   every access a shader makes crosses the bus: 16 fps against 29 on an RTX 5080
-#   (docs/rtx5080-16gb.md), 7.4 against 14.7 on an RTX 3080 10 GB (docs/rtx4070-performance.md).
+#   The 64 KiB least size (every title buffer gets a copy in the card's memory; in the PC's
+#   memory every access a shader makes on them crosses the bus) with the preset's budgets:
+#   16 fps against 29 on an RTX 5080 (docs/rtx5080-16gb.md), 7.4 against 14.7 on an RTX 3080
+#   10 GB (docs/rtx4070-performance.md). From 15 GB that least size is the default of the
+#   code by now (shadow.rs, card_limits; on 24 GB cards too, where this profile adds
+#   nothing): what the profile adds there are the budgets.
 #   Not under -Safe, as in those presets. Smaller cards keep the defaults: the laptop preset
 #   that fits them trades other things (docs/laptop-16gb.md).
 # - Up to eight cores: those presets' three pipeline workers. The default ten, next to the
@@ -253,7 +257,8 @@ Write-Host "Settings for the $profile$(if ($Safe) { ', safe' })$(if ($RayTracing
 if ($autoAdds.Contains('VICTORY_CARD_BUFFERS_MIN_KB')) {
     $preset = if ($cardGb -ge 15) { '4070tisuper' } else { '4070' }
     Write-Host ("This NVIDIA card has $cardGb GB: title buffers go to the card's memory, with the memory settings of " +
-        "-Machine $preset (docs/rtx5080-16gb.md). -Machine 4090 keeps the buffers under 4 MiB in the PC's memory.")
+        "-Machine $preset (docs/rtx5080-16gb.md). -Machine 4090 leaves those budgets out: on a card of 15 GB and more " +
+        "the 64 KiB least size stays (the default of the code), under 15 GB the buffers under 16 MiB stay in the PC's memory.")
 }
 if ($Console -eq 'series-s' -and $Machine -ne '7900xtx') {
     Write-Host ("Series S requests {0} list translation threads, {1} for memory updates, and {2} for landing." -f

@@ -562,19 +562,67 @@ fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
     }
 }
 
-/// Resolve `(min_bytes, max_bytes)` from the adapter's local VRAM budget and
-/// optional explicit MiB overrides from `VICTORY_CARD_BUFFERS_MIN_MB` /
-/// `VICTORY_CARD_BUFFERS_MB`.
+/// PCI vendor ID of NVIDIA's adapters.
+const NVIDIA: u32 = 0x10DE;
+
+/// Whether the adapter is one the 64 KiB least size ([`resolve_card_limits`])
+/// was measured on: NVIDIA's, with a local VRAM budget above 12 GiB and
+/// under 28 GiB (16 GB cards, whose budgets are 13 to 15.5 GiB, and 24 GB
+/// cards, whose budgets are 22 to 23 GiB; a 32 GB card's is about 30 GiB).
+///
+/// Measured on both cards at equal content. An RTX 5080 (16 GB, budget
+/// 15,209 MiB), Series S, the opening cutscene: 16 fps with a 4 MiB least
+/// size and 27 with the preset of `-Machine 4070tisuper`, of which this
+/// least size and the budgets with it are "nearly all of the gain"
+/// (docs/rtx5080-16gb.md). An RTX 5090 D v2 (24 GB, budget 23,267 MiB),
+/// Series S, the opening cutscene, the least size alone, the picture the
+/// same at equal shot progress: on `main` (2026-11-28) three runs with it
+/// beside baselines without, 26.3, 29.5 and 28.9 fps (at equal world
+/// seconds in the window shot 29 to 30 against 22 to 23: 34 per cent); in
+/// one build, the old minimum against this default: 21.9 against 26.6 to
+/// 30.0 fps.
+///
+/// Not measured, so as before: NVIDIA cards of 12 GB and less (their
+/// measured settings are the launcher's `-Machine 4070` and `3060`, which
+/// set this least size together with those presets' budgets), of 32 GB and
+/// more, cards of other vendors, and a budget that could not be read.
+fn measured_64_kib(nvidia: bool, local_vram_budget: Option<u64>) -> bool {
+    const TWELVE_GIB: u64 = 12 << 30;
+    const TWENTY_EIGHT_GIB: u64 = 28 << 30;
+    // Above 12 GiB: the range starts one byte past it (a range check takes its start in).
+    nvidia && local_vram_budget.is_some_and(|budget| ((TWELVE_GIB + 1)..TWENTY_EIGHT_GIB).contains(&budget))
+}
+
+/// Resolve `(min_bytes, max_bytes)` from the adapter's vendor and local
+/// VRAM budget and optional explicit MiB overrides from
+/// `VICTORY_CARD_BUFFERS_MIN_MB` / `VICTORY_CARD_BUFFERS_MB`. An explicit
+/// minimum wins over the default as before, over the 64 KiB one too.
 fn resolve_card_limits(
+    nvidia: bool,
     local_vram_budget: Option<u64>,
     min_mb_override: Option<u64>,
     max_mb_override: Option<u64>,
 ) -> (u64, u64) {
     const MIB: u64 = 1 << 20;
     let (default_min_mb, default_max_mb) = default_card_limits_mb(local_vram_budget);
-    let min_bytes = min_mb_override.unwrap_or(default_min_mb).saturating_mul(MIB).max(MIB);
+    let min_bytes = match min_mb_override {
+        Some(mb) => mb.saturating_mul(MIB).max(MIB),
+        // Nothing set: 64 KiB on the cards that were measured with it.
+        None if measured_64_kib(nvidia, local_vram_budget) => 64 << 10,
+        None => default_min_mb.saturating_mul(MIB),
+    };
     let max_bytes = max_mb_override.unwrap_or(default_max_mb).saturating_mul(MIB);
     (min_bytes, max_bytes)
+}
+
+/// The least size once `VICTORY_CARD_BUFFERS_MIN_KB` is looked at: a value
+/// above 0 is the least size in KiB and wins over the default and over
+/// `VICTORY_CARD_BUFFERS_MIN_MB`; unset, 0 or not a number leaves `min_bytes`.
+fn card_buffers_min_kb(min_bytes: u64, value: Option<&str>) -> u64 {
+    match value.and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(kib) if kib > 0 => kib << 10,
+        _ => min_bytes,
+    }
 }
 
 /// The smallest title buffer whose copy goes to the card's memory, and the
@@ -583,12 +631,17 @@ fn resolve_card_limits(
 /// `VICTORY_CARD_BUFFERS_MIN_MB` and `VICTORY_CARD_BUFFERS_MB`.
 /// Defaults scale with the adapter's local VRAM budget (16 MiB / 512 MiB on
 /// `<= 12 GiB` budgets, 4 MiB / 2048 MiB on 16 GB cards, 1 MiB / up to 8192 MiB
-/// on `>= 20 GiB` budgets), and explicit env vars always override.
+/// on `>= 20 GiB` budgets), with 64 KiB in place of the 4 MiB and the 1 MiB
+/// on NVIDIA cards ([`measured_64_kib`]), and explicit env vars always
+/// override.
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
-        let vram_budget = crate::host::host().and_then(|h| h.video_memory()).map(|[budget, ..]| budget);
+        let host = crate::host::host();
+        let vram_budget = host.and_then(|h| h.video_memory()).map(|[budget, ..]| budget);
+        let nvidia = host.and_then(|h| h.adapter_vendor_id()) == Some(NVIDIA);
         let (mut min_bytes, max_bytes) = resolve_card_limits(
+            nvidia,
             vram_budget,
             std::env::var("VICTORY_CARD_BUFFERS_MIN_MB").ok().as_deref().and_then(parse_mib),
             explicit_card_buffers_mb(),
@@ -598,11 +651,7 @@ fn card_limits() -> (u64, u64) {
         // buffer. Copies under 1 MiB are nearly all there are and few bytes;
         // in the PC's memory every load, store and atomic a shader does on
         // them crosses the bus.
-        if let Some(kib) = std::env::var("VICTORY_CARD_BUFFERS_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok())
-            && kib > 0
-        {
-            min_bytes = kib << 10;
-        }
+        min_bytes = card_buffers_min_kb(min_bytes, std::env::var("VICTORY_CARD_BUFFERS_MIN_KB").ok().as_deref());
         if card_all() {
             min_bytes = 0;
         }
@@ -6824,8 +6873,8 @@ mod loose_allocation_tests;
 #[cfg(test)]
 mod window_tests {
     use super::{
-        WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
-        tail_of, window_of, window_victims,
+        WINDOW, card_buffers_min_kb, cover, default_card_limits_mb, grid, holder, longest_tail,
+        measured_64_kib, resolve_card_limits, tail_of, window_of, window_victims,
     };
 
     #[test]
@@ -6936,10 +6985,54 @@ mod window_tests {
         assert_eq!(default_card_limits_mb(Some(48 * GIB)), (1, 8192));
 
         // Explicit env overrides always win, clamp min to >= 1 MiB, and saturate on overflow.
-        assert_eq!(resolve_card_limits(Some(32 * GIB), Some(8), Some(4096)), (8 * MIB, 4096 * MIB));
-        assert_eq!(resolve_card_limits(Some(12 * GIB), Some(0), Some(1024)), (MIB, 1024 * MIB));
-        assert_eq!(resolve_card_limits(None, Some(u64::MAX), Some(u64::MAX)), (u64::MAX, u64::MAX));
-        assert_eq!(resolve_card_limits(None, None, None), (16 * MIB, 512 * MIB));
+        assert_eq!(resolve_card_limits(false, Some(32 * GIB), Some(8), Some(4096)), (8 * MIB, 4096 * MIB));
+        assert_eq!(resolve_card_limits(false, Some(12 * GIB), Some(0), Some(1024)), (MIB, 1024 * MIB));
+        assert_eq!(resolve_card_limits(false, None, Some(u64::MAX), Some(u64::MAX)), (u64::MAX, u64::MAX));
+        assert_eq!(resolve_card_limits(false, None, None, None), (16 * MIB, 512 * MIB));
+    }
+
+    /// The 64 KiB least size is the default where it was measured: an NVIDIA
+    /// card of 16 GB (a budget above 12 GiB and under 20 GiB) or of 24 GB (20
+    /// GiB and more, under 28 GiB). Nowhere else; and the explicit sizes win
+    /// over it as they did over the old default.
+    #[test]
+    fn card_buffers_are_carded_from_64_kib_on_the_measured_cards() {
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+        const KIB: u64 = 1 << 10;
+
+        // 16 GB cards, the 16 GB tier's 2,048 MiB kept: RTX 5080 (docs/rtx5080-16gb.md).
+        assert_eq!(resolve_card_limits(true, Some(13 * GIB), None, None), (64 * KIB, 2048 * MIB));
+        assert_eq!(resolve_card_limits(true, Some(15_209 * MIB), None, None), (64 * KIB, 2048 * MIB));
+        // 24 GB cards, a quarter of the budget kept: RTX 5090 D v2.
+        assert_eq!(resolve_card_limits(true, Some(20 * GIB), None, None), (64 * KIB, 5120 * MIB));
+        assert_eq!(resolve_card_limits(true, Some(23_267 * MIB), None, None), (64 * KIB, 5816 * MIB));
+        assert!(measured_64_kib(true, Some(23_267 * MIB)));
+
+        // Another vendor, a card not measured, or no budget read: as before.
+        assert!(!measured_64_kib(false, Some(23_267 * MIB)));
+        assert_eq!(resolve_card_limits(false, Some(15_209 * MIB), None, None), (4 * MIB, 2048 * MIB));
+        assert_eq!(resolve_card_limits(false, Some(23_267 * MIB), None, None), (MIB, 5816 * MIB));
+        assert_eq!(resolve_card_limits(true, Some(11 * GIB), None, None), (16 * MIB, 512 * MIB));
+        assert_eq!(resolve_card_limits(true, Some(12 * GIB), None, None), (16 * MIB, 512 * MIB));
+        assert_eq!(resolve_card_limits(true, Some(28 * GIB), None, None), (MIB, 7168 * MIB));
+        assert_eq!(resolve_card_limits(true, Some(32 * GIB), None, None), (MIB, 8192 * MIB));
+        assert_eq!(resolve_card_limits(true, None, None, None), (16 * MIB, 512 * MIB));
+
+        // `VICTORY_CARD_BUFFERS_MIN_MB` wins over the 64 KiB default: the old
+        // minimums are had with it. The maximum is the default's unless set.
+        assert_eq!(resolve_card_limits(true, Some(23_267 * MIB), Some(1), None), (MIB, 5816 * MIB));
+        assert_eq!(resolve_card_limits(true, Some(15_209 * MIB), Some(4), None), (4 * MIB, 2048 * MIB));
+        assert_eq!(resolve_card_limits(true, Some(23_267 * MIB), None, Some(1536)), (64 * KIB, 1536 * MIB));
+
+        // `VICTORY_CARD_BUFFERS_MIN_KB` above 0 wins over both; 0, a value
+        // that is not a number, or nothing leaves what was resolved.
+        assert_eq!(card_buffers_min_kb(64 * KIB, Some("1024")), 1024 * KIB);
+        assert_eq!(card_buffers_min_kb(64 * KIB, Some(" 4096 ")), 4 * MIB);
+        assert_eq!(card_buffers_min_kb(MIB, Some("64")), 64 * KIB);
+        assert_eq!(card_buffers_min_kb(64 * KIB, Some("0")), 64 * KIB);
+        assert_eq!(card_buffers_min_kb(64 * KIB, Some("64 KiB")), 64 * KIB);
+        assert_eq!(card_buffers_min_kb(MIB, None), MIB);
     }
 
     /// An ask that may take any window takes the longest that holds all of

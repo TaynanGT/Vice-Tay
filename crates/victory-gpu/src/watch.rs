@@ -4970,6 +4970,10 @@ mod tests {
         use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
         for &view in views {
             title_memory_remapped(view, bytes);
+            // As the runtime tells of an unmapping: what was known of the
+            // address as a view (VIEWS) goes with it, or a later allocation
+            // there is taken for one and left out of an asking.
+            title_memory_unmapping(view, bytes);
             // SAFETY: a view of the section mapped by `two_views`.
             unsafe {
                 UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {

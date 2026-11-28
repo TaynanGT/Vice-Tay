@@ -1404,6 +1404,7 @@ pub(crate) fn host() -> Option<&'static Host> {
 }
 
 fn create() -> windows::core::Result<Host> {
+    crate::drvwatch::start();
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.
@@ -11250,6 +11251,10 @@ impl Meter {
             let drops = crate::pipeline::take_drops();
             if !five {
                 return;
+            }
+            let driver_errors = crate::drvwatch::errors();
+            if driver_errors != 0 {
+                tracing::warn!(driver_errors, "display driver events recorded since startup; indirect windows disabled");
             }
             #[cfg(feature = "diagnostics")]
             open_lists_line();

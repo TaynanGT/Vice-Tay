@@ -77,6 +77,7 @@ pub struct Stream {
     status: Box<Status>,
     convolver: Option<Convolver>,
     deinterleaved: bool,
+    reported_signal: bool,
 }
 
 /// One block of work.
@@ -241,12 +242,21 @@ pub extern "system" fn XDspActivate(
     } else {
         None
     };
+    let route = if convolver.is_some() {
+        "convolution"
+    } else if channels == 1 && *MONO_PASSTHROUGH {
+        "mono dry"
+    } else {
+        "silent"
+    };
+    tracing::debug!(kind, channels, route, "audio DSP output selected");
     let new = Box::new(Stream {
         dsp,
         frames: desc.frames,
         channels: desc.channels,
         convolver,
         deinterleaved: options & DEINTERLEAVED != 0,
+        reported_signal: false,
         status: Box::new(Status {
             submitted: 0,
             completed: 0,
@@ -274,6 +284,16 @@ pub extern "system" fn XDspDeactivate(stream: *mut Stream) -> HRESULT {
     S_OK
 }
 
+fn report_signal(stream: &mut Stream, output: &[f32], route: &'static str) {
+    if !stream.reported_signal
+        && tracing::enabled!(tracing::Level::DEBUG)
+        && output.iter().any(|sample| sample.is_finite() && sample.abs() > 0.0001)
+    {
+        stream.reported_signal = true;
+        tracing::debug!(route, channels = stream.channels, "audio DSP emitted a signal");
+    }
+}
+
 fn write_convolution(stream: &mut Stream, command: &Command, samples: usize) -> bool {
     let Some(convolver) = &mut stream.convolver else {
         return false;
@@ -290,6 +310,7 @@ fn write_convolution(stream: &mut Stream, command: &Command, samples: usize) -> 
     for sample in output.iter_mut() {
         *sample = if sample.is_finite() { sample.clamp(-1.0, 1.0) } else { 0.0 };
     }
+    report_signal(stream, output, "convolution");
     // SAFETY: the title's output buffer holds one block of the stream.
     unsafe { std::ptr::copy(output.as_ptr(), command.output, samples) };
     true
@@ -308,6 +329,7 @@ fn write_output(stream: &mut Stream, command: &Command, mono_passthrough: bool) 
         // unreadable source the partial read stays in this scratch buffer.
         let mut input = [0.0f32; MAX_BLOCK_SAMPLES];
         if read_samples(command.input, &mut input[..samples]) {
+            report_signal(stream, &input[..samples], "mono dry");
             // SAFETY: the title's output buffer holds one block of the stream.
             unsafe { std::ptr::copy_nonoverlapping(input.as_ptr(), command.output, samples) };
             return;
@@ -394,6 +416,7 @@ mod tests {
             }),
             convolver: make_convolver(&dsp, &desc),
             deinterleaved: false,
+            reported_signal: false,
         };
         let mut samples = [0.25f32; 0x200];
         let mut reference = make_convolver(&dsp, &desc).unwrap();
@@ -427,6 +450,7 @@ mod tests {
             }),
             convolver: None,
             deinterleaved: false,
+            reported_signal: false,
         };
         let input = [0.25f32; 0x200];
         let mut output = [1.0f32; 0x400];

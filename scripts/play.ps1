@@ -12,6 +12,7 @@
 # -Fsr4K        PC FidelityFX at 3840x2160 (quality, balanced or performance)
 # -Dlss4K       NVIDIA DLSS at 3840x2160 (quality, balanced or performance); FSR if it cannot start
 # -FrameIntervalMs  use a frame interval in milliseconds (0 removes the limit)
+# -Username     local player name, up to 15 printable ASCII characters
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -Machine      auto (the default: by GPU vendor; on NVIDIA, worker counts sized to the CPU and,
 #               for a card of 10 to 19 GB, title buffers in the card's memory),
@@ -40,8 +41,15 @@ param(
     [ValidateRange(0.0, 1000.0)][double]$FrameIntervalMs,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [ValidateSet('auto', '7900xtx', '4070', '4070tisuper', '4090', '3060', 'laptop')][string]$Machine = 'auto',
+    [ValidateRange(0, 3600)][int]$TestSeconds = 0,
+    [string]$TestFfmpeg,
+    [ValidateScript({ $_ -match '\A[\x20-\x7e]{1,15}\z' -and $_ -match '\S' })][string]$Username,
     [hashtable]$More = @{}
 )
+if ($TestFfmpeg) {
+    if (!$TestSeconds) { throw '-TestFfmpeg requires -TestSeconds.' }
+    $TestFfmpeg = (Get-Command $TestFfmpeg -CommandType Application -ErrorAction Stop).Source
+}
 $settings = @{
     VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
     VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '1'; VICTORY_CARD_STEPS = '2'
@@ -246,6 +254,11 @@ if ($Dlss4K) { $settings.VICTORY_DLSS_4K = $Dlss4K.ToLowerInvariant() }
 if ($PSBoundParameters.ContainsKey('FrameIntervalMs')) {
     $settings.VICTORY_FRAME_INTERVAL_MS = $FrameIntervalMs.ToString([Globalization.CultureInfo]::InvariantCulture)
 }
+if (-not $Safe) {
+    $settings.VICTORY_DSP_CONVOLUTION = '1'
+    $settings.VICTORY_DSP_MONO_PASSTHROUGH = '1'
+}
+if ($Username) { $settings.VICTORY_USERNAME = $Username }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
 $profile = if ($autoNvidia) { 'automatic NVIDIA profile' } else { $Machine }
@@ -320,7 +333,12 @@ try {
         & $victory warm --used
         if ($LASTEXITCODE -ne 0) { Write-Host "victory warm ended with exit code $LASTEXITCODE; starting anyway." }
     }
-    & $victory run $Exe --console $Console --execute
-    $runtimeExitCode = $LASTEXITCODE
+    if ($TestSeconds) {
+        & "$PSScriptRoot\measure-world.ps1" -Victory $victory -Exe $Exe -Console $Console -Seconds $TestSeconds -Ffmpeg $TestFfmpeg
+        $runtimeExitCode = 0
+    } else {
+        & $victory run $Exe --console $Console --execute
+        $runtimeExitCode = $LASTEXITCODE
+    }
 } finally { Pop-Location }
 exit $runtimeExitCode

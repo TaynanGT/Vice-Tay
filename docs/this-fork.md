@@ -144,9 +144,11 @@ How each of these was found, with the numbers:
 - **Scripted keys** (`VICTORY_KEYS_FILE`): the file is taken by renaming it before
   it is read, so a batch written meanwhile is never deleted unread.
 
-- **DSP convolution.** Add `-More @{VICTORY_DSP_CONVOLUTION='1'}` to test the
-  host convolution path for phone calls and other filtered audio. Compare
-  the same call with the option off and on, at the same volume.
+- **Filtered dialogue.** The Windows launcher enables DSP convolution and the
+  dry mono fallback in its normal mode. The fallback sends the input through
+  without the console filter when the host can't process a mono stream.
+  Use `-More @{VICTORY_DSP_CONVOLUTION='0'; VICTORY_DSP_MONO_PASSTHROUGH='0'}`
+  to compare the same call at the same volume with both paths disabled.
   [Upstream test](https://github.com/Marvisak/VIctory/pull/3332)
 - **Mono DSP comparison.** Add `-More @{VICTORY_DSP_MONO_PASSTHROUGH='1'}`
   to pass readable mono DSP input through at unity gain when convolution

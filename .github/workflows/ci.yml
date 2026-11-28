@@ -56,6 +56,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - run: cargo test --workspace --locked
+      - name: Test frame benchmark and process ownership
+        shell: pwsh
+        run: |
+          ./scripts/test-frame-benchmark.ps1
+          ./scripts/test-benchmark-process.ps1
+          ./scripts/test-frame-benchmark-runner.ps1
 
   test-diagnostics:
     name: Diagnostics tests

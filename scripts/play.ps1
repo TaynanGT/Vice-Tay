@@ -40,7 +40,8 @@ param(
     [ValidateRange(0.0, 1000.0)][double]$FrameIntervalMs,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [ValidateSet('auto', '7900xtx', '4070', '4070tisuper', '4090', '3060', 'laptop')][string]$Machine = 'auto',
-    [hashtable]$More = @{}
+    [hashtable]$More = @{},
+    [string]$ExportEnvironment
 )
 $settings = @{
     VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
@@ -248,8 +249,8 @@ if ($PSBoundParameters.ContainsKey('FrameIntervalMs')) {
 }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
-$profile = if ($autoNvidia) { 'automatic NVIDIA profile' } else { $Machine }
-Write-Host "Settings for the $profile$(if ($Safe) { ', safe' })$(if ($RayTracing) { ', with ray tracing' })."
+$machineProfileLabel = if ($autoNvidia) { 'automatic NVIDIA profile' } else { $Machine }
+Write-Host "Settings for the $machineProfileLabel$(if ($Safe) { ', safe' })$(if ($RayTracing) { ', with ray tracing' })."
 if ($autoAdds.Contains('VICTORY_CARD_BUFFERS_MIN_KB')) {
     $preset = if ($cardGb -ge 15) { '4070tisuper' } else { '4070' }
     Write-Host ("This NVIDIA card has $cardGb GB: title buffers go to the card's memory, with the memory settings of " +
@@ -299,6 +300,22 @@ if ($hasNvidia -or $Machine -ne '7900xtx') {
     }
 }
 $Exe = (Resolve-Path -LiteralPath $Exe).Path
+if ($ExportEnvironment) {
+    if (-not [IO.Path]::IsPathFullyQualified($ExportEnvironment)) {
+        throw '-ExportEnvironment needs a new absolute JSON file.'
+    }
+    $launchDirectory = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
+    $configPath = if ($env:VICTORY_CONFIG) { [IO.Path]::GetFullPath($env:VICTORY_CONFIG, $launchDirectory) } else { Join-Path $launchDirectory 'victory.toml' }
+    $configHash = if (Test-Path -LiteralPath $configPath -PathType Leaf) { (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash } else { $null }
+    if ($env:VICTORY_CONFIG -and -not $configHash) { throw "VICTORY_CONFIG not found: $configPath" }
+    $export = [ordered]@{ schema_version = 1; runtime = $victory; exe = $Exe; console = $Console; working_directory = $launchDirectory; config_path = $configPath; config_sha256 = $configHash; environment = @{} }
+    foreach ($entry in Get-ChildItem Env:VICTORY_*) { $export.environment[$entry.Name] = $entry.Value }
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes(($export | ConvertTo-Json -Depth 5))
+    $stream = [IO.File]::Open($ExportEnvironment, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write)
+    try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+    Write-Host "Exported effective launch environment to $ExportEnvironment"
+    return
+}
 Push-Location -LiteralPath (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
 try {
     if (-not $SkipShaders) {

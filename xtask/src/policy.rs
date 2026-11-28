@@ -34,6 +34,7 @@ const ALLOWED_TEXT_PATHS: &[&str] = &[
     "docs/.nojekyll",
     "docs/index.html",
     "linux/wineserver/view-tree.patch",
+    "scripts/BenchmarkProcess.cs",
 ];
 
 /// Signatures of formats that must never be committed.

@@ -141,6 +141,15 @@ struct GenerateArgs {
 }
 const _: () = assert!(std::mem::offset_of!(GenerateArgs, generated) == 264);
 static GENERATED: AtomicU64 = AtomicU64::new(0);
+// Count + 1, so zero means that DXGI could not provide an output count.
+static CAPTURE_PRESENT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// SDK-generated frames and the most recent successful proxy Present count.
+/// These are observations, not display timestamps.
+pub(crate) fn capture_counts() -> (u64, Option<u32>) {
+    let count = CAPTURE_PRESENT_COUNT.load(Ordering::Relaxed);
+    (GENERATED.load(Ordering::Relaxed), count.checked_sub(1).map(|n| n as u32))
+}
 
 #[cfg(feature = "diagnostics")]
 static FRAME_RATES: AtomicU64 = AtomicU64::new(0);
@@ -983,6 +992,7 @@ pub(crate) fn present(
 
 fn record_present(state: &mut State, presented: Option<u32>, enabled: bool) {
     state.real += 1;
+    CAPTURE_PRESENT_COUNT.store(presented.map_or(0, |n| u64::from(n) + 1), Ordering::Relaxed);
     let Some(presented) = presented else {
         state.sample = None;
         #[cfg(feature = "diagnostics")]

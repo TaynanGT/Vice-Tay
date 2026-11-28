@@ -1,5 +1,10 @@
 # Measurements
 
+For frame-time percentiles and hitches, use the
+[per-frame capture and repeatable benchmark](frame-benchmark.md).
+The report summarizer below remains useful for comparing periodic log windows;
+its percentiles describe those reports, not individual frames.
+
 To compare two runs at the same camera position, select the time spent in
 that scene from each diagnostics log. Supply times with an explicit offset.
 This PowerShell command selects one minute with more than 1,000 draws per frame.

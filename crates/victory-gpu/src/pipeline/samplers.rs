@@ -174,11 +174,19 @@ fn sync(device: &ID3D12Device, mine: &[Words]) -> usize {
             added.push('\n');
         }
     }
-    for w in &new {
-        match root_with(device, w) {
-            Ok(root) => made.kept.push(root),
-            Err(e) => tracing::warn!(error = %e, sampler = line(w), "a static sampler of the list was refused"),
+    // A refused sampler shifts the places of every one after it: none of them
+    // count as made, so pipelines using them stay out of the library.
+    if let Some(at) = new.iter().position(|w| match root_with(device, w) {
+        Ok(root) => {
+            made.kept.push(root);
+            false
         }
+        Err(e) => {
+            tracing::warn!(error = %e, sampler = line(w), "a static sampler of the list was refused");
+            true
+        }
+    }) {
+        new.truncate(at);
     }
     if let Some(file) = &mut file
         && !added.is_empty()

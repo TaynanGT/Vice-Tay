@@ -227,6 +227,11 @@ if ($Safe) {
     # A dispatch does not end a batch of argument clamps before the title waits
     # for it: off by default, as other ways the title may wait are not known.
     $settings.VICTORY_INDIRECT_BATCH = '2'
+    # Series S on the 4070tisuper profile: list calls are translated inside the call again.
+    # Translated later (VICTORY_THIN), the black patches and stretched triangles of #90 showed in
+    # about 200 of 967 frames of a recorded walk on an RTX 5070 Ti with a Ryzen 7 9850X3D; without,
+    # in 3 of about 960, at about the same frame rate. -More @{VICTORY_THIN='1'} turns it back on.
+    if ($Console -eq 'series-s' -and $Machine -eq '4070tisuper') { $settings.VICTORY_THIN = '0' }
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 # The whole screen, with no frame, as on the console.

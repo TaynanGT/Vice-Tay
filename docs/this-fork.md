@@ -55,6 +55,10 @@ How each of these was found, with the numbers:
 - **Small pooled textures sit at 4 KiB placements**, except on AMD cards, which
   keep the 64 KiB that avoided device losses on an RX 7900 XTX
   (`VICTORY_POOL_SMALL=1` or `=0` picks either on any card).
+- **Pool growth does not hold the bookkeeping lock.** Existing pieces and
+  returns can proceed while another thread creates a staging or texture block.
+  Oldest-first fallback order is retained rather than rebuilt for each request.
+  [Mechanism and verification limits](texture-pool-stability.md).
 - **Structured views that begin off an element get no copy of their bytes** by
   default. Making one holds a global lock; on a card whose view heap has no raw
   twins (NVIDIA) every such view took it, and the list threads queued on it down

@@ -17,7 +17,7 @@
 //! goes (an object of ours the texture holds says so), a staging buffer's
 //! when the last list that recorded its copy is reset.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::c_void;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -197,6 +197,8 @@ struct Block<B> {
 struct Pool<B> {
     /// `None`: a block let go, its place to be used again.
     blocks: Vec<Option<Block<B>>>,
+    /// Every live block, oldest first (including ripe and empty blocks).
+    age: BTreeSet<(u64, usize)>,
     /// Pieces given back, and when each may be used again.
     resting: VecDeque<(u64, Piece)>,
     /// The empty blocks it was last told to keep, and the most it keeps.
@@ -207,17 +209,19 @@ struct Pool<B> {
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0 }
+        Pool { blocks: Vec::new(), age: BTreeSet::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0 }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
     /// part was ever used before; `make` makes a block when none has room.
+    #[cfg(test)]
     fn take(&mut self, len: u64, align: u64, now: u64, make: impl FnMut() -> Option<B>) -> Option<(Piece, B, bool)> {
         self.take_ripe(len, align, now, Ripe::ALL, make)
     }
 
     /// The same from a block that is ripe, if one has room; `make` makes one
     /// ahead too, when few are empty.
+    #[cfg(test)]
     fn take_ripe(
         &mut self,
         len: u64,
@@ -226,59 +230,76 @@ impl<B: Clone> Pool<B> {
         ripe: Ripe,
         mut make: impl FnMut() -> Option<B>,
     ) -> Option<(Piece, B, bool)> {
-        // With blocks made ahead, what would be an allocation of its own (and
-        // new when the card first reads it) lies in one of those too.
-        if len == 0 || len > if ripe.ahead > 0 { BLOCK } else { BLOCK / 2 } {
+        if !Self::eligible(len, ripe) {
             return None;
         }
+        let taken = match self.take_existing(len, align, now, ripe) {
+            Some(taken) => taken,
+            None => {
+                let memory = self.grow(now, &mut make)?;
+                self.take_new(memory, len, align, ripe)?
+            }
+        };
+        if self.needs_spare(ripe)
+            && let Some(memory) = self.grow(now, &mut make)
+        {
+            self.add(memory, ripe.started);
+        }
+        Some(taken)
+    }
+
+    fn eligible(len: u64, ripe: Ripe) -> bool {
+        // With blocks made ahead, larger pieces lie in those too.
+        len > 0 && len <= if ripe.ahead > 0 { BLOCK } else { BLOCK / 2 }
+    }
+
+    fn take_existing(&mut self, len: u64, align: u64, now: u64, ripe: Ripe) -> Option<(Piece, B, bool)> {
         self.rested(now);
-        let mut found = None;
         for (i, block) in self.blocks.iter_mut().enumerate() {
             if let Some(block) = block
                 && ripe.is(block)
                 && let Some(start) = block.free.take(len, align)
             {
-                found = Some((i, start));
-                break;
+                return Some(self.finish(i, start, len, ripe));
             }
         }
-        if found.is_none() && ripe.ahead > 0 {
-            // The one that has been there the longest.
-            let mut unripe: Vec<(u64, usize)> =
-                self.blocks.iter().enumerate().filter_map(|(i, b)| Some((b.as_ref()?.made, i))).collect();
-            unripe.sort_unstable();
-            found = unripe.into_iter().find_map(|(_, i)| Some((i, self.blocks[i].as_mut()?.free.take(len, align)?)));
-        }
-        // A failed 64 MiB block must not trigger another driver call for each
-        // small texture. Existing free ranges remain usable during backoff.
-        let (i, start) = match found {
-            Some(found) => found,
-            None => {
-                let memory = self.grow(now, &mut make)?;
-                let i = self.add(memory, ripe.started);
-                (i, self.blocks[i].as_mut()?.free.take(len, align)?)
-            }
-        };
         if ripe.ahead > 0 {
-            if !ripe.is(self.blocks[i].as_ref()?) {
-                let n = UNRIPE.fetch_add(1, Ordering::Relaxed) + 1;
-                if n.is_power_of_two() {
-                    tracing::info!("textures cut from blocks made while lists ran that still run: {n}");
-                }
-            }
-            let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count();
-            if empty < ripe.ahead
-                && let Some(memory) = self.grow(now, &mut make)
-            {
-                self.add(memory, ripe.started);
+            // Same oldest-first probe sequence as sorting all (made, index)
+            // pairs on every miss; losing ranges are not changed.
+            let found = self.age.iter().find_map(|&(_, i)| {
+                self.blocks[i].as_mut()?.free.take(len, align).map(|start| (i, start))
+            });
+            if let Some((i, start)) = found {
+                return Some(self.finish(i, start, len, ripe));
             }
         }
-        let block = self.blocks[i].as_mut()?;
-        let again = start < block.used_to;
-        block.used_to = block.used_to.max(start + len);
-        Some((Piece { block: i, start, len }, block.memory.clone(), again))
+        None
     }
 
+    fn finish(&mut self, i: usize, start: u64, len: u64, ripe: Ripe) -> (Piece, B, bool) {
+        if ripe.ahead > 0 && !ripe.is(self.blocks[i].as_ref().unwrap()) {
+            let n = UNRIPE.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::info!("textures cut from blocks made while lists ran that still run: {n}");
+            }
+        }
+        let block = self.blocks[i].as_mut().unwrap();
+        let again = start < block.used_to;
+        block.used_to = block.used_to.max(start + len);
+        (Piece { block: i, start, len }, block.memory.clone(), again)
+    }
+
+    fn take_new(&mut self, memory: B, len: u64, align: u64, ripe: Ripe) -> Option<(Piece, B, bool)> {
+        let i = self.add(memory, ripe.started);
+        let start = self.blocks[i].as_mut()?.free.take(len, align)?;
+        Some(self.finish(i, start, len, ripe))
+    }
+
+    fn needs_spare(&self, ripe: Ripe) -> bool {
+        ripe.ahead > 0 && self.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count() < ripe.ahead
+    }
+
+    #[cfg(test)]
     fn grow(&mut self, now: u64, make: &mut impl FnMut() -> Option<B>) -> Option<B> {
         if now < self.retry_growth_at {
             return None;
@@ -299,6 +320,7 @@ impl<B: Clone> Pool<B> {
             }
         };
         self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made, since: crate::host::now_ms() });
+        self.age.insert((made, i));
         i
     }
 
@@ -328,10 +350,11 @@ impl<B: Clone> Pool<B> {
         let previous = std::mem::replace(&mut self.spare, most);
         if sweep || any || most < previous {
             let mut spare = 0;
-            for block in &mut self.blocks {
+            for (i, block) in self.blocks.iter_mut().enumerate() {
                 if block.as_ref().is_some_and(|b| b.free.whole(BLOCK)) {
                     spare += 1;
                     if spare > most {
+                        self.age.remove(&(block.as_ref().unwrap().made, i));
                         *block = None;
                     }
                 }
@@ -344,6 +367,10 @@ impl<B: Clone> Pool<B> {
     }
 }
 
+#[cfg(test)]
+#[path = "pool/growth_tests.rs"]
+mod growth_tests;
+
 /// A mapped upload buffer's memory.
 #[derive(Clone)]
 struct Upload(ID3D12Resource, *mut u8);
@@ -352,9 +379,84 @@ unsafe impl Send for Upload {}
 
 static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE_KEPT));
 static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT));
+static TEXTURE_GROWTH: Mutex<()> = Mutex::new(());
+static STAGING_GROWTH: Mutex<()> = Mutex::new(());
 
-fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Reserve existing pieces under the short bookkeeping lock. Only misses
+/// serialize on `growth`; driver work never holds the bookkeeping lock.
+fn take_shared<B: Clone>(
+    pool: &Mutex<Pool<B>>,
+    growth: &Mutex<()>,
+    len: u64,
+    align: u64,
+    clock: impl Fn() -> (u64, Ripe),
+    mut make: impl FnMut() -> Option<B>,
+) -> Option<(Piece, B, bool)> {
+    let (now, ripe) = clock();
+    if !Pool::<B>::eligible(len, ripe) {
+        return None;
+    }
+    let mut state = lock(pool);
+    let mut taken = state.take_existing(len, align, now, ripe);
+    let mut maybe_spare = taken.is_some() && state.needs_spare(ripe) && now >= state.retry_growth_at;
+    drop(state);
+    if taken.is_none() {
+        // Never enter this gate while holding the pool lock. Waiting misses
+        // recheck: another grower or return may have supplied a piece.
+        let _gate = lock(growth);
+        let (now, ripe) = clock();
+        let mut state = lock(pool);
+        taken = state.take_existing(len, align, now, ripe);
+        if taken.is_none() {
+            if now < state.retry_growth_at {
+                return None;
+            }
+            drop(state);
+            let memory = make();
+            let (completed, ripe) = clock();
+            state = lock(pool);
+            taken = match memory {
+                Some(memory) => state.take_new(memory, len, align, ripe),
+                None => {
+                    state.retry_growth_at = completed.saturating_add(500);
+                    None
+                }
+            };
+            maybe_spare = taken.is_some() && state.needs_spare(ripe) && completed >= state.retry_growth_at;
+        } else {
+            maybe_spare = state.needs_spare(ripe) && now >= state.retry_growth_at;
+        }
+    }
+    // Reservation already belongs to caller. Spare failure cannot lose it.
+    // If another grower is busy, don't make existing-hit caller wait for it.
+    if !maybe_spare {
+        return taken;
+    }
+    let spare_gate = match growth.try_lock() {
+        Ok(gate) => Some(gate),
+        Err(std::sync::TryLockError::Poisoned(poison)) => Some(poison.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    };
+    if let Some(_gate) = spare_gate {
+        let (now, ripe) = clock();
+        let state = lock(pool);
+        let need = state.needs_spare(ripe) && now >= state.retry_growth_at;
+        drop(state);
+        if need {
+            let memory = make();
+            let (completed, ripe) = clock();
+            let mut state = lock(pool);
+            match memory {
+                Some(memory) => { state.add(memory, ripe.started); }
+                None => { state.retry_growth_at = completed.saturating_add(500); }
+            }
+        }
+    }
+    taken
 }
 
 /// Bytes of the pieces textures hold now.
@@ -389,7 +491,7 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
     }
     // Copies from a buffer begin at multiples of 512.
     let bytes = bytes.next_multiple_of(512);
-    let (piece, memory, again) = lock(&STAGING).take(bytes, 512, now(), || {
+    let (piece, memory, again) = take_shared(&STAGING, &STAGING_GROWTH, bytes, 512, || (now(), Ripe::ALL), || {
         // Only gate speculative bindless prefetch on staging-pool growth
         // headroom; table-bound textures and decoration bakes are sampled
         // immediately and would otherwise read uninitialized/reused VRAM.
@@ -673,7 +775,7 @@ pub(crate) unsafe fn texture(
         return None;
     }
     #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
-    let (piece, heap, again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
+    let (piece, heap, again) = take_shared(&TEXTURES, &TEXTURE_GROWTH, info.SizeInBytes, info.Alignment.max(1), || (now(), Ripe::now()), || {
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: BLOCK,
             Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },

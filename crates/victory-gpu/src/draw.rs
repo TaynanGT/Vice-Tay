@@ -4085,7 +4085,7 @@ impl State {
                 continue;
             };
             self.fresh_tables
-                .insert(key, FreshTable { first, epoch: 0, ready: Few::default() });
+                .insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, host.id(), first, n));
             // The title's own slots of this table: what the draw reads of
@@ -4975,6 +4975,7 @@ impl<T: Copy + Default, const N: usize> Default for Few<T, N> {
 }
 
 impl<T, const N: usize> Few<T, N> {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn clear(&mut self) {
         self.len = 0;
         self.many.clear();
@@ -5078,7 +5079,7 @@ struct FreshTable {
     /// tested depth target) read were brought up to date, and whether that read the
     /// tested depth target.
     epoch: u64,
-    ready: Few<ReadyReader, 4>,
+    ready: Vec<ReadyReader>,
 }
 
 impl FreshTable {
@@ -5628,10 +5629,18 @@ mod zero_alloc_tests {
     }
 
     #[test]
+    fn fresh_table_fits_single_cache_line_bucket() {
+        const { assert!(std::mem::size_of::<ReadyReader>() <= 24); }
+        const { assert!(std::mem::size_of::<FreshTable>() <= 48); }
+        const { assert!(std::mem::size_of::<((u64, u32, u64), FreshTable)>() <= 64); }
+    }
+
+    #[test]
     fn ready_reader_layout_and_fresh_table_matching_and_clearing() {
         const { assert!(std::mem::size_of::<ReadyReader>() <= 24); }
 
-        let mut table = FreshTable { first: 10, epoch: 0, ready: Few::default() };
+        let mut table = FreshTable { first: 10, epoch: 0, ready: Vec::new() };
+        assert_eq!(table.ready.capacity(), 0);
         let r = |plan: usize, direct_len: u32, stores: bool, tested_depth: usize| ReadyReader {
             plan,
             tested_depth,
@@ -5657,25 +5666,24 @@ mod zero_alloc_tests {
         table.note_ready(1, r2, true);
         table.note_ready(1, r3, true);
         assert_eq!(table.ready.len(), 4);
-        assert!(table.ready.many.is_empty());
         assert_eq!(table.find_ready(1, &r2), Some(true));
         assert_eq!(table.find_ready(1, &r3), Some(true));
 
-        // 5th through 16th spill into `many`; 17th+ are capped at 16.
+        // 5th through 16th are retained; 17th+ are capped at 16.
         for i in 4..20usize {
             table.note_ready(1, r(0x2000 + i, 1, false, 0), i % 2 == 0);
         }
         assert_eq!(table.ready.len(), 16);
-        assert!(!table.ready.many.is_empty());
         assert_eq!(table.find_ready(1, &r(0x2000 + 15, 1, false, 0)), Some(false));
         assert_eq!(table.find_ready(1, &r(0x2000 + 16, 1, false, 0)), None);
 
-        // Advancing epoch clears previous readers and returns inline.
+        // Advancing epoch clears previous readers while preserving Vec capacity.
+        let cap = table.ready.capacity();
         assert_eq!(table.find_ready(2, &r0), None);
         table.note_ready(2, r3, true);
         assert_eq!(table.epoch, 2);
         assert_eq!(table.ready.len(), 1);
-        assert!(table.ready.many.is_empty());
+        assert_eq!(table.ready.capacity(), cap);
         assert_eq!(table.find_ready(2, &r3), Some(true));
         assert_eq!(table.find_ready(2, &r0), None);
         assert_eq!(table.find_ready(1, &r3), None);
@@ -5826,7 +5834,7 @@ mod zero_alloc_tests {
             cached_fast_vec.push(t);
         }
         let cached_fast_targets = Some((cached_fast_vec, depth_key));
-        let mut fast_table = FreshTable { first: 0, epoch: 0, ready: Few::default() };
+        let mut fast_table = FreshTable { first: 0, epoch: 0, ready: Vec::new() };
         let mut fast_acc = 0u64;
         let t_fast = Instant::now();
         for i in 0..DRAWS {
@@ -5849,7 +5857,7 @@ mod zero_alloc_tests {
                 sel.dedup();
             }
             fast_acc = fast_acc.wrapping_add(u64::from(*sel.last().unwrap_or(&0)));
-            // FreshTable::ready packed ReadyReader in Few<ReadyReader, 4>
+            // FreshTable::ready packed ReadyReader in Vec<ReadyReader>
             let epoch = (i >> 3) as u64 + 1;
             let reader = ReadyReader {
                 plan: 0x8000usize + (i & 3),

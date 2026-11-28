@@ -3162,21 +3162,25 @@ impl HostHeap {
     }
 
     /// Starts a stack-buffered batch for [`HostHeap::make_listed_into`] copies.
+    ///
+    /// Defaults to direct mode (`CopyDescriptorsSimple(1, ...)` per view with
+    /// immediate post-copy resource retirement); set
+    /// `VICTORY_BATCH_LIST_VIEWS=1` to opt into multi-range `CopyDescriptors`
+    /// batching.
     pub(crate) fn list_copy_batch(&self) -> ListCopyBatch<'_> {
-        static BATCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let batched = *BATCH.get_or_init(|| {
-            std::env::var_os("VICTORY_BATCH_LIST_VIEWS").is_none_or(|value| value != "0")
-        });
-        ListCopyBatch::new(self, batched)
+        ListCopyBatch::new(self, batch_list_views())
     }
 
     /// Makes slot `index` (a dynamic one) the view the record `words` names,
     /// from this thread's descriptor of it if the recording `recording` has
     /// made one, else as [`HostHeap::make_at`] does, and keeps that
-    /// ([`ListViews`]). Copies are queued into `batch` rather than issued one
-    /// at a time. Each destination slot in an unflushed `batch` must be
-    /// distinct. What is known of the record in this recording; `None` (the
-    /// slot is not made): not a view kept so.
+    /// ([`ListViews`]). When `batch` is in batched mode
+    /// (`VICTORY_BATCH_LIST_VIEWS=1`), copies are queued into `batch` rather
+    /// than issued one at a time, and each destination slot in an unflushed
+    /// `batch` must be distinct; in direct mode (the default), each view
+    /// flushes immediately via `CopyDescriptorsSimple(1, ...)`. What is known
+    /// of the record in this recording; `None` (the slot is not made): not a
+    /// view kept so.
     pub(crate) fn make_listed_into(
         &self,
         recording: u64,
@@ -6835,9 +6839,13 @@ mod tests {
     }
 }
 
-/// Stack-buffered batch of `ListViews` descriptor copies into a [`HostHeap`],
-/// flushed as a single `CopyDescriptors` call (or `CopyDescriptorsSimple` for
-/// one descriptor) instead of one driver call per slot.
+/// Stack-buffered batch of `ListViews` descriptor copies into a [`HostHeap`].
+///
+/// In direct mode (the default), each [`HostHeap::make_listed_into`] flushes
+/// immediately via `CopyDescriptorsSimple(1, ...)` and retires any displaced
+/// resource right after. With `VICTORY_BATCH_LIST_VIEWS=1`, copies are
+/// buffered and flushed as a single `CopyDescriptors` call (or
+/// `CopyDescriptorsSimple` for one descriptor).
 pub(crate) struct ListCopyBatch<'a> {
     heap: &'a HostHeap,
     batched: bool,
@@ -7420,6 +7428,22 @@ pub(crate) mod zero_alloc_tests {
 
         heap.release(heap.id(), s0, 1);
     }
+
+    #[test]
+    fn list_copy_batch_defaults_to_direct_mode() {
+        use std::ffi::OsStr;
+
+        assert!(!batch_list_views_value(None));
+        assert!(!batch_list_views_value(Some(OsStr::new("0"))));
+        assert!(!batch_list_views_value(Some(OsStr::new(""))));
+        assert!(batch_list_views_value(Some(OsStr::new("1"))));
+        if std::env::var_os("VICTORY_BATCH_LIST_VIEWS").is_none() {
+            assert!(!batch_list_views());
+            if let Some(heap) = HostHeap::new(false, 4) {
+                assert!(!heap.list_copy_batch().batched);
+            }
+        }
+    }
 }
 
 /// What is known of a record a list's tables hold, in that recording of the
@@ -7519,6 +7543,23 @@ pub(crate) fn note_listed(recording: u64, words: [u32; 3], listed: Listed) {
 /// for every table).
 pub(crate) fn list_views() -> bool {
     crate::toggled!("VICTORY_LIST_VIEWS")
+}
+
+/// Whether [`HostHeap::make_listed_into`] batches copies into multi-range
+/// `CopyDescriptors` calls (`VICTORY_BATCH_LIST_VIEWS=1`).
+///
+/// Defaults to `false` (direct `CopyDescriptorsSimple(1, ...)` per view with
+/// immediate post-copy resource retirement) to avoid D3D12 multi-range
+/// `CopyDescriptors` contention across parallel recording threads.
+fn batch_list_views() -> bool {
+    static BATCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *BATCH.get_or_init(|| {
+        batch_list_views_value(std::env::var_os("VICTORY_BATCH_LIST_VIEWS").as_deref())
+    })
+}
+
+fn batch_list_views_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| value == "1")
 }
 
 #[cfg(test)]

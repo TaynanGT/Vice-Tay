@@ -30,6 +30,7 @@ pub(crate) enum Tag {
 enum TypeDef {
     Void,
     Int(u32),
+    Half,
     Float,
     Double,
     /// Pointee and address space.
@@ -63,6 +64,7 @@ struct Global {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Const {
     Int(i64),
+    Half(u16),
     Float(u32),
     Undef,
     Aggregate(Vec<u32>),
@@ -109,7 +111,8 @@ pub(crate) enum Cast {
     FpToSi = 4,
     UiToFp = 5,
     SiToFp = 6,
-    /// 32- to 64-bit float: a plain double operation, unlike the integer conversions to
+    FpTrunc = 7,
+    /// Float widening. f32 to f64 is a plain double operation, unlike integer conversions to
     /// doubles (which need the double extensions flag).
     FpExt = 8,
     Bitcast = 11,
@@ -234,6 +237,8 @@ pub(crate) struct Module {
     /// reductions, fxceless e3307c77). This line writes no fast-math flags, so it only marks
     /// such a program.
     pub exact_floats: bool,
+    /// Use DXIL's native low-precision data layout rather than min precision.
+    pub(super) native_fp16_layout: bool,
 }
 
 impl Module {
@@ -252,6 +257,9 @@ impl Module {
     }
     pub fn int(&mut self, bits: u32) -> Ty {
         self.ty(TypeDef::Int(bits))
+    }
+    pub fn half(&mut self) -> Ty {
+        self.ty(TypeDef::Half)
     }
     pub fn float(&mut self) -> Ty {
         self.ty(TypeDef::Float)
@@ -303,6 +311,11 @@ impl Module {
     pub fn bool(&mut self, v: bool) -> V {
         let t = self.int(1);
         self.int_const(t, -i64::from(v))
+    }
+    /// A binary16 constant, including its exact sign and NaN payload bits.
+    pub fn half_const(&mut self, ty: Ty, bits: u16) -> V {
+        debug_assert_eq!(self.types[ty.0 as usize], TypeDef::Half);
+        self.constant(ty, Const::Half(bits))
     }
     pub fn f32(&mut self, bits: u32) -> V {
         let t = self.float();
@@ -684,6 +697,17 @@ impl Module {
     }
 
     pub fn write(&self) -> Vec<u8> {
+        // Bitcode stores log2(alignment) + 1. Native half/i16 arrays have
+        // two-byte elements, even if the base of the array is aligned to four.
+        let alignment = |ty: Ty| {
+            if self.native_fp16_layout
+                && matches!(self.types[ty.0 as usize], TypeDef::Half | TypeDef::Int(16))
+            {
+                2
+            } else {
+                3
+            }
+        };
         let mut w = Writer::default();
         w.bytes(b"BC\xC0\xDE");
         w.enter(MODULE_BLOCK, 3);
@@ -715,6 +739,7 @@ impl Module {
         for t in &self.types {
             match t {
                 TypeDef::Void => w.record(2, &[]),
+                TypeDef::Half => w.record(10, &[]),
                 TypeDef::Float => w.record(3, &[]),
                 TypeDef::Double => w.record(4, &[]),
                 TypeDef::Int(b) => w.record(7, &[u64::from(*b)]),
@@ -741,12 +766,12 @@ impl Module {
         w.exit();
 
         w.record(2, &chars("dxil-ms-dx"));
-        w.record(
-            3,
-            &chars(
-                "e-m:e-p:32:32-i1:32-i8:32-i16:32-i32:32-i64:64-f16:32-f32:32-f64:64-n8:16:32:64",
-            ),
-        );
+        let layout = if self.native_fp16_layout {
+            "e-m:e-p:32:32-i1:32-i8:8-i16:16-i32:32-i64:64-f16:16-f32:32-f64:64-n8:16:32:64"
+        } else {
+            "e-m:e-p:32:32-i1:32-i8:32-i16:32-i32:32-i64:64-f16:32-f32:32-f64:64-n8:16:32:64"
+        };
+        w.record(3, &chars(layout));
         let first_const = (self.globals.len() + self.funcs.len()) as u64;
         for g in &self.globals {
             // [type, address space << 2 | explicit type | constant, init id
@@ -807,6 +832,7 @@ impl Module {
             match c {
                 Const::Undef => w.record(3, &[]),
                 Const::Int(v) => w.record(4, &[signed(*v)]),
+                Const::Half(bits) => w.record(6, &[u64::from(*bits)]),
                 Const::Float(bits) => w.record(6, &[u64::from(*bits)]),
                 Const::Aggregate(ids) => {
                     let r: Vec<u64> = ids.iter().map(|&i| const_id(i)).collect();
@@ -1004,9 +1030,13 @@ impl Module {
                         r.extend(idx.iter().map(|&i| rel(i)));
                         w.record(43, &r);
                     }
-                    // Alignment 4 (log2 + 1), not volatile.
-                    Op::Load(p) => w.record(20, &[rel(*p), u64::from(inst.ty.0), 3, 0]),
-                    Op::Store(p, v) => w.record(44, &[rel(*p), rel(*v), 3, 0]),
+                    // Load/store are not volatile.
+                    Op::Load(p) => {
+                        w.record(20, &[rel(*p), u64::from(inst.ty.0), alignment(inst.ty), 0])
+                    }
+                    Op::Store(p, v) => {
+                        w.record(44, &[rel(*p), rel(*v), alignment(self.type_of(*v)), 0])
+                    }
                     // Sequentially consistent, across threads.
                     Op::AtomicRmw(op, p, v) => {
                         w.record(38, &[rel(*p), rel(*v), *op as u64, 0, 6, 1])

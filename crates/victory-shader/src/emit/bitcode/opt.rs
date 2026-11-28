@@ -1134,6 +1134,125 @@ impl Module {
         u
     }
 
+    /// The profile minor version for live native-half code, with `None` when
+    /// the module emits no instructions using `half` or `i16`.
+    pub(crate) fn native_fp16_profile(&self, compute: bool, mut needs_sm66: bool) -> Option<u32> {
+        if !self.type_ids.contains_key(&TypeDef::Half) {
+            return None;
+        }
+        let live = self.live();
+        let reached = self.reached();
+        let is_16bit = |ty: Ty| matches!(self.types[ty.0 as usize], TypeDef::Half | TypeDef::Int(16));
+        let mut low_precision = false;
+        for (block, reached) in self.blocks.iter().zip(reached) {
+            if !reached {
+                continue;
+            }
+            for &i in block
+                .phis
+                .iter()
+                .filter(|&&i| live[i as usize])
+                .chain(&block.body)
+            {
+                let inst = &self.insts[i as usize];
+                if !low_precision {
+                    low_precision = is_16bit(inst.ty);
+                    for_each_operand(&inst.op, |v| low_precision |= is_16bit(self.type_of(v)));
+                }
+                if !needs_sm66 {
+                    let mut atomic = false;
+                    match &inst.op {
+                        Op::Call(_, args) => match args.first().and_then(|&v| self.int_value(v)) {
+                            // DXIL 1.2 ends at opcode 140. Some overloads and
+                            // profiles require more than the opcode alone.
+                            Some(78 | 79) => atomic = true,
+                            Some(60..=61 | 64 | 81 | 83..=86) => needs_sm66 = compute,
+                            // Single-register static bindings may be rewritten to
+                            // createHandle (57) after profile selection.
+                            Some(0..=140 | 216 | 217) => (),
+                            _ => needs_sm66 = true,
+                        },
+                        Op::AtomicRmw(..) | Op::CmpXchg(..) => atomic = true,
+                        _ => (),
+                    }
+                    if atomic {
+                        let is_i64 = |ty: Ty| self.types[ty.0 as usize] == TypeDef::Int(64);
+                        needs_sm66 = is_i64(inst.ty);
+                        for_each_operand(&inst.op, |v| needs_sm66 |= is_i64(self.type_of(v)));
+                    }
+                }
+                if needs_sm66 && low_precision {
+                    return Some(6);
+                }
+            }
+        }
+        low_precision.then_some(2)
+    }
+
+    /// Replace the SM 6.6 calls for single-register static bindings with the
+    /// DXIL 1.2 form. The index stays the absolute register; the range ID is
+    /// the binding's position in the respective `dx.resources` class list.
+    /// An unrecognized shape leaves the whole module intact for SM 6.6.
+    pub(crate) fn lower_static_handles(
+        &mut self,
+        range_id: impl Fn(i64, i64, i64) -> Option<u32>,
+    ) -> Option<()> {
+        let mut bindings = std::collections::BTreeMap::new();
+        let mut annotations = HashMap::new();
+        for &i in self.blocks.iter().flat_map(|b| &b.body) {
+            let Op::Call(_, args) = &self.insts[i as usize].op else { continue };
+            match args.first().and_then(|&op| self.int_value(op)) {
+                Some(217) => {
+                    let [_, V::Const(bind), index, uniform] = args.as_slice() else { return None };
+                    let Const::Aggregate(fields) = &self.consts[*bind as usize].1 else { return None };
+                    let [lo, hi, space, class] = fields.as_slice() else { return None };
+                    let get = |&c| self.int_value(V::Const(c));
+                    let register = get(lo)?;
+                    if get(hi)? != register || self.int_value(*index)? != register || self.int_value(*uniform)? != 0 {
+                        return None;
+                    }
+                    let id = range_id(get(class)?, get(space)?, register)?;
+                    bindings.insert(i, (V::Const(*class), id, *index, *uniform));
+                }
+                Some(216) => {
+                    let [_, V::Inst(handle), _] = args.as_slice() else { return None };
+                    annotations.insert(i, *handle);
+                }
+                Some(0..=140) => (),
+                _ => return None,
+            }
+        }
+        if !annotations.values().all(|h| bindings.contains_key(h)) {
+            return None;
+        }
+        if bindings.is_empty() {
+            return Some(());
+        }
+        let opcode = self.i32(57);
+        for (i, (class, range, index, uniform)) in bindings {
+            let range = self.i32(range);
+            let args = vec![opcode, class, range, index, uniform];
+            let params = args.iter().map(|&v| self.type_of(v)).collect();
+            let ty = self.func_ty(self.insts[i as usize].ty, params);
+            self.ptr(ty);
+            let V::Func(f) = self.function("dx.op.createHandle", ty, Some(Attr::ReadNone), false) else {
+                unreachable!()
+            };
+            self.insts[i as usize].op = Op::Call(f, args);
+        }
+        for block in &mut self.blocks {
+            block.body.retain(|i| !annotations.contains_key(i));
+            for &i in block.phis.iter().chain(&block.body) {
+                map_operands(&mut self.insts[i as usize].op, |v| match v {
+                    V::Inst(i) => annotations.get(&i).copied().map_or(v, V::Inst),
+                    _ => v,
+                });
+            }
+        }
+        self.drop_unused_functions();
+        Some(())
+    }
+
     /// A constant table no remaining load reads leaves the module (the
     /// validator refuses an internal declaration nothing uses). Shared
     /// memory stays declared whether it is read or not.
@@ -1218,11 +1337,9 @@ impl Module {
             .map(|(i, f)| (f.name.clone(), i as u32))
             .collect();
         // Instructions that left their block keep a stale number: nothing
-        // reads them again.
-        for inst in &mut self.insts {
-            if let Op::Call(f, _) = &mut inst.op
-                && used[*f as usize]
-            {
+        // reads them again (including a second pass after lowering handles).
+        for &i in self.blocks.iter().flat_map(|b| b.phis.iter().chain(&b.body)) {
+            if let Op::Call(f, _) = &mut self.insts[i as usize].op {
                 *f = new[*f as usize];
             }
         }

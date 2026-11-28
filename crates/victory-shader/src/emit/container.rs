@@ -3,6 +3,9 @@
 //! program (`DXIL`), laid out as validator version 1.6 lays them out, plus
 //! the container hash that D3D12 checks.
 
+/// `ShaderFeatureInfo_NativeLowPrecision` (SFI0), not the entry metadata flag.
+pub(crate) const NATIVE_LOW_PRECISION: u64 = 1 << 18;
+
 /// One signature element: one row (D3D12 links stages by semantic).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SigElement {
@@ -329,6 +332,20 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
 
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// The `DXIL` part: shader model 6.x, DXIL 1.x, and its LLVM bitcode.
+pub(crate) fn program(kind: u32, minor: u32, bitcode: &[u8]) -> Vec<u8> {
+    debug_assert!(bitcode.len().is_multiple_of(4));
+    let mut out = Vec::with_capacity(24 + bitcode.len());
+    out.extend((kind << 16 | 0x60 | minor).to_le_bytes());
+    out.extend((((24 + bitcode.len()) / 4) as u32).to_le_bytes());
+    out.extend(b"DXIL");
+    out.extend((0x100 | minor).to_le_bytes());
+    out.extend(16u32.to_le_bytes());
+    out.extend((bitcode.len() as u32).to_le_bytes());
+    out.extend(bitcode);
+    out
 }
 
 /// The container: parts in order, hashed.

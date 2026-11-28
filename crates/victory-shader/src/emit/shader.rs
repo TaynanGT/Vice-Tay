@@ -1,6 +1,7 @@
 //! A DXIL vertex, pixel, compute or mesh shader under construction: the module,
 //! the `dx.op` declarations it calls, its signatures and bound resources,
-//! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
+//! and the metadata and container that wrap it up (SM 6.6, or 6.2 for
+//! compatible native-half shaders; validator 1.6).
 
 use super::bitcode::{Attr, Md, Module, Ty, V};
 use super::container::{self, Binding, Psv, SigElement};
@@ -115,6 +116,8 @@ pub(crate) mod flags {
     pub const EARLY_DEPTH_STENCIL: u64 = 1 << 3;
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const DOUBLES: u64 = 1 << 2;
+    /// An instruction in the module uses `i16` or `half`.
+    pub const LOW_PRECISION_PRESENT: u64 = 1 << 5;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     /// Unordered views in a vertex, geometry or mesh program.
@@ -122,6 +125,8 @@ pub(crate) mod flags {
     pub const ROVS: u64 = 1 << 18;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const BARYCENTRICS: u64 = 1 << 22;
+    /// Interpret `i16` and `half` as native 16-bit types, not minimum precision.
+    pub const USE_NATIVE_LOW_PRECISION: u64 = 1 << 23;
     pub const INT64: u64 = 1 << 20;
     pub const ATOMIC_TYPED64: u64 = 1 << 27;
     pub const ATOMIC_HEAP64: u64 = 1 << 32;
@@ -273,6 +278,7 @@ pub(crate) struct Shader {
     pub wave_size: Option<u32>,
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
+    native_fp16_enabled: bool,
     lds: Option<V>,
     main: V,
     pub entry: usize,
@@ -326,10 +332,21 @@ impl Shader {
             threads: None,
             wave_size: None,
             lds_dwords: 0,
+            native_fp16_enabled: false,
             lds: None,
             main,
             entry,
         }
+    }
+
+    /// Allow lowering to emit native 16-bit floating-point operations.
+    pub fn enable_native_fp16(&mut self) {
+        self.native_fp16_enabled = true;
+    }
+
+    /// `(half, i16)` for the native path. Do not intern either until needed.
+    pub fn native_fp16_types(&mut self) -> Option<(Ty, Ty)> {
+        self.native_fp16_enabled.then(|| (self.m.half(), self.m.int(16)))
     }
 
     /// The thread-group shared memory: `[lds_dwords x i32]` in address
@@ -648,18 +665,55 @@ impl Shader {
         if !self.root_uavs.is_empty() && !self.pixel && !compute {
             self.flags |= flags::UAVS_EVERY_STAGE;
         }
+        let bound_resources = self.user_data > 0
+            || self.samplers > 0
+            || !self.root_cbvs.is_empty()
+            || !self.root_srvs.is_empty()
+            || !self.root_uavs.is_empty();
+        let native_profile = if self.native_fp16_enabled {
+            // WaveSize is 6.6, mesh is 6.5+, and signature kinds 29+
+            // start with SM 6.4 shading rate.
+            let newer = self.wave_size.is_some()
+                || self.mesh.is_some()
+                || self.inputs.iter().chain(&self.outputs).any(|e| e.kind >= 29);
+            let profile = self.m.native_fp16_profile(compute, newer);
+            if profile == Some(2) {
+                let position = |roots: &[(u8, V)], register| {
+                    roots.iter().position(|&(r, _)| i64::from(r) == register).map(|n| n as u32)
+                };
+                let user_data = self.user_data > 0;
+                let range_id = |class, space, register| {
+                    match (class, space as u32, register) {
+                        (0, ROOT_CBV_SPACE, _) => position(&self.root_srvs, register),
+                        (1, ROOT_CBV_SPACE, _) => position(&self.root_uavs, register),
+                        (2, USER_DATA_SPACE, 0) if user_data => Some(0),
+                        (2, ROOT_CBV_SPACE, _) => {
+                            position(&self.root_cbvs, register).map(|n| n + u32::from(user_data))
+                        }
+                        (3, SAMPLER_SPACE, r) if (0..i64::from(self.samplers)).contains(&r) => Some(r as u32),
+                        _ => None,
+                    }
+                };
+                Some(if self.m.lower_static_handles(range_id).is_some() { 2 } else { 6 })
+            } else {
+                profile
+            }
+        } else {
+            None
+        };
+        let native_fp16 = native_profile.is_some();
+        if native_fp16 {
+            self.flags |= flags::LOW_PRECISION_PRESENT | flags::USE_NATIVE_LOW_PRECISION;
+            self.m.native_fp16_layout = true;
+        }
+        let sm_minor = native_profile.unwrap_or(6);
         let mut resources = None;
         let mut bindings = Vec::new();
         let i32c = |s: &mut Self, v: u32| {
             let c = s.m.i32(v);
             s.m.md_value(c)
         };
-        if self.user_data > 0
-            || self.samplers > 0
-            || !self.root_cbvs.is_empty()
-            || !self.root_srvs.is_empty()
-            || !self.root_uavs.is_empty()
-        {
+        if bound_resources {
             let empty = self.m.md_str("");
             let mut cbvs = None;
             let mut cbv_list = Vec::new();
@@ -936,9 +990,21 @@ impl Shader {
         self.m.named_md("llvm.ident", vec![ident]);
         let one = i32c(&mut self, 1);
         let six = i32c(&mut self, 6);
-        let version = self.m.md_node(vec![Some(one), Some(six)]);
+        let minor = if sm_minor == 6 {
+            six
+        } else {
+            i32c(&mut self, sm_minor)
+        };
+        let version = self.m.md_node(vec![Some(one), Some(minor)]);
         self.m.named_md("dx.version", vec![version]);
-        self.m.named_md("dx.valver", vec![version]);
+        // Keep validator 1.6 for both profiles: the signature and PSV0
+        // writers follow that validator version, not the shader model.
+        let valver = if sm_minor == 6 {
+            version
+        } else {
+            self.m.md_node(vec![Some(one), Some(six)])
+        };
+        self.m.named_md("dx.valver", vec![valver]);
         // Program kinds: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
         let (name, kind) = match (self.threads, self.pixel) {
             _ if self.mesh.is_some() => ("ms", 13u32),
@@ -948,21 +1014,14 @@ impl Shader {
             (None, false) => ("vs", 1),
         };
         let name = self.m.md_str(name);
-        let sm = self.m.md_node(vec![Some(name), Some(six), Some(six)]);
+        let sm = self.m.md_node(vec![Some(name), Some(six), Some(minor)]);
         self.m.named_md("dx.shaderModel", vec![sm]);
         self.m.named_md("dx.entryPoints", vec![entry]);
 
         self.m.single_latches();
         let bitcode = self.m.write();
         super::bitcode::census::note(&self.m, &bitcode);
-        let mut dxil = Vec::with_capacity(24 + bitcode.len());
-        dxil.extend((kind << 16 | 0x66).to_le_bytes());
-        dxil.extend((((24 + bitcode.len()) / 4) as u32).to_le_bytes());
-        dxil.extend(b"DXIL");
-        dxil.extend(0x106u32.to_le_bytes());
-        dxil.extend(16u32.to_le_bytes());
-        dxil.extend((bitcode.len() as u32).to_le_bytes());
-        dxil.extend(&bitcode);
+        let dxil = container::program(kind, sm_minor, &bitcode);
 
         let mut features = 0u64;
         if self.flags & flags::DOUBLES != 0 {
@@ -988,6 +1047,9 @@ impl Shader {
         }
         if self.flags & flags::BARYCENTRICS != 0 {
             features |= 0x2_0000;
+        }
+        if native_fp16 {
+            features |= container::NATIVE_LOW_PRECISION;
         }
         if self.flags & flags::RESOURCE_HEAP != 0 {
             features |= 0x200_0000;

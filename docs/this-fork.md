@@ -94,8 +94,8 @@ How each of these was found, with the numbers:
   frame line counts the slots tables take, the refusals whose free slots were
   in pieces, and the tables that waited for flights to land for slots or were
   refused again and dropped (diagnostics builds).
-- **Stretched-triangle spikes ("wedges")**: set `VICTORY_MERGE_AFTER_LANDING=3`
-  (off by default for now). The cause: when the title wrote a page of a buffer
+- **Stretched-triangle spikes ("wedges")**: fixed by `VICTORY_MERGE_AFTER_LANDING=3`,
+  on by default (`=0` for the merge as it was). The cause: when the title wrote a page of a buffer
   that a compute pass not yet landed also writes (skinning output), the merge
   put the title's old bytes into that range, and at the landing they won over
   the card's results. With `=2` only the bytes the title really changed go in,

@@ -3055,8 +3055,8 @@ static MERGED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// Whether title bytes are kept out of the ranges a flight not landed may
 /// write, in copies shaders write, until the flight has landed
-/// (`VICTORY_MERGE_AFTER_LANDING=1`; off by default: they are merged in
-/// beside the flights' writes, [`Shadow::merge_under_writes`]).
+/// (`VICTORY_MERGE_AFTER_LANDING=1` and up; on by default at `3`; with `0`
+/// they are merged in beside the flights' writes, [`Shadow::merge_under_writes`]).
 ///
 /// Why: run 831 (`VICTORY_PACE_SHADER_COPIES=1`, the refreshes and merges of
 /// such copies held until the card had run the frame before) had no wedges;
@@ -3125,15 +3125,16 @@ pub(crate) fn refresh_precise() -> bool {
     after_landing_level() >= 3
 }
 
-/// `VICTORY_MERGE_AFTER_LANDING`: 0, 1, 2 or 3.
+/// `VICTORY_MERGE_AFTER_LANDING`: 0, 1, 2 or 3; 3 when unset (the wedges of
+/// #90), `0` for the merge as it was.
 fn after_landing_level() -> u8 {
     static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *LEVEL.get_or_init(|| {
         let level = match std::env::var("VICTORY_MERGE_AFTER_LANDING").as_deref().map(str::trim) {
+            Ok("0") => 0,
             Ok("1") => 1,
             Ok("2") => 2,
-            Ok("3") => 3,
-            _ => 0,
+            _ => 3,
         };
         if level == 1 {
             tracing::info!(

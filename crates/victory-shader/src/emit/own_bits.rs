@@ -105,7 +105,7 @@ fn used(p: &Program, st: &Structured, b: usize, i: usize) -> Vec<Value> {
         .iter()
         .filter(|&&(r, _)| match r {
             Reg::S(c) if c == EXEC || c == EXEC + 1 => false,
-            Reg::V(_) => ops.contains(&r) || guarded,
+            Reg::V(_) => guarded || ops.iter().any(|&(reg, _)| reg == r),
             _ => true,
         })
         .map(|r| r.1)

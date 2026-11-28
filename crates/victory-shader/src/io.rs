@@ -288,7 +288,8 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             let per_lane = p.blocks.iter().flat_map(|b| &b.insts).find(|i| {
                 i.read(Reg::V(5)).is_some_and(|v| group.contains(&v))
                     && i.name() != "v_readfirstlane_b32"
-                    && (i.write(Reg::V(5)).is_none() || operand_reads(p, i).contains(&Reg::V(5)))
+                    && (i.write(Reg::V(5)).is_none()
+                        || operand_reads(p, i).iter().any(|&(reg, _)| reg == Reg::V(5)))
             });
             if let Some(i) = per_lane {
                 return Err(unsupported(

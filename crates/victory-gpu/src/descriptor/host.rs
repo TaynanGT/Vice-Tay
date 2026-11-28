@@ -213,7 +213,7 @@ pub(crate) struct HostHeap {
     /// are due: such a texture is uploaded when a draw reads it through a
     /// table; one a shader picks by a computed index is brought up to date
     /// from here ([`HostHeap::texture_slots_due`]).
-    textures: Mutex<TextureQueue>,
+    textures: TextureQueue,
     /// Its slots ([`Queued`]).
     queued: std::sync::Arc<Queued>,
     /// Per title slot, the frame (plus one; 0: never) in which a draw last
@@ -1066,45 +1066,77 @@ struct Waiting {
     away: u64,
 }
 
-/// The queue of title slots whose texture view waits to be brought up to
-/// date for shaders that pick textures by index: which are due, and in
-/// which order (no host heap needed, so it is tested without one).
+/// Number of independent shards inside [`TextureQueue`]. Must be a power of two.
+const TEXTURE_SHARDS: usize = 32;
+
+/// One shard of [`TextureQueue`]: disjoint slot subset, locked independently so
+/// descriptor writes, heap-sync workers, list translation, and texture passes
+/// do not form a convoy on one heap-wide mutex.
 #[derive(Default)]
-pub(crate) struct TextureQueue {
+struct TextureShard {
     slots: std::collections::BTreeMap<u32, Waiting>,
-    /// Each slot write, requeue or new pass gets a later revision.
-    revision: u64,
-    active_passes: usize,
-    /// The revision whose due slots a bake finished serving.
-    baked: Option<u64>,
     /// Slots held back because the card had no room for the host copy
     /// they need ([`TextureQueue::hold`]), each with the write it was
     /// held as.
     held: std::collections::BTreeMap<u32, u64>,
+}
+
+/// Cache-line padded shard lock so adjacent shards do not false-share.
+#[repr(align(64))]
+#[derive(Default)]
+struct PaddedTextureShard(Mutex<TextureShard>);
+
+/// Cache-line padded monotonic revision counter so writes do not invalidate
+/// the read-mostly `shards` / `queued` fields on every `shard()` lookup.
+#[repr(align(64))]
+#[derive(Default)]
+struct PaddedRevision(std::sync::atomic::AtomicU64);
+
+#[derive(Default)]
+struct TexturePassState {
+    active_passes: usize,
+    /// The revision whose due slots a bake finished serving.
+    baked: Option<u64>,
+}
+
+/// The queue of title slots whose texture view waits to be brought up to
+/// date for shaders that pick textures by index: which are due, and in
+/// which order (no host heap needed, so it is tested without one).
+pub(crate) struct TextureQueue {
+    shards: Box<[PaddedTextureShard]>,
     /// Which slots are in `slots`, for those who only want one out
     /// ([`Queued`]).
     queued: std::sync::Arc<Queued>,
+    /// Each slot write, requeue or new pass gets a later revision.
+    revision: PaddedRevision,
+    pass: Mutex<TexturePassState>,
+}
+
+impl Default for TextureQueue {
+    fn default() -> Self {
+        Self::new(std::sync::Arc::default())
+    }
 }
 
 /// Only a pass that did not overlap another can certify a bake. Ordinary
 /// passes can defer slots while the bake is reading its snapshot.
 pub(crate) struct TexturePass<'a> {
-    queue: &'a Mutex<TextureQueue>,
+    queue: &'a TextureQueue,
     pub(crate) revision: Option<u64>,
 }
 
 impl<'a> TexturePass<'a> {
-    fn begin(queue: &'a Mutex<TextureQueue>) -> Self {
-        let mut textures = queue.lock().unwrap_or_else(|e| e.into_inner());
-        let revision = textures.next_revision();
-        textures.active_passes += 1;
-        Self { queue, revision: (textures.active_passes == 1).then_some(revision) }
+    fn begin(queue: &'a TextureQueue) -> Self {
+        let mut pass = queue.pass.lock().unwrap_or_else(|e| e.into_inner());
+        let revision = queue.next_revision();
+        pass.active_passes += 1;
+        Self { queue, revision: (pass.active_passes == 1).then_some(revision) }
     }
 }
 
 impl Drop for TexturePass<'_> {
     fn drop(&mut self) {
-        self.queue.lock().unwrap_or_else(|e| e.into_inner()).active_passes -= 1;
+        self.queue.pass.lock().unwrap_or_else(|e| e.into_inner()).active_passes -= 1;
     }
 }
 
@@ -1133,10 +1165,17 @@ impl Queued {
         }
     }
 
-    /// Whether `slot` may be in the queue.
+    /// Whether `slot` may be in the queue (returns `true` if unknown/empty).
     fn may(&self, slot: u32) -> bool {
         let word = self.0.get(slot as usize / 64);
         word.is_none_or(|w| w.load(std::sync::atomic::Ordering::SeqCst) >> (slot % 64) & 1 != 0)
+    }
+
+    /// Whether `slot`'s queued bit is known and currently set (returns `false`
+    /// if unknown/empty).
+    fn is_set(&self, slot: u32) -> bool {
+        let word = self.0.get(slot as usize / 64);
+        word.is_some_and(|w| w.load(std::sync::atomic::Ordering::SeqCst) >> (slot % 64) & 1 != 0)
     }
 }
 
@@ -1144,65 +1183,147 @@ impl Queued {
 /// others: the slot and its write's number.
 type Due = [Vec<(u32, u64)>; 2];
 
+impl TextureShard {
+    fn take_out(&mut self, queued: &Queued, index: u32) -> bool {
+        let was = self.slots.remove(&index).is_some();
+        if was {
+            queued.set(index, false);
+        }
+        was
+    }
+
+    /// The entry of `index` if it is still the write the pass was handed.
+    fn same(&mut self, index: u32, write: u64) -> Option<&mut Waiting> {
+        self.slots.get_mut(&index).filter(|w| w.write == write)
+    }
+
+    /// Replacing a retry also clears a card-space hold for the same write.
+    fn reschedule(&mut self, index: u32, write: u64) -> Option<&mut Waiting> {
+        if self.held.get(&index) == Some(&write) {
+            self.held.remove(&index);
+        }
+        self.same(index, write)
+    }
+
+    fn upsert(
+        &mut self,
+        revision: &std::sync::atomic::AtomicU64,
+        queued: &Queued,
+        index: u32,
+        frame: u64,
+        due: u64,
+        (seen, keep_earlier_due): (bool, bool),
+    ) {
+        use std::collections::btree_map::Entry;
+        match self.slots.entry(index) {
+            Entry::Occupied(mut entry) => {
+                if seen {
+                    return;
+                }
+                let w = entry.get_mut();
+                let write = revision.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                let due = if keep_earlier_due { w.due.min(due) } else { due };
+                let waited = w.waited || w.looks > 0 || w.mapped > 0;
+                *w = Waiting {
+                    due,
+                    written: frame,
+                    write,
+                    looks: 0,
+                    mapped: 0,
+                    checked: (0, 0, 0, 0, 0),
+                    since: w.since,
+                    waited,
+                    away: w.away,
+                };
+            }
+            Entry::Vacant(entry) => {
+                let write = revision.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                entry.insert(Waiting {
+                    due,
+                    written: frame,
+                    write,
+                    looks: 0,
+                    mapped: 0,
+                    checked: (0, 0, 0, 0, 0),
+                    since: crate::host::now_ms(),
+                    waited: false,
+                    away: 0,
+                });
+                queued.set(index, true);
+            }
+        }
+    }
+}
+
 impl TextureQueue {
-    fn next_revision(&mut self) -> u64 {
-        self.revision += 1;
-        self.revision
+    fn new(queued: std::sync::Arc<Queued>) -> Self {
+        Self {
+            shards: (0..TEXTURE_SHARDS).map(|_| PaddedTextureShard::default()).collect(),
+            queued,
+            revision: PaddedRevision::default(),
+            pass: Mutex::new(TexturePassState::default()),
+        }
+    }
+
+    /// Groups 16 adjacent title slots per shard so contiguous table/remap walks
+    /// lock fewer shards while concurrent workers spread across all 32 shards.
+    #[inline]
+    fn shard_index(index: u32) -> usize {
+        (index as usize >> 4) & (TEXTURE_SHARDS - 1)
+    }
+
+    #[inline]
+    fn shard(&self, index: u32) -> std::sync::MutexGuard<'_, TextureShard> {
+        self.shards[Self::shard_index(index)].0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn next_revision(&self) -> u64 {
+        self.revision.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
     }
 
     fn bake_covered(&self) -> bool {
-        self.baked == Some(self.revision)
+        let pass = self.pass.lock().unwrap_or_else(|e| e.into_inner());
+        pass.baked == Some(self.revision.0.load(std::sync::atomic::Ordering::SeqCst))
     }
 
-    fn finish_bake(&mut self, revision: u64) {
-        if self.revision == revision {
-            self.baked = Some(revision);
+    fn finish_bake(&self, revision: u64) {
+        let mut pass = self.pass.lock().unwrap_or_else(|e| e.into_inner());
+        if self.revision.0.load(std::sync::atomic::Ordering::SeqCst) == revision {
+            pass.baked = Some(revision);
         }
     }
 
-    fn insert(&mut self, index: u32, waiting: Waiting) {
-        if self.slots.insert(index, waiting).is_none() {
-            self.queued.set(index, true);
-        }
-    }
-
-    fn take_out(&mut self, index: u32) -> bool {
-        let was = self.slots.remove(&index).is_some();
-        if was {
-            self.queued.set(index, false);
-        }
-        was
+    fn take_out(&self, index: u32) -> bool {
+        self.shard(index).take_out(&self.queued, index)
     }
 
     /// A texture view was written into slot `index` in `frame`, due from
     /// frame `due`. `seen`: it was not written, a draw or the pass made
     /// the host slot from a view the queue may hold already, which then
     /// stays as it is.
-    fn written(&mut self, index: u32, frame: u64, due: u64, seen: bool) {
-        if seen && self.slots.contains_key(&index) {
-            return;
-        }
-        let write = self.next_revision();
-        let (since, waited, away) = self.kept(index);
-        self.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), since, waited, away });
-    }
-
-    /// What a slot written again keeps of its wait.
-    fn kept(&self, index: u32) -> (u64, bool, u64) {
-        self.slots.get(&index).map_or_else(
-            || (crate::host::now_ms(), false, 0),
-            |w| (w.since, w.waited || w.looks > 0 || w.mapped > 0, w.away),
-        )
+    fn written(&self, index: u32, frame: u64, due: u64, seen: bool) {
+        // Advance revision under the shard lock so any snapshot that already
+        // passed this shard sees a newer revision and cannot certify a bake
+        // without this write.
+        self.shard(index)
+            .upsert(&self.revision.0, &self.queued, index, frame, due, (seen, false));
     }
 
     /// When slot `index` began to wait, whether it waited for its memory, and
     /// when a look last found that away.
     fn since(&self, index: u32) -> Option<(u64, bool, u64)> {
-        self.slots.get(&index).map(|w| (w.since, w.waited || w.looks > 0 || w.mapped > 0, w.away))
+        self.shard(index).slots.get(&index).map(|w| (w.since, w.waited || w.looks > 0 || w.mapped > 0, w.away))
     }
 
-    fn remove(&mut self, index: u32) {
-        self.take_out(index);
+    fn remove(&self, index: u32) {
+        self.shard(index).take_out(&self.queued, index);
+    }
+
+    /// Removes each slot of `stale` while holding at most one shard lock at a time.
+    fn remove_stale(&self, stale: &[(u32, u64)]) {
+        for &(slot, _) in stale {
+            self.shard(slot).take_out(&self.queued, slot);
+        }
     }
 
     /// Up to `max` slots due at `frame`, each with its write number, in
@@ -1220,28 +1341,52 @@ impl TextureQueue {
         Self::in_order(self.snapshot(frame, max != 0).0, max)
     }
 
+    #[cfg(test)]
+    fn write_of(&self, index: u32) -> u64 {
+        self.shard(index).slots[&index].write
+    }
+
     /// Collect the slots for [`TextureQueue::in_order`] and the frame counters
-    /// in one walk under the queue lock. A counts-only pass allocates no slots.
+    /// shard by shard (never holding more than one shard lock at a time).
+    /// A counts-only pass allocates no slots.
     /// Counts cover all slots, all due, waiting for memory, partly uploaded,
     /// and the age in frames of the oldest due write.
     fn snapshot(&self, frame: u64, collect_slots: bool) -> (Due, [u64; 5]) {
         let mut due = Due::default();
-        let mut counts = [self.slots.len() as u64, 0, 0, 0, 0];
-        for (&index, w) in &self.slots {
-            if w.mapped > 0 {
-                counts[3] += 1;
-            } else if w.looks > 0 {
-                counts[2] += 1;
-            }
-            if w.due <= frame {
-                counts[1] += 1;
-                counts[4] = counts[4].max(frame.saturating_sub(w.written));
-                if collect_slots {
-                    due[usize::from(w.looks == 0 && w.mapped == 0)].push((index, w.write));
+        let mut counts = [0u64; 5];
+        for shard in &self.shards {
+            let shard = shard.0.lock().unwrap_or_else(|e| e.into_inner());
+            counts[0] += shard.slots.len() as u64;
+            for (&index, w) in &shard.slots {
+                if w.mapped > 0 {
+                    counts[3] += 1;
+                } else if w.looks > 0 {
+                    counts[2] += 1;
+                }
+                if w.due <= frame {
+                    counts[1] += 1;
+                    counts[4] = counts[4].max(frame.saturating_sub(w.written));
+                    if collect_slots {
+                        due[usize::from(w.looks == 0 && w.mapped == 0)].push((index, w.write));
+                    }
                 }
             }
         }
         (due, counts)
+    }
+
+    /// Every slot currently due at `frame` and whether it was uploaded before.
+    fn all_due(&self, frame: u64) -> Vec<(u32, bool)> {
+        let mut out = Vec::new();
+        for shard in &self.shards {
+            let shard = shard.0.lock().unwrap_or_else(|e| e.into_inner());
+            for (&index, w) in &shard.slots {
+                if w.due <= frame {
+                    out.push((index, w.mapped > 0 || w.checked.2 != 0));
+                }
+            }
+        }
+        out
     }
 
     /// Select a batch in service order after releasing the queue lock.
@@ -1280,30 +1425,19 @@ impl TextureQueue {
         again
     }
 
-    /// The entry of `index` if it is still the write the pass was handed.
-    fn same(&mut self, index: u32, write: u64) -> Option<&mut Waiting> {
-        self.slots.get_mut(&index).filter(|w| w.write == write)
-    }
-
-    /// Replacing a retry also clears a card-space hold for the same write.
-    fn reschedule(&mut self, index: u32, write: u64) -> Option<&mut Waiting> {
-        if self.held.get(&index) == Some(&write) {
-            self.held.remove(&index);
-        }
-        self.same(index, write)
-    }
-
     /// Slot `index` is up to date: out of the queue until written again.
-    fn done(&mut self, index: u32, write: u64) {
-        if self.same(index, write).is_some() {
-            self.take_out(index);
+    fn done(&self, index: u32, write: u64) {
+        let mut shard = self.shard(index);
+        if shard.same(index, write).is_some() {
+            shard.take_out(&self.queued, index);
         }
     }
 
     /// Nothing to upload at slot `index` now: looked at again after 1, 2,
     /// 4, ... frames, at most `most`.
-    fn later(&mut self, index: u32, write: u64, frame: u64, most: u64) {
-        if let Some(w) = self.reschedule(index, write) {
+    fn later(&self, index: u32, write: u64, frame: u64, most: u64) {
+        let mut shard = self.shard(index);
+        if let Some(w) = shard.reschedule(index, write) {
             w.due = frame + (1u64 << w.looks.min(16)).min(most.max(1));
             w.looks = w.looks.saturating_add(1);
             w.away = crate::host::now_ms();
@@ -1320,22 +1454,29 @@ impl TextureQueue {
     /// reached: the ones whose host copy exists and only wants bringing up
     /// to date, and the ones whose memory went, which is what lets host
     /// copies go and makes room.)
-    fn hold(&mut self, index: u32, write: u64, due: u64) {
-        if let Some(w) = self.same(index, write) {
+    fn hold(&self, index: u32, write: u64, due: u64) {
+        let mut shard = self.shard(index);
+        if let Some(w) = shard.same(index, write) {
             w.due = w.due.max(due);
-            self.held.insert(index, write);
+            shard.held.insert(index, write);
         }
     }
 
     /// The card has room again at `frame`: the slots held back for lack of
     /// it are due now, as if they had never been held. Returns how many.
-    fn room(&mut self, frame: u64) -> usize {
-        let held = std::mem::take(&mut self.held);
+    fn room(&self, frame: u64) -> usize {
         let mut back = 0;
-        for (index, write) in held {
-            if let Some(w) = self.same(index, write) {
-                w.due = w.due.min(frame);
-                back += 1;
+        for shard in &self.shards {
+            let mut shard = shard.0.lock().unwrap_or_else(|e| e.into_inner());
+            if shard.held.is_empty() {
+                continue;
+            }
+            let held = std::mem::take(&mut shard.held);
+            for (index, write) in held {
+                if let Some(w) = shard.same(index, write) {
+                    w.due = w.due.min(frame);
+                    back += 1;
+                }
             }
         }
         back
@@ -1343,8 +1484,9 @@ impl TextureQueue {
 
     /// Slot `index` was uploaded with `mapped` bytes of its memory there,
     /// not all of it: looked at again from frame `due`.
-    fn partly(&mut self, index: u32, write: u64, due: u64, mapped: u64) {
-        if let Some(w) = self.reschedule(index, write) {
+    fn partly(&self, index: u32, write: u64, due: u64, mapped: u64) {
+        let mut shard = self.shard(index);
+        if let Some(w) = shard.reschedule(index, write) {
             (w.due, w.looks, w.mapped) = (due, 0, mapped.max(1));
         }
     }
@@ -1354,8 +1496,9 @@ impl TextureQueue {
     /// title that fills a texture's memory after it wrote the view (the
     /// `looks`-th such look; `uploaded` is the upload's frame).
     #[allow(clippy::too_many_arguments)]
-    fn recheck(&mut self, index: u32, write: u64, due: u64, at: (u64, u64), print: u64, looks: u8, uploaded: u64) {
-        if let Some(w) = self.reschedule(index, write) {
+    fn recheck(&self, index: u32, write: u64, due: u64, at: (u64, u64), print: u64, looks: u8, uploaded: u64) {
+        let mut shard = self.shard(index);
+        if let Some(w) = shard.reschedule(index, write) {
             (w.due, w.looks, w.mapped) = (due, 1, 0);
             w.checked = (at.0, at.1, print, looks, uploaded);
         }
@@ -1364,24 +1507,74 @@ impl TextureQueue {
     /// What [`TextureQueue::recheck`] noted of slot `index`, if it is
     /// waiting for such a look.
     fn checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64)> {
-        self.slots.get(&index).map(|w| w.checked).filter(|c| c.2 != 0)
+        self.shard(index).slots.get(&index).map(|w| w.checked).filter(|c| c.2 != 0)
     }
 
-    /// The memory slot `index`'s texture lies in was mapped, unmapped or
-    /// written in `frame`: the slot is looked at from frame `due` as one
-    /// written now, whatever was known of it (a pass at work on it does
-    /// not take it out).
-    fn changed(&mut self, index: u32, frame: u64, due: u64) {
-        let write = self.next_revision();
-        let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
-        let (since, waited, away) = self.kept(index);
-        self.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), since, waited, away });
+    /// The memory of each slot in `slots` (sorted) was mapped, unmapped or
+    /// written in `frame`: each slot is looked at from frame `due` as one
+    /// written now, batching consecutive slots that share a shard.
+    fn changed_many(&self, slots: &[u32], frame: u64, due: u64) {
+        let mut i = 0;
+        while i < slots.len() {
+            let s = Self::shard_index(slots[i]);
+            let mut end = i + 1;
+            while end < slots.len() && Self::shard_index(slots[end]) == s {
+                end += 1;
+            }
+            let mut shard = self.shards[s].0.lock().unwrap_or_else(|e| e.into_inner());
+            for &slot in &slots[i..end] {
+                shard.upsert(&self.revision.0, &self.queued, slot, frame, due, (false, true));
+            }
+            i = end;
+        }
+    }
+
+    /// For sorted `slots`, counts those uploaded before (out of the queue, or
+    /// in it after a partial or rechecked upload) and, if `enqueue`, makes
+    /// them due at `due`.
+    fn changed_uploaded(&self, slots: &[u32], frame: u64, due: u64, enqueue: bool) -> usize {
+        let mut uploaded = 0;
+        let mut i = 0;
+        while i < slots.len() {
+            let s = Self::shard_index(slots[i]);
+            let mut end = i + 1;
+            while end < slots.len() && Self::shard_index(slots[end]) == s {
+                end += 1;
+            }
+            let mut shard = self.shards[s].0.lock().unwrap_or_else(|e| e.into_inner());
+            for &slot in &slots[i..end] {
+                if shard.slots.get(&slot).is_none_or(|w| w.mapped > 0 || w.checked.2 != 0) {
+                    uploaded += 1;
+                    if enqueue {
+                        shard.upsert(&self.revision.0, &self.queued, slot, frame, due, (false, true));
+                    }
+                }
+            }
+            i = end;
+        }
+        uploaded
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
     /// (0: not uploaded, or all of it was).
     fn mapped(&self, index: u32) -> u64 {
-        self.slots.get(&index).map_or(0, |w| w.mapped)
+        self.shard(index).slots.get(&index).map_or(0, |w| w.mapped)
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn slot_state(&self, index: u32, frame: u64) -> String {
+        let shard = self.shard(index);
+        match shard.slots.get(&index) {
+            None => "not queued".into(),
+            Some(w) => format!(
+                "queued due={} written@{} looks={} part_mapped={} recheck={}",
+                if w.due <= frame { "now".to_string() } else { format!("@{}", w.due) },
+                w.written,
+                w.looks,
+                w.mapped,
+                w.checked.2 != 0
+            ),
+        }
     }
 }
 
@@ -1925,7 +2118,7 @@ impl HostHeap {
             strides,
             buffers: Slots::new(count as usize),
             changed: Slots::new(count as usize),
-            textures: Mutex::new(TextureQueue { queued: queued.clone(), ..Default::default() }),
+            textures: TextureQueue::new(queued.clone()),
             queued,
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
@@ -2120,10 +2313,7 @@ impl HostHeap {
     /// with its write number, in the order to serve them
     /// ([`TextureQueue::in_order`]), and the queue's counts.
     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
-        let (due, census) = {
-            let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-            textures.snapshot(frame, max != 0)
-        };
+        let (due, census) = self.textures.snapshot(frame, max != 0);
         (TextureQueue::in_order(due, max), census)
     }
 
@@ -2133,13 +2323,12 @@ impl HostHeap {
     }
 
     pub(crate) fn finish_bake(&self, revision: u64) {
-        self.textures.lock().unwrap_or_else(|e| e.into_inner()).finish_bake(revision);
+        self.textures.finish_bake(revision);
     }
 
     /// Whether a completed bake covered this heap and there are no pending memory notes.
     pub(crate) fn bake_covered(&self) -> bool {
-        let covered = self.textures.lock().unwrap_or_else(|e| e.into_inner()).bake_covered();
-        if !covered {
+        if !self.textures.bake_covered() {
             return false;
         }
         let clear = HEAP_CHANGES.lock().unwrap_or_else(|e| e.into_inner()).get(&self.id)
@@ -2152,13 +2341,7 @@ impl HostHeap {
     /// look): for the card accounting line
     /// (`crate::resource::card_accounting`).
     pub(crate) fn texture_slots_all_due(&self, frame: u64) -> Vec<(u32, bool)> {
-        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        textures
-            .slots
-            .iter()
-            .filter(|(_, w)| w.due <= frame)
-            .map(|(&index, w)| (index, w.mapped > 0 || w.checked.2 != 0))
-            .collect()
+        self.textures.all_due(frame)
     }
 
     /// The texture view of title slot `index` (as handed out with `write`)
@@ -2166,16 +2349,15 @@ impl HostHeap {
     /// that many bytes of its memory there, not all), or not until the
     /// slot is written again.
     pub(crate) fn texture_slot_since(&self, index: u32) -> Option<(u64, bool, u64)> {
-        self.textures.lock().unwrap_or_else(|e| e.into_inner()).since(index)
+        self.textures.since(index)
     }
 
     /// The texture view of title slot `index` (as handed out with `write`)
     /// was brought up to date: see [`HostHeap::texture_slot_done`].
     pub(crate) fn texture_slot_done(&self, index: u32, write: u64, again: Option<(u64, u64)>) {
-        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         match again {
-            Some((frame, mapped)) => textures.partly(index, write, frame, mapped),
-            None => textures.done(index, write),
+            Some((frame, mapped)) => self.textures.partly(index, write, frame, mapped),
+            None => self.textures.done(index, write),
         }
     }
 
@@ -2191,37 +2373,35 @@ impl HostHeap {
         looks: u8,
         uploaded: u64,
     ) {
-        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        textures.recheck(index, write, due, at, print, looks, uploaded);
+        self.textures.recheck(index, write, due, at, print, looks, uploaded);
     }
 
     /// See [`TextureQueue::checked`].
     pub(crate) fn texture_slot_checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64)> {
-        self.textures.lock().unwrap_or_else(|e| e.into_inner()).checked(index)
+        self.textures.checked(index)
     }
 
     /// Nothing to upload at title slot `index` now (its memory is not
     /// mapped, or no more of it than before): looked at again after 1, 2,
     /// 4, ... frames, at most `most`.
     pub(crate) fn texture_slot_later(&self, index: u32, write: u64, frame: u64, most: u64) {
-        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        textures.later(index, write, frame, most);
+        self.textures.later(index, write, frame, most);
     }
 
     /// See [`TextureQueue::hold`].
     pub(crate) fn texture_slot_held(&self, index: u32, write: u64, due: u64) {
-        self.textures.lock().unwrap_or_else(|e| e.into_inner()).hold(index, write, due);
+        self.textures.hold(index, write, due);
     }
 
     /// See [`TextureQueue::room`].
     pub(crate) fn texture_slots_room(&self, frame: u64) -> usize {
-        self.textures.lock().unwrap_or_else(|e| e.into_inner()).room(frame)
+        self.textures.room(frame)
     }
 
     /// Bytes of title slot `index`'s memory that were mapped when it was
     /// last uploaded in part (0: not uploaded, or whole).
     pub(crate) fn texture_slot_mapped(&self, index: u32) -> u64 {
-        self.textures.lock().unwrap_or_else(|e| e.into_inner()).mapped(index)
+        self.textures.mapped(index)
     }
 
     /// Takes the ranges of title memory the runtime mapped, unmapped or
@@ -2248,10 +2428,7 @@ impl HostHeap {
         slots.sort_unstable();
         slots.dedup();
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
-        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        for &slot in &slots {
-            textures.changed(slot, frame, frame + 1);
-        }
+        self.textures.changed_many(&slots, frame, frame + 1);
         STALE[3].fetch_add(slots.len() as u64, Relaxed);
         slots.len()
     }
@@ -2273,10 +2450,7 @@ impl HostHeap {
         slots.sort_unstable();
         slots.dedup();
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
-        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        for &slot in &slots {
-            textures.changed(slot, frame, frame + 1);
-        }
+        self.textures.changed_many(&slots, frame, frame + 1);
         slots.len()
     }
 
@@ -2327,12 +2501,7 @@ impl HostHeap {
         slots.sort_unstable();
         slots.dedup();
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
-        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        slots.retain(|slot| textures.slots.get(slot).is_none_or(|w| w.mapped > 0 || w.checked.2 != 0));
-        for &slot in &slots {
-            textures.changed(slot, frame, frame);
-        }
-        slots.len()
+        self.textures.changed_uploaded(&slots, frame, frame, true)
     }
 
     /// [`HostHeap::texture_slots_page_written`] for `ranges` (start, end):
@@ -2348,19 +2517,12 @@ impl HostHeap {
         slots.dedup();
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
         let held = slots.len();
-        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         // Uploaded before: out of the queue, or in it after an upload (in
         // part, or whole and being looked at again).
-        slots.retain(|slot| textures.slots.get(slot).is_none_or(|w| w.mapped > 0 || w.checked.2 != 0));
+        let uploaded = self.textures.changed_uploaded(&slots, frame, frame + PAGE_WRITE_AFTER, due);
         PAGE_WRITES[2].fetch_add(held as u64, Relaxed);
-        PAGE_WRITES[3].fetch_add(slots.len() as u64, Relaxed);
-        if !due {
-            return [held, slots.len(), 0];
-        }
-        for &slot in &slots {
-            textures.changed(slot, frame, frame + PAGE_WRITE_AFTER);
-        }
-        [held, slots.len(), slots.len()]
+        PAGE_WRITES[3].fetch_add(uploaded as u64, Relaxed);
+        [held, uploaded, if due { uploaded } else { 0 }]
     }
 
     /// Whether host slot `index` is made from the very record the title
@@ -2438,10 +2600,7 @@ impl HostHeap {
         slots.sort_unstable();
         slots.dedup();
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
-        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        for &slot in &slots {
-            textures.changed(slot, frame, frame + 1);
-        }
+        self.textures.changed_many(&slots, frame, frame + 1);
         crate::tiles::STATS[10].fetch_add(slots.len() as u64, std::sync::atomic::Ordering::Relaxed);
         slots.len()
     }
@@ -2952,11 +3111,8 @@ impl HostHeap {
         // Once per slot and frame: tables are read by every draw.
         if old != now | TABLED_READ {
             stamp.store(now | TABLED_READ, Relaxed);
-            if tabled_out() && self.queued.may(index) {
-                let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-                if textures.take_out(index) {
-                    TABLED_WRITES[1].fetch_add(1, Relaxed);
-                }
+            if tabled_out() && self.queued.may(index) && self.textures.take_out(index) {
+                TABLED_WRITES[1].fetch_add(1, Relaxed);
             }
         }
     }
@@ -2993,7 +3149,11 @@ impl HostHeap {
         if !(texture && !read_now) && !self.queued.may(index) {
             return;
         }
-        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        // `seen` keeps an already-queued slot as it is, so avoid taking the
+        // shard lock when the queued bitmap already marks it present.
+        if texture && !read_now && seen && self.queued.is_set(index) {
+            return;
+        }
         if texture && !read_now {
             let due = if lately && !seen {
                 TABLED_WRITES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3001,9 +3161,9 @@ impl HostHeap {
             } else {
                 0
             };
-            textures.written(index, frame, due, seen);
+            self.textures.written(index, frame, due, seen);
         } else {
-            textures.remove(index);
+            self.textures.remove(index);
         }
     }
 
@@ -3117,10 +3277,7 @@ impl HostHeap {
         };
         if !stale.is_empty() {
             STALE[0].fetch_add(stale.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-            for &(slot, _) in &stale {
-                textures.remove(slot);
-            }
+            self.textures.remove_stale(&stale);
         }
         let (stride, kind) = view.map_or((None, 0), view_stride_and_kind);
         self.write_view_metadata(index, stride.unwrap_or(0) | kind, view.and_then(view_address).unwrap_or(0));
@@ -3858,18 +4015,7 @@ impl HostHeap {
     /// `index` at `frame`, in a few words (diagnostics).
     #[cfg(feature = "diagnostics")]
     pub(crate) fn texture_slot_state(&self, index: u32, frame: u64) -> String {
-        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        match textures.slots.get(&index) {
-            None => "not queued".into(),
-            Some(w) => format!(
-                "queued due={} written@{} looks={} part_mapped={} recheck={}",
-                if w.due <= frame { "now".to_string() } else { format!("@{}", w.due) },
-                w.written,
-                w.looks,
-                w.mapped,
-                w.checked.2 != 0
-            ),
-        }
+        self.textures.slot_state(index, frame)
     }
 
     /// The view host slot `index` was made from, in a few words, with the
@@ -6073,9 +6219,9 @@ mod tests {
 
     #[test]
     fn bake_coverage_is_local_to_the_heap_and_the_pass_revision() {
-        let mut first = TextureQueue::default();
-        let mut second = TextureQueue::default();
-        for queue in [&mut first, &mut second] {
+        let first = TextureQueue::default();
+        let second = TextureQueue::default();
+        for queue in [&first, &second] {
             queue.written(3, 1, 1, false);
         }
         let pass = first.next_revision();
@@ -6096,21 +6242,93 @@ mod tests {
 
     #[test]
     fn overlapping_texture_passes_cannot_certify_a_bake() {
-        let queue = Mutex::new(TextureQueue::default());
+        let queue = TextureQueue::default();
         let earlier = TexturePass::begin(&queue);
         let revision = earlier.revision.unwrap();
         let later = TexturePass::begin(&queue);
         assert!(later.revision.is_none());
         drop(later);
         drop(earlier);
-        queue.lock().unwrap().finish_bake(revision);
-        assert!(!queue.lock().unwrap().bake_covered());
+        queue.finish_bake(revision);
+        assert!(!queue.bake_covered());
 
         let next = TexturePass::begin(&queue).revision.unwrap();
-        queue.lock().unwrap().finish_bake(next);
-        assert!(queue.lock().unwrap().bake_covered());
+        queue.finish_bake(next);
+        assert!(queue.bake_covered());
         let _normal = TexturePass::begin(&queue);
-        assert!(!queue.lock().unwrap().bake_covered());
+        assert!(!queue.bake_covered());
+    }
+
+    #[test]
+    fn sharded_texture_queue_handles_concurrent_writes_across_shards_and_invalidates_bake() {
+        use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+
+        let queued = std::sync::Arc::new(Queued::new(4096));
+        let queue = std::sync::Arc::new(TextureQueue::new(queued.clone()));
+        let writers_left = AtomicU32::new(8);
+        let published = AtomicU32::new(0);
+
+        // Race a live certifier (`begin -> snapshot -> finish_bake`) against
+        // concurrent writers spread across all 32 shards: any bake that
+        // certifies must have seen every slot published before `begin`.
+        std::thread::scope(|s| {
+            let cert_q = queue.clone();
+            let cert_left = &writers_left;
+            let cert_pub = &published;
+            s.spawn(move || {
+                while cert_left.load(Relaxed) > 0 {
+                    let before_begin = cert_pub.load(std::sync::atomic::Ordering::Acquire);
+                    let pass = TexturePass::begin(&cert_q);
+                    let rev = pass.revision.unwrap();
+                    let (due, counts) = cert_q.snapshot(1, true);
+                    drop(pass);
+                    cert_q.finish_bake(rev);
+                    if cert_q.bake_covered() {
+                        assert!(
+                            counts[0] >= u64::from(before_begin) && due[1].len() >= before_begin as usize,
+                            "certified bake missed a write published before begin"
+                        );
+                    }
+                }
+            });
+            for t in 0..8u32 {
+                let q = queue.clone();
+                let p = &published;
+                let left = &writers_left;
+                s.spawn(move || {
+                    for i in 0..128u32 {
+                        let slot = t * 512 + i;
+                        q.written(slot, 1, 0, false);
+                        p.fetch_add(1, std::sync::atomic::Ordering::Release);
+                        // Second observation with `seen=true` must leave the write intact.
+                        q.written(slot, 2, 0, true);
+                    }
+                    left.fetch_sub(1, Relaxed);
+                });
+            }
+        });
+
+        let (due, counts) = queue.snapshot(1, true);
+        assert_eq!(counts[0], 1024);
+        assert_eq!(counts[1], 1024);
+        assert_eq!(due[1].len(), 1024);
+        assert!(queued.is_set(0) && queued.is_set(7 * 512 + 127));
+        assert!(!queued.is_set(7 * 512 + 200));
+
+        // Clean bake pass after writes settle must certify.
+        let clean = TexturePass::begin(&queue);
+        let clean_rev = clean.revision.unwrap();
+        let _ = queue.snapshot(1, true);
+        drop(clean);
+        queue.finish_bake(clean_rev);
+        assert!(queue.bake_covered());
+
+        // `changed_many` across shards must invalidate the certified bake and
+        // advance each slot's write number.
+        let before = queue.write_of(16);
+        queue.changed_many(&[0, 16, 32, 512], 5, 5);
+        assert!(!queue.bake_covered());
+        assert!(queue.write_of(16) > before);
     }
 
     /// The queue of textures picked by index serves the slots looked at
@@ -6120,7 +6338,7 @@ mod tests {
     /// slot written again meanwhile is dropped.
     #[test]
     fn the_texture_queue_serves_the_newest_writes_first() {
-        let mut q = TextureQueue::default();
+        let q = TextureQueue::default();
         // Slots 10..18 written in frames 1..9, slot 5 last.
         for i in 0..8u32 {
             q.written(10 + i, u64::from(i) + 1, 0, false);
@@ -6175,12 +6393,12 @@ mod tests {
     fn capped_texture_batches_match_the_full_service_order() {
         let len = 32;
         for retries in 0..=len {
-            let mut q = TextureQueue::default();
+            let q = TextureQueue::default();
             for i in 0..len {
                 let index = (i * 13) % len;
                 q.written(index, 1, 1, false);
                 if index < retries {
-                    q.later(index, q.slots[&index].write, 1, 1);
+                    q.later(index, q.write_of(index), 1, 1);
                 }
             }
             let full = q.due(2, usize::MAX);
@@ -6192,14 +6410,14 @@ mod tests {
 
     #[test]
     fn texture_snapshot_counts_include_deferred_slots_and_do_not_depend_on_the_batch() {
-        let mut q = TextureQueue::default();
+        let q = TextureQueue::default();
         q.written(1, 2, 0, false);
         q.written(2, 4, 0, false);
         q.written(3, 6, 0, false);
         q.written(4, 8, 11, false);
-        let retry = q.slots[&2].write;
+        let retry = q.write_of(2);
         q.later(2, retry, 8, 4);
-        q.partly(3, q.slots[&3].write, 12, 4096);
+        q.partly(3, q.write_of(3), 12, 4096);
 
         let (due, counts) = q.snapshot(10, true);
         assert_eq!(counts, [4, 2, 1, 1, 8]);
@@ -6215,7 +6433,7 @@ mod tests {
     /// a slot written again meanwhile is the title's new write.
     #[test]
     fn slots_held_for_lack_of_room_come_back_when_there_is_room() {
-        let mut q = TextureQueue::default();
+        let q = TextureQueue::default();
         for i in 0..4u32 {
             q.written(20 + i, 1, 0, false);
         }
@@ -6243,7 +6461,7 @@ mod tests {
 
     #[test]
     fn card_room_preserves_texture_retries_after_a_hold() {
-        let mut q = TextureQueue::default();
+        let q = TextureQueue::default();
         for index in 1..=4 {
             q.written(index, 0, 0, false);
         }

@@ -177,6 +177,11 @@ if ($Machine -eq '3060') {
     $settings.VICTORY_THIN_THREADS = '6'; $settings.VICTORY_UNDER_THREADS = '4'; $settings.VICTORY_LAND_THREADS = '3'
     $settings.VICTORY_WINDOWS_BAR_MB = '3072'
     if (-not $Safe) { $settings.VICTORY_MAP_THREADS = 'auto' }
+    # Six pipeline workers instead of the 4070's three. With a cold pipeline cache (after a
+    # translator or driver change) about 460 of the route's pipelines take seconds to a minute
+    # each; with three workers the world stayed black for about 6 minutes, with six for under 5,
+    # and the queue emptied 3 minutes sooner, with no fewer frames afterwards (runs 43, 46, 45).
+    $settings.VICTORY_PIPELINE_WORKERS = '6'
 }
 if ($Machine -eq '4070tisuper') {
     # RTX 4070 Ti SUPER (16 GB, DXGI budget about 15.3 GB), Ryzen 7 9850X3D (eight cores), 32 GB.

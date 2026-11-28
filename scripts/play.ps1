@@ -90,7 +90,9 @@ function Get-AutoNvidiaSettings([int]$CardGb, [int]$Cores, [bool]$Safe) {
         $adds.VICTORY_CARD_RESERVE_BUDGETS = '1'
         $adds.VICTORY_CARD_BUFFERS_MIN_KB = '64'; $adds.VICTORY_CARD_BUFFERS_MB = '1536'
         $adds.VICTORY_CARD_WINDOWS_MB = '1024'
-        if ($CardGb -ge 15) { $adds.VICTORY_WINDOWS_BAR_MB = '4096' }
+        # Under 15 GB: the first 3D frames ask for thousands of 64 KiB title buffers; make them
+        # during the menu (#178). RTX 3080 10 GB: fewer hitches at world entry (docs/rtx5080-16gb.md).
+        if ($CardGb -ge 15) { $adds.VICTORY_WINDOWS_BAR_MB = '4096' } else { $adds.VICTORY_TITLE_PREWARM_COUNT = '3328' }
     }
     $adds
 }

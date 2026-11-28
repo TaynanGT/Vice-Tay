@@ -48,8 +48,9 @@
 //! 16,352 of 16,384 pages read zeros with the handle closed, none with it
 //! open (the test below). `VICTORY_LIBRARY_HANDLE=0`: closed, as before.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
 
@@ -63,9 +64,23 @@ pub fn use_pipeline_cache(dir: PathBuf) {
     let _ = DIR.set(dir);
 }
 
-/// The folder the library is kept in.
+/// The configured cache root, where untranslated title recipes are kept.
 pub(super) fn folder() -> Option<PathBuf> {
     DIR.get().cloned()
+}
+
+/// Isolate the compiled library (including its staging file) and scheduling
+/// history by the device's resolved mode. Keep the legacy path for baseline
+/// runs; the book of untranslated title recipes stays shared.
+fn cache_dir(dir: &Path, native_fp16: bool) -> Cow<'_, Path> {
+    if native_fp16 { Cow::Owned(dir.join("native-fp16")) } else { Cow::Borrowed(dir) }
+}
+
+fn active_cache_dir() -> Option<&'static Path> {
+    static ACTIVE: OnceLock<Cow<'static, Path>> = OnceLock::new();
+    let dir = DIR.get()?;
+    let active = ACTIVE.get_or_init(|| cache_dir(dir, crate::host::native_fp16_enabled()));
+    Some(active.as_ref())
 }
 
 /// Host pipelines created, loaded from the library, and title pipelines
@@ -449,7 +464,7 @@ fn library() -> Option<&'static Library> {
         .get_or_init(|| {
             let _opening = crate::timeline::span("pipeline: open the host pipeline library");
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
-            let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
+            let blob = active_cache_dir().map_or(Blob::None, Blob::of);
             let library = open(&device, blob);
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
@@ -623,7 +638,7 @@ pub(super) fn allows_static_samplers(host: &crate::host::Host) -> bool {
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    let (Some(dir), Some(library)) = (active_cache_dir(), library()) else { return };
     // A shutdown save waits for the current save. Periodic callers can leave
     // the work to that save without blocking the pipeline workers or meter.
     let mut last = if now {
@@ -791,7 +806,7 @@ fn read_pipeline_history(file: &str) -> String {
     if !saved_pipeline_history() {
         return String::new();
     }
-    DIR.get().and_then(|dir| std::fs::read_to_string(dir.join(file)).ok()).unwrap_or_default()
+    active_cache_dir().and_then(|dir| std::fs::read_to_string(dir.join(file)).ok()).unwrap_or_default()
 }
 
 /// How long each title pipeline that took long to make took, in ms (beside
@@ -876,6 +891,30 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fp16_pipeline_libraries_are_read_and_written_separately() {
+        let dir = tempfile::tempdir().unwrap();
+        let baseline = cache_dir(dir.path(), false);
+        let native = cache_dir(dir.path(), true);
+        assert_eq!(baseline.as_ref(), dir.path(), "keep the existing baseline library path");
+        assert_ne!(baseline, native);
+        std::fs::create_dir_all(&native).unwrap();
+        for (path, bytes) in [(&baseline, b"baseline".as_slice()), (&native, b"native".as_slice())] {
+            save_snapshot(path, &AtomicU64::new(1), |tmp| {
+                std::fs::write(tmp, bytes)?;
+                Ok(bytes.len())
+            })
+            .unwrap();
+        }
+        assert_eq!(Blob::of(&baseline).bytes(), b"baseline");
+        assert_eq!(Blob::of(&native).bytes(), b"native");
+
+        // A deferred replacement stays in its own mode's library too.
+        std::fs::write(native.join(NEXT_FILE), b"new native").unwrap();
+        assert_eq!(Blob::of(&baseline).bytes(), b"baseline");
+        assert_eq!(Blob::of(&native).bytes(), b"new native");
+    }
 
     #[test]
     fn bypassing_the_library_calls_pipeline_creation() {

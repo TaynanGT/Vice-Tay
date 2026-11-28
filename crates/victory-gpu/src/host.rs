@@ -38,6 +38,8 @@ const RTV_RING: u32 = 1024;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
+    /// The requested shader mode, resolved against this device (not the adapter list).
+    pub(crate) native_fp16: bool,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -1403,11 +1405,42 @@ pub(crate) fn host() -> Option<&'static Host> {
     .as_ref()
 }
 
+/// Resolve the mode before choosing a shader or PSO cache key. An unset
+/// switch must not create a device earlier than an ordinary widened run.
+pub(crate) fn native_fp16_enabled() -> bool {
+    if let Some(host) = made_host() {
+        return host.native_fp16;
+    }
+    native_fp16_requested(std::env::var_os("VICTORY_NATIVE_FP16").as_deref())
+        && host().is_some_and(|host| host.native_fp16)
+}
+
+fn native_fp16_requested(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| value == "1")
+}
+
+fn native_fp16_supported(device: &ID3D12Device) -> windows::core::Result<bool> {
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS4::default();
+    // SAFETY: the feature query writes the corresponding structure of the given size.
+    unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS4,
+            (&raw mut options).cast(),
+            size_of_val(&options) as u32,
+        )?;
+    }
+    Ok(options.Native16BitShaderOpsSupported.as_bool())
+}
+
+fn resolve_native_fp16(requested: bool, probe: impl FnOnce() -> windows::core::Result<bool>) -> bool {
+    requested && probe().unwrap_or(false)
+}
+
 fn create() -> windows::core::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
-        // The debug layer only in builds with diagnostics.
-        let debug = cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_DEBUG");
+        // The debug layer is only for diagnostics builds and host unit tests.
+        let debug = cfg!(any(test, feature = "diagnostics")) && crate::switch::on("VICTORY_D3D12_DEBUG");
         if debug {
             let mut layer: Option<ID3D12Debug> = None;
             match D3D12GetDebugInterface(&mut layer) {
@@ -1456,7 +1489,7 @@ fn create() -> windows::core::Result<Host> {
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP") {
+        if cfg!(any(test, feature = "diagnostics")) && crate::switch::on("VICTORY_D3D12_WARP") {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
@@ -1466,6 +1499,11 @@ fn create() -> windows::core::Result<Host> {
             crate::tdr::log();
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        let requested = native_fp16_requested(std::env::var_os("VICTORY_NATIVE_FP16").as_deref());
+        let native_fp16 = resolve_native_fp16(requested, || native_fp16_supported(&device));
+        if requested {
+            tracing::info!(native_fp16, "resolved VICTORY_NATIVE_FP16 for the host D3D12 device");
+        }
         // Before anything is made with it (`VICTORY_RECORD`).
         #[cfg(feature = "diagnostics")]
         crate::replay::record::from_env(&device);
@@ -1540,6 +1578,7 @@ fn create() -> windows::core::Result<Host> {
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
+            native_fp16,
             queue,
             fence,
             submitted: Mutex::new(0),
@@ -1591,6 +1630,9 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
         Ok(adapter)
     }
 }
+
+#[cfg(test)]
+mod fp16_tests;
 
 #[cfg(test)]
 mod tests {

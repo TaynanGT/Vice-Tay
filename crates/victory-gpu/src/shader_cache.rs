@@ -29,7 +29,7 @@ use crate::Precompiled;
 const FORMAT: u32 = 2;
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, UserData};
+use victory_shader::emit::{HostShader, StaticSampler, TranslationOptions, UserData};
 use victory_shader::resource::RootIndexedView;
 use victory_shader::{HwStage, RootType};
 
@@ -86,7 +86,7 @@ pub fn stale_counts() -> (u64, u64, u64) {
 /// entries, the settings it runs with, and what it was told of the host.
 /// Not our executable: a rebuild of anything else used to translate every
 /// shader again.
-fn build() -> [u8; 32] {
+fn build(native_fp16: bool) -> [u8; 32] {
     // The view heap's null slot differs by host GPU: a translation cached
     // without the clamp must not be served (`host_settings` below).
     crate::descriptor::host::probe_view_limit();
@@ -154,17 +154,32 @@ fn build() -> [u8; 32] {
         }
         bytes
     });
+    translation_key(fixed, &victory_shader::emit::host_settings(), native_fp16)
+}
+
+fn translation_key(fixed: &[u8], host_settings: &[u32], native_fp16: bool) -> [u8; 32] {
     let mut hash = blake3::Hasher::new();
     hash.update(fixed);
-    for value in victory_shader::emit::host_settings() {
+    for value in host_settings {
         hash.update(&value.to_le_bytes());
+    }
+    // Extend only the enabled key so baseline entries stay usable when
+    // the request is absent, inexact, or unsupported by the host.
+    if native_fp16 {
+        hash.update(b"native-fp16-v1\0");
     }
     *hash.finalize().as_bytes()
 }
 
+fn translation_options() -> TranslationOptions {
+    TranslationOptions {
+        native_fp16: crate::host::native_fp16_enabled(),
+    }
+}
+
 /// What tells one set of translations from another ([`build`]).
 pub(crate) fn translation() -> [u8; 32] {
-    build()
+    build(translation_options().native_fp16)
 }
 
 /// Identifies a completed batch of cached translations, including the
@@ -174,9 +189,9 @@ pub fn precompile_cache_key() -> Option<[u8; 32]> {
     if WRITE_FAILED.load(Ordering::Relaxed) {
         return None;
     }
-    crate::host::host()?;
+    let host = crate::host::host()?;
     let mut key = blake3::Hasher::new();
-    key.update(&build());
+    key.update(&build(host.native_fp16));
     if let Some(only) = std::env::var_os("VICTORY_WAVE_WIDE_ONLY") {
         key.update(only.as_encoded_bytes());
     }
@@ -188,23 +203,29 @@ pub fn precompile_cache_key() -> Option<[u8; 32]> {
 /// kept, or why it does not translate. The host is opened first, as a run
 /// does: what the card can do decides the form of some programs.
 pub fn precompile(container: &[u8]) -> Result<Precompiled, String> {
-    let _ = crate::host::host();
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
-    let Some(cache) = CACHE.get() else {
-        translate(container)?;
-        return Ok(Precompiled::NotCached("no shader cache".into()));
-    };
-    cached(cache, &build(), container, translate, true).map(|(_, outcome)| outcome)
+    translated(container, true)
+        .map(|(_, outcome)| outcome.unwrap_or_else(|| Precompiled::NotCached("no shader cache".into())))
 }
 
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    translated(container, false).map(|(shader, _)| shader)
+}
+
+fn translated(container: &[u8], force_refresh: bool) -> Result<(HostShader, Option<Precompiled>), String> {
+    let options = translation_options();
+    let translate = |c: &[u8]| victory_shader::emit::translate_with_options(c, options).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, &build(), container, translate, refresh_in_runs())
-            .map(|(shader, _)| shader),
-        None => translate(container),
+        Some(cache) => cached(
+            cache,
+            &build(options.native_fp16),
+            container,
+            translate,
+            force_refresh || refresh_in_runs(),
+        )
+        .map(|(shader, outcome)| (shader, Some(outcome))),
+        None => Ok((translate(container)?, None)),
     }
 }
 
@@ -537,6 +558,36 @@ mod tests {
                 shift: 5,
             }],
         }
+    }
+
+    #[test]
+    fn fp16_shader_cache_keeps_baseline_and_native_entries_separate() {
+        let dir = tempfile::tempdir().unwrap();
+        let container = b"the same console container in both modes";
+        let fixed = b"version and translator settings";
+        let host_settings = [1u32, 32, 0, 0];
+        let baseline = translation_key(fixed, &host_settings, false);
+        let native = translation_key(fixed, &host_settings, true);
+        let mut previous = fixed.to_vec();
+        for setting in host_settings {
+            previous.extend_from_slice(&setting.to_le_bytes());
+        }
+        assert_eq!(baseline, *blake3::hash(&previous).as_bytes());
+        assert_ne!(baseline, native);
+
+        let mut native_shader = shader();
+        native_shader.dxil.push(16);
+        {
+            let cache = Cache::open(dir.path()).unwrap();
+            assert_eq!(cached(&cache, &baseline, container, |_| Ok(shader()), false),
+                Ok((shader(), Precompiled::Translated)));
+            assert_eq!(cached(&cache, &native, container, |_| Ok(native_shader.clone()), false),
+                Ok((native_shader.clone(), Precompiled::Translated)));
+        }
+        let cache = Cache::open(dir.path()).unwrap();
+        let unexpected = |_: &[u8]| panic!("expected the entry for this mode on disk");
+        assert_eq!(cached(&cache, &native, container, unexpected, false), Ok((native_shader, Precompiled::Cached)));
+        assert_eq!(cached(&cache, &baseline, container, unexpected, false), Ok((shader(), Precompiled::Cached)));
     }
 
     #[test]

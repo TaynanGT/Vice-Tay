@@ -1,5 +1,7 @@
 //! DXIL emission (decision 0003, step 3): a console vertex, pixel, compute
-//! or mesh shader as a PC DXIL container (SM 6.6) that host D3D12 accepts.
+//! or mesh shader as a PC DXIL container for host D3D12. The default profile
+//! is SM 6.6. With explicit native FP16, shaders using native half can use SM
+//! 6.2 unless they need newer features such as descriptor heaps or WaveSize.
 //! Compute shaders keep the console's thread-group size; one that depends
 //! on the lane layout (cross-lane operations) declares the console's wave
 //! size (`WaveSize`), so the host device must support it.
@@ -86,6 +88,8 @@ mod container;
 mod cube_lod_tests;
 #[cfg(all(test, windows))]
 mod diff_tests;
+#[cfg(all(test, windows))]
+mod fp16_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
@@ -403,8 +407,15 @@ pub struct UserData {
     pub dword: u32,
 }
 
+/// Codegen choices resolved by the caller. The GPU host only enables native FP16 after
+/// checking the adapter; the translator itself does not read `VICTORY_NATIVE_FP16`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TranslationOptions {
+    pub native_fp16: bool,
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
-/// shader container.
+/// shader container with the default codegen choices.
 ///
 /// A program refused because the first half of an interpolation is read as
 /// data is translated once more with first halves evaluated as the pair
@@ -419,18 +430,26 @@ pub struct UserData {
 /// a program: with that on for every program, 69 compute programs that
 /// already translated came out changed (`CS_RaytracingResolve`, ...).
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
-    match translate_plain(container) {
+    translate_with_options(container, TranslationOptions::default())
+}
+
+/// Like [`translate`], using the caller's explicit codegen options for every attempt.
+pub fn translate_with_options(
+    container: &[u8],
+    options: TranslationOptions,
+) -> Result<HostShader, ShaderError> {
+    match translate_plain(container, options) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
-            lower::with_first_half_pairs(|| translate_plain(container))
+            lower::with_first_half_pairs(|| translate_plain(container, options))
         }
         Err(ShaderError::Unsupported { what, .. }) if what == lower::MASK_ELSEWHERE => {
-            lower::with_mask_ops_on_numbers(|| translate_plain(container))
+            lower::with_mask_ops_on_numbers(|| translate_plain(container, options))
         }
         other => other,
     }
 }
 
-fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
+fn translate_plain(container: &[u8], options: TranslationOptions) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -455,7 +474,7 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit(&c, &native, &p, &st, &io, &res)
+    emit_with_options(&c, &native, &p, &st, &io, &res, options)
 }
 
 /// [`emit`] with the same second tries as [`translate`] (first halves of
@@ -656,6 +675,19 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    emit_with_options(c, native, p, st, io, res, TranslationOptions::default())
+}
+
+/// Like [`emit`], using the caller's explicit codegen options.
+pub fn emit_with_options(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    options: TranslationOptions,
+) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
     let wave32_compute =
@@ -664,7 +696,7 @@ pub fn emit(
     if listed && wave32_compute {
         let by_default = std::env::var_os("VICTORY_WAVE_PAIRS_ONLY").is_none() && paired_by_default(c.input);
         let was = PAIRED_BY_DEFAULT_HERE.replace(by_default);
-        let tried = paired(c, native, p);
+        let tried = paired_with_options(c, native, p, options);
         PAIRED_BY_DEFAULT_HERE.set(was);
         match tried {
             Ok((shader, Some(32))) => {
@@ -676,7 +708,7 @@ pub fn emit(
         }
         lower::take_needs();
     }
-    let original = emit_program(c, native, p, st, io, res);
+    let original = emit_program(c, native, p, st, io, res, options);
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every
     // lane runs: once more with its early-outs left out
@@ -695,7 +727,7 @@ pub fn emit(
             || lower::crosses_halves(p, st)
                 && (original.is_err() || lower::wave_local(p, st).is_err()))
     {
-        let again = paired(c, native, p);
+        let again = paired_with_options(c, native, p, options);
         if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
             match &again {
                 Ok((_, wave)) => eprintln!("WAVE64-RETRY paired Wave64: wave {wave:?}"),
@@ -782,7 +814,7 @@ pub fn emit(
         ];
         for (name, f) in &forms {
             if let Some((p, st, io, res)) = f {
-                let again = emit_program(c, native, p, st, io, res);
+                let again = emit_program(c, native, p, st, io, res, options);
                 report(name, &again);
                 if done(&again) {
                     return again.map(|(shader, _)| shader);
@@ -823,7 +855,7 @@ pub fn emit(
         for exact in [true, false] {
             if !exact {
                 if pairs_on {
-                    let again = paired(c, native, p);
+                    let again = paired_with_options(c, native, p, options);
                     report("paired Wave64", &again);
                     if done(&again) {
                         return again.map(|(shader, _)| shader);
@@ -837,7 +869,7 @@ pub fn emit(
                 let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
                 let deep = if deep_on { form("without skips, scalars followed", ir::without_skips(p, true)) } else { None };
                 if let Some((p, st, io, res)) = &deep {
-                    let again = emit_program(c, native, p, st, io, res);
+                    let again = emit_program(c, native, p, st, io, res, options);
                     report("without skips, scalars followed", &again);
                     if done(&again) {
                         return again.map(|(shader, _)| shader);
@@ -854,7 +886,7 @@ pub fn emit(
                         Some(p),
                     ];
                     if let Some(base) = bases.into_iter().flatten().next() {
-                        let again = widen(c, native, base, why, driver_loop);
+                        let again = widen(c, native, base, why, driver_loop, options);
                         report("wave-wide branches", &again);
                         if done(&again) {
                             return again.map(|(shader, _)| shader);
@@ -872,7 +904,7 @@ pub fn emit(
                 if let Some((p, st, io, res)) = f
                     && idiom(p, st) == exact
                 {
-                    let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
+                    let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res, options));
                     report(&format!("local waves ({}), {name}", if exact { "idiom" } else { "APPROXIMATE" }), &local);
                     if done(&local) {
                         return local.map(|(shader, _)| shader);
@@ -880,7 +912,7 @@ pub fn emit(
                 }
             }
             if idiom(p, st) == exact {
-                let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
+                let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res, options));
                 report(if exact { "local waves (idiom)" } else { "local waves (APPROXIMATE)" }, &local);
                 if done(&local) {
                     return local.map(|(shader, _)| shader);
@@ -892,14 +924,14 @@ pub fn emit(
             if !strict {
                 for (name, f) in &forms {
                     if let Some((p, st, io, res)) = f {
-                        let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
+                        let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res, options));
                         report(&format!("local waves (APPROXIMATE, any mask), {name}"), &local);
                         if done(&local) {
                             return local.map(|(shader, _)| shader);
                         }
                     }
                 }
-                let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
+                let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res, options));
                 report("local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
                     return local.map(|(shader, _)| shader);
@@ -915,20 +947,20 @@ pub fn emit(
             let bases = [forms[0].1.as_ref(), forms[1].1.as_ref()];
             for (name, f) in [("without early-outs", bases[0]), ("without skips", bases[1])] {
                 if let Some((p, st, io, res)) = f {
-                    let again = loose_lds::with(|| emit_program(c, native, p, st, io, res));
+                    let again = loose_lds::with(|| emit_program(c, native, p, st, io, res, options));
                     report(&format!("loose LDS (APPROXIMATE), {name}"), &again);
                     if done(&again) {
                         return again.map(|(shader, _)| shader);
                     }
                 }
             }
-            let again = loose_lds::with(|| emit_program(c, native, p, st, io, res));
+            let again = loose_lds::with(|| emit_program(c, native, p, st, io, res, options));
             report("loose LDS (APPROXIMATE)", &again);
             if done(&again) {
                 return again.map(|(shader, _)| shader);
             }
             if local_on && !exact_only {
-                let local = loose_lds::with(|| lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res)));
+                let local = loose_lds::with(|| lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res, options)));
                 report("loose LDS + local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
                     return local.map(|(shader, _)| shader);
@@ -945,10 +977,12 @@ pub fn emit(
                 && what == lower::LANE_MASK
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
-            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some(), false);
+            let again = widen(
+                c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some(), false, options,
+            );
             match again {
                 Ok(_) => again,
-                Err(_) => emit_program(c, native, p, st, io, res),
+                Err(_) => emit_program(c, native, p, st, io, res, options),
             }
         }
         other => other,
@@ -977,7 +1011,7 @@ pub fn emit(
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    emit_program(c, native, &p, &st, &io, &res).and_then(supported)
+    emit_program(c, native, &p, &st, &io, &res, options).and_then(supported)
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
@@ -993,6 +1027,7 @@ fn widen(
     p: &ir::Program,
     why: bool,
     active_loop_only: bool,
+    options: TranslationOptions,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
     const NOT: ShaderError = ShaderError::Unsupported {
         offset: 0,
@@ -1016,7 +1051,7 @@ fn widen(
         let io = io::raise(p, native)?;
         let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
         lower::take_needs();
-        let r = emit_program(c, native, p, &st, &io, &res);
+        let r = emit_program(c, native, p, &st, &io, &res, options);
         let needs = lower::take_needs();
         // (or translated for 64-lane waves still: shared memory read and written where not
         // every lane runs, whose blocks the lowering names too)
@@ -1087,11 +1122,21 @@ fn wave_pairs_on() -> bool {
     std::env::var_os("VICTORY_WAVE_PAIRS").is_some_and(|v| v == "1")
 }
 
-// Paired lanes from PR #854 (PiloteCode), including the per-wave CFG used by 840243e2.
+#[cfg(all(test, windows))]
 fn paired(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
+    paired_with_options(c, native, p, TranslationOptions::default())
+}
+
+// Paired lanes from PR #854 (PiloteCode), including the per-wave CFG used by 840243e2.
+fn paired_with_options(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    options: TranslationOptions,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
     let crate::native::StageIo::Cs(cs) = native.io else {
         return Err(ShaderError::Unsupported {
@@ -1165,7 +1210,7 @@ fn paired(
     };
     let io = io::raise(p, native)?;
     let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
-    lower::with_paired_lanes(|| emit_program(c, native, p, &st, &io, &res))
+    lower::with_paired_lanes(|| emit_program(c, native, p, &st, &io, &res, options))
 }
 
 /// The translated program, and the wave size it requires of the host.
@@ -1176,6 +1221,7 @@ fn emit_program(
     st: &structure::Structured,
     io: &io::Io,
     res: &resource::Resources,
+    options: TranslationOptions,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
@@ -1240,17 +1286,20 @@ fn emit_program(
         }
         _ => 0,
     };
-    let l = lower::lower(&lower::Parts {
-        native,
-        p,
-        st,
-        io,
-        res,
-        inputs,
-        outputs,
-        prims,
-        mesh_stride,
-    })?;
+    let l = lower::lower_with_options(
+        &lower::Parts {
+            native,
+            p,
+            st,
+            io,
+            res,
+            inputs,
+            outputs,
+            prims,
+            mesh_stride,
+        },
+        options,
+    )?;
     let wave_size = l.wave_size;
     let shader = HostShader {
         stage: native.stage,

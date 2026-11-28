@@ -1695,31 +1695,26 @@ impl State {
         }
         let l = &list.list;
         // Vertex buffers the input layout reads.
-        let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
-        let mut count = 0;
-        for (slot, (view, &v)) in views.iter_mut().zip(&self.vertex).enumerate() {
-            if p.slots & 1 << slot == 0 {
-                continue;
+        if p.slots != 0 {
+            let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
+            let count = vertex_slot_count(p.slots);
+            for slot in active_vertex_slots(p.slots) {
+                let v = self.vertex[slot];
+                if v.address == 0 || v.size == 0 {
+                    continue;
+                }
+                let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
+                    continue;
+                };
+                shadow.refresh(list, v.address, u64::from(v.size));
+                views[slot] = D3D12_VERTEX_BUFFER_VIEW {
+                    BufferLocation: shadow.gpu(v.address),
+                    SizeInBytes: v.size.min(u32::try_from(shadow.left(v.address)).unwrap_or(u32::MAX)),
+                    StrideInBytes: v.stride,
+                };
             }
-            count = slot + 1;
-            if v.address == 0 || v.size == 0 {
-                continue;
-            }
-            let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
-                continue;
-            };
-            shadow.refresh(list, v.address, u64::from(v.size));
-            *view = D3D12_VERTEX_BUFFER_VIEW {
-                BufferLocation: shadow.gpu(v.address),
-                SizeInBytes: v.size.min(u32::try_from(shadow.left(v.address)).unwrap_or(u32::MAX)),
-                StrideInBytes: v.stride,
-            };
-        }
-        // SAFETY: an open list; the views name live host buffers.
-        unsafe {
-            if count > 0 {
-                l.IASetVertexBuffers(0, Some(&views[..count]));
-            }
+            // SAFETY: an open list; the views name live host buffers.
+            unsafe { l.IASetVertexBuffers(0, Some(&views[..count])) };
         }
         if indexed {
             let v = self.index;
@@ -4422,17 +4417,17 @@ impl State {
             return false;
         };
         let rects = u64::from(count / 3);
-        for slot in 0..32 {
+        for slot in active_vertex_slots(p.slots) {
             let elements: Vec<(u32, u32)> = p
                 .inputs
                 .iter()
-                .filter(|e| e.slot == slot && !e.per_instance)
+                .filter(|e| e.slot as usize == slot && !e.per_instance)
                 .map(|e| (e.offset, e.format))
                 .collect();
             if elements.is_empty() {
                 continue;
             }
-            let v = self.vertex[slot as usize];
+            let v = self.vertex[slot];
             let stride = u64::from(v.stride);
             let from = v.address + u64::from(first) * stride;
             if v.address == 0
@@ -4472,7 +4467,7 @@ impl State {
                 StrideInBytes: v.stride,
             };
             // SAFETY: an open list; the view names live scratch memory.
-            unsafe { list.list.IASetVertexBuffers(slot, Some(&[view])) };
+            unsafe { list.list.IASetVertexBuffers(slot as u32, Some(&[view])) };
         }
         true
     }
@@ -5333,6 +5328,23 @@ const LINE_LOOP: u32 = 18;
 const QUADS: u32 = 19;
 const QUAD_STRIP: u32 = 20;
 
+/// The vertex buffer slots set in the mask, lowest first.
+fn active_vertex_slots(mut mask: u32) -> impl Iterator<Item = usize> {
+    std::iter::from_fn(move || {
+        if mask == 0 {
+            return None;
+        }
+        let slot = mask.trailing_zeros() as usize;
+        mask &= mask - 1;
+        Some(slot)
+    })
+}
+
+/// Includes the empty bindings below the highest active slot.
+fn vertex_slot_count(mask: u32) -> usize {
+    (u32::BITS - mask.leading_zeros()) as usize
+}
+
 /// Fixed-function state, straight onto the host list.
 pub(crate) fn viewports(list: &HostList, viewports: &[D3D12_VIEWPORT]) {
     // SAFETY: an open list.
@@ -5417,7 +5429,19 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{View, is_depth_companion, is_depth_srv, staging_budget_per_frame};
+    use super::{
+        View, active_vertex_slots, is_depth_companion, is_depth_srv, staging_budget_per_frame,
+        vertex_slot_count,
+    };
+
+    #[test]
+    fn vertex_slots_preserve_binding_order_and_holes() {
+        for mask in [0, 1, 0b1010_0001, 1 << 31, u32::MAX] {
+            let expected: Vec<_> = (0..32).filter(|&slot| mask & (1 << slot) != 0).collect();
+            assert_eq!(vertex_slot_count(mask), expected.last().map_or(0, |slot| slot + 1));
+            assert_eq!(active_vertex_slots(mask).collect::<Vec<_>>(), expected);
+        }
+    }
 
     #[test]
     fn depth_srv_checks_the_plane_not_the_number_of_levels() {

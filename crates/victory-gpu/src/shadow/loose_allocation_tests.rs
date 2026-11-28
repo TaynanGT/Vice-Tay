@@ -190,6 +190,7 @@ fn readback_bytes(shadow: &Arc<Shadow>, from: u64, len: usize) -> Vec<u8> {
 
 #[test]
 fn unrelated_loose_lookups_and_parallel_allocations_proceed_while_a_window_is_pending() {
+    let _guard = BY_ADDRESS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if host().is_none() || crate::port::on() || crate::inplace::level() >= 1 {
         return;
     }
@@ -270,7 +271,11 @@ fn unrelated_loose_lookups_and_parallel_allocations_proceed_while_a_window_is_pe
 
 #[test]
 fn loose_reselects_concurrent_wider_tail_or_holder_and_gpu_readback_sees_live_bytes() {
-    if host().is_none() || crate::port::on() || crate::inplace::level() >= 1 {
+    let _guard = BY_ADDRESS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(host) = host() else {
+        return;
+    };
+    if crate::port::on() || crate::inplace::level() >= 1 {
         return;
     }
     const STEP: u64 = 256 << 10;
@@ -293,9 +298,9 @@ fn loose_reselects_concurrent_wider_tail_or_holder_and_gpu_readback_sees_live_by
             use_holder: !use_tails,
             grid: if use_tails { WINDOW } else { STEP },
         };
-        let card_bytes_before = WINDOW_CARD_BYTES.load(Ordering::Relaxed);
-
         std::thread::scope(|scope| {
+            let submissions = host.lock_submissions_for_test();
+            let card_bytes_before = WINDOW_CARD_BYTES.load(Ordering::Relaxed);
             let (ready, waiting) = channel();
             let (go, resume) = channel();
             let worker = scope.spawn(move || {
@@ -358,6 +363,8 @@ fn loose_reselects_concurrent_wider_tail_or_holder_and_gpu_readback_sees_live_by
             let again = loose_with(q, |_| panic!("tail/holder hit must not re-allocate")).unwrap();
             assert!(Arc::ptr_eq(&again, &wider));
 
+            // Readback submits a list and takes the submission lock itself.
+            drop(submissions);
             // Prove byte-exact GPU refresh + readback from the published window.
             let got = readback_bytes(&chosen, ask_addr, K64);
             assert!(
@@ -370,6 +377,7 @@ fn loose_reselects_concurrent_wider_tail_or_holder_and_gpu_readback_sees_live_by
 
 #[test]
 fn loose_allocation_failure_leaves_window_open_to_retry() {
+    let _guard = BY_ADDRESS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if host().is_none() || crate::port::on() || crate::inplace::level() >= 1 {
         return;
     }
@@ -382,6 +390,7 @@ fn loose_allocation_failure_leaves_window_open_to_retry() {
 
 #[test]
 fn exact_lookups_and_parallel_allocations_proceed_while_pending_with_gpu_readback() {
+    let _guard = BY_ADDRESS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if host().is_none() {
         return;
     }
@@ -471,6 +480,7 @@ fn exact_lookups_and_parallel_allocations_proceed_while_pending_with_gpu_readbac
 
 #[test]
 fn exact_eviction_keeps_held_entries_and_uses_publish_time_tick() {
+    let _guard = BY_ADDRESS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if host().is_none() {
         return;
     }

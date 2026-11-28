@@ -178,6 +178,15 @@ struct Memory {
     packed_sweep: usize,
     /// Places of pages that are free: the copy, the address in the arena.
     free: Vec<(usize, usize)>,
+    /// Reclaimed single-buffer PC-RAM arena slots waiting for in-flight GPU
+    /// submissions and `bury_lag()` (`until <= finished`) before reuse,
+    /// preventing reuse of pages a running or concurrently recording list may
+    /// still read over PCIe.
+    delayed_free: std::collections::VecDeque<(u64, usize, usize)>,
+    /// Monotonic high-water mark for `delayed_free` target submission numbers
+    /// so `delayed_free` stays strictly ordered even if `STARTED + QUEUED`
+    /// jitters across `behind` / `cut_for` transitions.
+    last_delayed_until: u64,
     /// Copies of title buffers the builder may store in.
     open: std::collections::HashSet<usize>,
     /// Pages taken from faults.
@@ -263,6 +272,8 @@ impl Memory {
             packed_order: Vec::new(),
             packed_sweep: 0,
             free: Vec::new(),
+            delayed_free: std::collections::VecDeque::new(),
+            last_delayed_until: 0,
             open: Default::default(),
             faulted: 0,
             heaps: HashMap::new(),
@@ -389,6 +400,7 @@ impl Memory {
             ONCE.call_once(|| tracing::warn!(MOST, "title memory by address: no more pages are taken; others read zeros"));
             return false;
         }
+        self.drain_delayed_free();
         if let Some((copy, at)) = self.free.pop() {
             self.hold(page, at, copy);
             return true;
@@ -403,12 +415,31 @@ impl Memory {
         true
     }
 
+    /// Moves reclaimed PC-RAM arena slots into `self.free` once every GPU
+    /// submission that could still read them has finished.
+    fn drain_delayed_free(&mut self) {
+        drain_completed_slots(
+            &mut self.delayed_free,
+            &mut self.free,
+            crate::host::submissions().1,
+        );
+    }
+
     /// Another arena's pages.
     fn another(&mut self) -> bool {
         let Some(at) = crate::upload::reserve(ARENA as usize) else {
             return false;
         };
-        let Some(n) = crate::shadow::by_address(at as u64, ARENA).and_then(|s| self.number(s)) else {
+        let Some(n) = crate::shadow::by_address_arena(at as u64, ARENA).and_then(|s| self.number(s)) else {
+            // SAFETY: `at` was allocated directly by `upload::reserve` (`VirtualAlloc2`)
+            // and never handed out after allocation failed.
+            unsafe {
+                windows_sys::Win32::System::Memory::VirtualFree(
+                    at as *mut _,
+                    0,
+                    windows_sys::Win32::System::Memory::MEM_RELEASE,
+                );
+            }
             return false;
         };
         self.arenas.push((n, at));
@@ -432,7 +463,18 @@ impl Memory {
             let Some(held) = self.pages.get_mut(&page) else { continue };
             held.owners = held.owners.saturating_sub(1);
             if held.owners == 0 && held.theirs {
-                self.free.push((held.copy, held.at));
+                if self.copies[held.copy].carded() {
+                    self.free.push((held.copy, held.at));
+                } else {
+                    let until = compute_delayed_until(
+                        crate::host::submissions().0,
+                        crate::queue::queued(),
+                        crate::host::bury_lag_value(),
+                        self.last_delayed_until,
+                    );
+                    self.last_delayed_until = until;
+                    self.delayed_free.push_back((until, held.copy, held.at));
+                }
                 self.pages.remove(&page);
                 // SAFETY: an entry of the directory, under the mutex.
                 unsafe { self.entry(page).write_volatile(0) };
@@ -544,6 +586,7 @@ impl Memory {
             let never = std::mem::replace(&mut held.taken, now.max(1)) == 0;
             let shadow = &self.copies[held.copy];
             let base = held.at - shadow.span().0 as usize;
+            let carded = shadow.carded();
             let mut title = [0u8; PIECE];
             for piece in (0..PAGE as usize).step_by(PIECE) {
                 let from = (page * PAGE) as usize + piece;
@@ -551,9 +594,16 @@ impl Memory {
                 crate::host::copy_mapped(title.as_mut_ptr(), from as *const u8, PIECE, false);
                 // SAFETY: a page of an arena of ours, under the mutex.
                 let ours = unsafe { std::slice::from_raw_parts_mut((held.at + piece) as *mut u8, PIECE) };
-                self.stats.changed += merge(&title, ours, never) as u64 * 4;
+                if carded {
+                    self.stats.changed += merge(&title, ours, never) as u64 * 4;
+                } else {
+                    self.stats.changed += merge_direct(&title, ours, never, |off, bytes| {
+                        shadow.stage_direct(base + piece + off, bytes);
+                    }) as u64
+                        * 4;
+                }
             }
-            if never {
+            if never && carded {
                 shadow.resend(base, base + PAGE as usize);
             }
         }
@@ -636,6 +686,7 @@ impl Memory {
         {
             return false;
         }
+        self.drain_delayed_free();
         let Some((copy, at)) = self.free.pop() else {
             return false;
         };
@@ -667,6 +718,7 @@ impl Memory {
         let Some(held) = self.pages.get(&page) else { return };
         let shadow = &self.copies[held.copy];
         let base = held.at - shadow.span().0 as usize;
+        let carded = shadow.carded();
         let mut title = [0u8; PIECE];
         let mut at = from;
         while at < to {
@@ -674,13 +726,24 @@ impl Memory {
             crate::host::copy_mapped(title.as_mut_ptr(), (page as usize * PAGE as usize + at) as *const u8, n, false);
             // SAFETY: a page of an arena of ours, under the mutex.
             let ours = unsafe { std::slice::from_raw_parts_mut((held.at + at) as *mut u8, n) };
-            if *ours != title[..n] {
-                ours.copy_from_slice(&title[..n]);
-                crate::watch::wrote(held.at + at, n);
+            if carded {
+                if *ours != title[..n] {
+                    ours.copy_from_slice(&title[..n]);
+                    crate::watch::wrote(held.at + at, n);
+                }
+            } else if whole {
+                if *ours != title[..n] {
+                    ours.copy_from_slice(&title[..n]);
+                }
+                shadow.stage_direct(base + at, &title[..n]);
+            } else {
+                merge_direct_slice(&title[..n], ours, |off, bytes| {
+                    shadow.stage_direct(base + at + off, bytes);
+                });
             }
             at += n;
         }
-        if whole {
+        if whole && carded {
             shadow.resend(base + from, base + to);
         }
     }
@@ -847,6 +910,22 @@ impl Memory {
             s.left as f64 / frames,
             faults_all()
         );
+        // Where the copies shaders walk lie: a read of PC system memory crosses
+        // the PCIe bus (telemetry ported from avatarmanz).
+        let arena = |n: usize| self.arenas.iter().any(|a| a.0 == n);
+        let (mut pc, mut pc_mb, mut pc_arenas) = (0usize, 0u64, 0usize);
+        for (n, shadow) in self.copies.iter().enumerate() {
+            if is_in_pc(&shadow.buffer) {
+                pc += 1;
+                pc_mb += shadow.span().1 >> 20;
+                pc_arenas += usize::from(arena(n));
+            }
+        }
+        tracing::info!(
+            "title memory by address: of the {} copies, {pc} in the PC's memory ({pc_mb} MB; arenas {pc_arenas} of {})",
+            self.copies.len(),
+            self.arenas.len()
+        );
         self.stats.from = Some((now, self.frame));
     }
 }
@@ -932,6 +1011,17 @@ fn packed_len(header: u64) -> Option<u64> {
     (version & 0xFFFF == 6 && marks & 0x8100 == 0x8100 && nodes > 0 && len <= PACKED).then_some(len)
 }
 
+/// Whether `buffer` resides in PC system memory (PCIe) rather than local GPU
+/// VRAM (`D3D12_HEAP_TYPE_DEFAULT` or `D3D12_MEMORY_POOL_L1`).
+pub(crate) fn is_in_pc(buffer: &ID3D12Resource) -> bool {
+    let mut props = D3D12_HEAP_PROPERTIES::default();
+    // SAFETY: a live committed buffer.
+    unsafe { buffer.GetHeapProperties(Some(&mut props), None) }.is_ok()
+        && props.Type != D3D12_HEAP_TYPE_DEFAULT
+        && !(props.Type == D3D12_HEAP_TYPE_CUSTOM
+            && props.MemoryPoolPreference == D3D12_MEMORY_POOL_L1)
+}
+
 /// Puts what `title` holds into `ours` (what was last taken): the dwords that
 /// differ. How many.
 fn merge(title: &[u8; PIECE], ours: &mut [u8], never: bool) -> usize {
@@ -950,6 +1040,83 @@ fn merge(title: &[u8; PIECE], ours: &mut [u8], never: bool) -> usize {
         }
     }
     changed
+}
+
+/// Like [`merge`], also invoking `write(offset, bytes)` for only the changed
+/// dwords so a single-buffer PC-RAM arena updates without clobbering adjacent
+/// GPU-written dwords in the same 4 KiB page.
+fn merge_direct(
+    title: &[u8; PIECE],
+    ours: &mut [u8],
+    never: bool,
+    mut write: impl FnMut(usize, &[u8]),
+) -> usize {
+    if never {
+        ours.copy_from_slice(title);
+        write(0, title);
+        return PIECE / 4;
+    }
+    if ours == title {
+        return 0;
+    }
+    let mut changed = 0;
+    for (i, (t, o)) in title.chunks_exact(4).zip(ours.chunks_exact_mut(4)).enumerate() {
+        if t != o {
+            o.copy_from_slice(t);
+            write(i * 4, t);
+            changed += 1;
+        }
+    }
+    changed
+}
+
+/// Byte/dword selective merge for an arbitrary slice inside a page (used by
+/// [`Memory::take`] on single-buffer PC-RAM arenas).
+fn merge_direct_slice(title: &[u8], ours: &mut [u8], mut write: impl FnMut(usize, &[u8])) {
+    if ours == title {
+        return;
+    }
+    let mut off = 0;
+    while off + 4 <= title.len() {
+        let t = &title[off..off + 4];
+        let o = &mut ours[off..off + 4];
+        if t != o {
+            o.copy_from_slice(t);
+            write(off, t);
+        }
+        off += 4;
+    }
+    if off < title.len() && ours[off..] != title[off..] {
+        ours[off..].copy_from_slice(&title[off..]);
+        write(off, &title[off..]);
+    }
+}
+
+/// Computes a strictly monotonic completion target for recycling a single-buffer
+/// PC-RAM arena slot, incorporating `bury_lag()` (at least 1 submission so an
+/// idle queue never recycles a slot referenced by a concurrently recording list)
+/// and conservative headroom (`4x` queued jobs) for `cut_for`-split submissions.
+fn compute_delayed_until(started: u64, queued: u64, lag: u64, last_until: u64) -> u64 {
+    started
+        .saturating_add(queued.saturating_mul(4))
+        .saturating_add(lag.max(1))
+        .max(last_until)
+}
+
+/// Moves every front entry in `delayed` whose GPU submission number is `<= finished`
+/// into `free`.
+fn drain_completed_slots(
+    delayed: &mut std::collections::VecDeque<(u64, usize, usize)>,
+    free: &mut Vec<(usize, usize)>,
+    finished: u64,
+) {
+    while let Some(&(until, copy, at)) = delayed.front() {
+        if until > finished {
+            break;
+        }
+        delayed.pop_front();
+        free.push((copy, at));
+    }
 }
 
 /// Before a draw whose shader reads title memory by address: what its
@@ -990,7 +1157,8 @@ pub(crate) fn ready(
     if builds && sizes_wait() && asks_size(written, constants, threads) {
         list.first_use(SIZES);
     }
-    while builds && m.free.len() < SPARE && m.pages.len() + m.free.len() < MOST && m.another() {}
+    m.drain_delayed_free();
+    while builds && m.free.len() < SPARE && m.pages.len() + m.free.len() + m.delayed_free.len() < MOST && m.another() {}
     m.stats.uses[usize::from(builds)] += 1;
     // Once per list and page named: the builder dispatches hundreds of times
     // a frame with the same arguments.
@@ -1364,5 +1532,78 @@ mod tests {
         assert_eq!(packed_len(header(0x8102_0007, 5)), None);
         assert_eq!(packed_len(header(0x8102_0006, 0)), None);
         assert_eq!(packed_len(header(0x8102_0006, 1 << 21)), None);
+    }
+
+    #[test]
+    fn merge_direct_preserves_untouched_gpu_dwords() {
+        let mut title = [0u8; PIECE];
+        title[0..4].copy_from_slice(&[1, 2, 3, 4]);
+        title[16..20].copy_from_slice(&[5, 6, 7, 8]);
+        let mut ours = vec![0u8; PIECE];
+        let mut gpu = vec![0xFFu8; PIECE];
+        assert_eq!(
+            merge_direct(&title, &mut ours, true, |off, bytes| {
+                gpu[off..off + bytes.len()].copy_from_slice(bytes);
+            }),
+            PIECE / 4
+        );
+        assert_eq!(gpu, title);
+        // Simulate GPU builder writing dword at offset 8 without title changing it.
+        gpu[8..12].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        // Title changes only dword at offset 16.
+        title[16..20].copy_from_slice(&[9, 10, 11, 12]);
+        assert_eq!(
+            merge_direct(&title, &mut ours, false, |off, bytes| {
+                gpu[off..off + bytes.len()].copy_from_slice(bytes);
+            }),
+            1
+        );
+        assert_eq!(&gpu[16..20], &[9, 10, 11, 12]);
+        assert_eq!(
+            &gpu[8..12],
+            &[0xAA, 0xBB, 0xCC, 0xDD],
+            "untouched GPU-written dword in the same 4 KiB page must stay intact"
+        );
+    }
+
+    #[test]
+    fn is_in_pc_distinguishes_vram_and_shared_buffers() {
+        let Some(host) = host() else {
+            eprintln!("no host GPU; skipped");
+            return;
+        };
+        let vram = host.uav_buffer(4096).expect("uav_buffer");
+        let (shared, _) = host.shared_buffer(4096).expect("shared_buffer");
+        assert!(!is_in_pc(&vram), "DEFAULT heap uav_buffer must not report PC RAM");
+        assert!(is_in_pc(&shared), "shared_buffer must report PC RAM");
+    }
+
+    #[test]
+    fn delayed_free_holds_pc_ram_slot_until_flight_completes() {
+        // Even when `started == finished` and `queued == 0`, target exceeds
+        // `finished` (respecting `bury_lag`, minimum 1) so recording lists are safe.
+        let t0 = compute_delayed_until(10, 0, 16, 0);
+        assert_eq!(t0, 26);
+        assert!(t0 > 10);
+        // Even when `VICTORY_BURY_LAG=0`, waits at least 1 submission.
+        assert_eq!(compute_delayed_until(10, 0, 0, 0), 11);
+        // Monotonic clamping when `started + queued` jitters downward across
+        // concurrent `behind` / `cut_for` transitions.
+        let t1 = compute_delayed_until(10, 3, 16, 0); // 10 + 12 + 16 = 38
+        let t2 = compute_delayed_until(11, 1, 16, t1); // 11 + 4 + 16 = 31 -> clamped to 38
+        assert_eq!(t1, 38);
+        assert_eq!(t2, 38);
+
+        let mut delayed = std::collections::VecDeque::from([(t0, 1usize, 0x10000), (t1, 1, 0x20000)]);
+        let mut free = Vec::new();
+        drain_completed_slots(&mut delayed, &mut free, 25);
+        assert!(free.is_empty());
+        assert_eq!(delayed.len(), 2);
+        drain_completed_slots(&mut delayed, &mut free, 26);
+        assert_eq!(free, vec![(1, 0x10000)]);
+        assert_eq!(delayed.len(), 1);
+        drain_completed_slots(&mut delayed, &mut free, 38);
+        assert_eq!(free, vec![(1, 0x10000), (1, 0x20000)]);
+        assert!(delayed.is_empty());
     }
 }

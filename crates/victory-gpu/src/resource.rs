@@ -2173,8 +2173,10 @@ pub(crate) fn let_go_idle() {
     // The card's room says nothing of the PC's: what the card spills to
     // system memory is commit too. Short of it ([`crate::residency::pressured`]),
     // idle copies go after seconds, not the minutes room on the card keeps them.
+    let vram_req = VRAM_EVICT_REQUEST.swap(0, std::sync::atomic::Ordering::AcqRel);
     let (idle_ms, most) = match memory {
         _ if crate::residency::pressured() => (5_000, u64::MAX),
+        _ if vram_req > 0 => (5_000, vram_req),
         Some([budget, used, ..]) if keep => {
             let used = used
                 .saturating_sub(crate::pool::texture_room().saturating_add(crate::tiles::free_bytes()))
@@ -2276,6 +2278,23 @@ pub(crate) fn let_go_idle() {
                 first.unwrap_or(0)
             )
         });
+    }
+}
+
+/// Bytes of unpinned LRU texture eviction requested by
+/// [`crate::shadow::by_address`] when local VRAM approaches budget so
+/// subsequent BVH arena allocations stay in VRAM. Consumed on the single
+/// submitting thread by [`let_go_idle`] (preserving its `>= 5 s` idle window
+/// and avoiding any `MEMORY -> TEXTURES` lock nesting).
+#[cfg(windows)]
+static VRAM_EVICT_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Requests that [`let_go_idle`] evict up to `target_bytes` of unpinned,
+/// title-filled LRU texture copies on the submitting thread.
+#[cfg(windows)]
+pub(crate) fn request_vram_eviction(target_bytes: u64) {
+    if target_bytes > 0 {
+        VRAM_EVICT_REQUEST.fetch_max(target_bytes, std::sync::atomic::Ordering::AcqRel);
     }
 }
 

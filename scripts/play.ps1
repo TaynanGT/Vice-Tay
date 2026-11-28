@@ -2,6 +2,8 @@
 #   scripts\play.ps1 -Exe <path of your own copy's executable>
 # -Safe         without the newer, faster ways (the first thing to try when something is wrong)
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
+# -FullBright   use fixed ambient light with ray tracing and ambient shading off
+# -UnifiedGraphics  try VIctoryUnified's lighting and paired Wave64 settings
 # -Windowed     a window instead of the whole screen (full screen is the default)
 # -NoPanel      without the performance panel (on by default, F3 hides it while playing)
 # -SkipShaders  start even when the shader cache is cold (otherwise every shader is translated first)
@@ -40,7 +42,9 @@ param(
     [ValidateRange(0.0, 1000.0)][double]$FrameIntervalMs,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [ValidateSet('auto', '7900xtx', '4070', '4070tisuper', '4090', '3060', 'laptop')][string]$Machine = 'auto',
-    [hashtable]$More = @{}
+    [hashtable]$More = @{},
+    [switch]$FullBright,
+    [switch]$UnifiedGraphics
 )
 $settings = @{
     VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
@@ -246,10 +250,22 @@ if ($Dlss4K) { $settings.VICTORY_DLSS_4K = $Dlss4K.ToLowerInvariant() }
 if ($PSBoundParameters.ContainsKey('FrameIntervalMs')) {
     $settings.VICTORY_FRAME_INTERVAL_MS = $FrameIntervalMs.ToString([Globalization.CultureInfo]::InvariantCulture)
 }
+if ($UnifiedGraphics) {
+    $settings.VICTORY_AMBIENT_AIR = '1.5'
+    $settings.VICTORY_LEVELS_ON_DEMAND = '0'
+    $settings.VICTORY_F16_NEAREST = '1'
+    $settings.VICTORY_WAVE64_PAIRED = '1'
+    $settings.VICTORY_E5_TARGETS = 'r11g11b10'
+}
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
+if ($FullBright) {
+    $settings.VICTORY_BVH_BUILDER = '0'
+    $settings.VICTORY_AMBIENT = 'constant:1.0'
+    $settings.VICTORY_AMBIENT_SHADE = '0'
+}
 
 $profile = if ($autoNvidia) { 'automatic NVIDIA profile' } else { $Machine }
-Write-Host "Settings for the $profile$(if ($Safe) { ', safe' })$(if ($RayTracing) { ', with ray tracing' })."
+Write-Host "Settings for the $profile$(if ($Safe) { ', safe' })$(if ($UnifiedGraphics) { ', with Unified graphics' })$(if ($FullBright) { ', with fixed ambient light' } elseif ($RayTracing) { ', with ray tracing' })."
 if ($autoAdds.Contains('VICTORY_CARD_BUFFERS_MIN_KB')) {
     $preset = if ($cardGb -ge 15) { '4070tisuper' } else { '4070' }
     Write-Host ("This NVIDIA card has $cardGb GB: title buffers go to the card's memory, with the memory settings of " +

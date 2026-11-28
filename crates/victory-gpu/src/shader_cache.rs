@@ -152,6 +152,9 @@ fn build() -> [u8; 32] {
         if victory_shader::emit::constants_raw() {
             bytes.extend_from_slice(b"VICTORY_PORT_CBV=1");
         }
+        if std::env::var_os("VICTORY_WAVE64_PAIRED").is_some_and(|v| v == "1") {
+            bytes.extend_from_slice(b"VICTORY_WAVE64_PAIRED=1\0");
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();

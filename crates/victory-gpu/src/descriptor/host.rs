@@ -5722,6 +5722,7 @@ mod tests {
     /// takes: the device, which such a view removes, stays.
     #[test]
     fn an_oversized_constant_buffer_view_leaves_the_device_alive() {
+        let _guard = crate::shadow::BY_ADDRESS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(host) = host() else {
             return; // no host GPU
         };
@@ -5963,6 +5964,7 @@ mod tests {
     /// brought up to date for it; another's is its buffer's.
     #[test]
     fn views_off_their_elements_get_a_copy_of_their_bytes() {
+        let _guard = crate::shadow::BY_ADDRESS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(host) = host() else {
             return; // no host GPU here
         };
@@ -6706,6 +6708,8 @@ mod tests {
     #[test]
     fn dynamic_slots_populate_and_clear_view_metadata() {
         use victory_shader::emit::{VIEW_ADDRESSES, VIEW_INTEGER, VIEW_SIGNED};
+
+        let _guard = crate::shadow::BY_ADDRESS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(heap) = HostHeap::new(false, 4) else {
             return; // no host GPU
         };

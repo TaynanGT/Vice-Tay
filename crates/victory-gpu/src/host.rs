@@ -6903,6 +6903,12 @@ impl Host {
         self.submit(runs, &[], false, None, None).fence
     }
 
+    /// Keeps submission-time sweeps and dirty-run drains out of accounting tests.
+    #[cfg(test)]
+    pub(crate) fn lock_submissions_for_test(&self) -> std::sync::MutexGuard<'_, u64> {
+        self.submitted.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Runs a closed internal upload-only host list synchronously without
     /// draining title queues (`queue::before_sync`), so it is deadlock-safe
     /// when invoked from `VICTORY_THIN=1` worker threads. Settles in-flight
@@ -12659,6 +12665,7 @@ mod refresh_tests {
 
     #[test]
     fn raw_title_copy_preserves_overlap_in_either_direction() {
+        let _guard = crate::shadow::BY_ADDRESS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _one = crate::watch::one_asking_test();
         let input: Vec<u8> = (0..12_555).map(|i| (i % 251) as u8).collect();
         for (src, dst) in [(0, 13), (13, 0)] {
@@ -12673,6 +12680,8 @@ mod refresh_tests {
 
     #[test]
     fn raw_title_copy_keeps_write_watch_and_resends_equal_bytes() {
+        let _guard = crate::shadow::BY_ADDRESS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _submissions = super::host().map(super::Host::lock_submissions_for_test);
         let _one = crate::watch::one_asking_test();
         let dst = title(PAGE, false);
         let value = [0u8; 16];
@@ -12701,6 +12710,8 @@ mod refresh_tests {
     fn raw_title_copy_tolerates_decommit_after_a_mapping_check() {
         use super::{copy_raw_spans, copy_raw_title};
         use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, MEM_RELEASE, VirtualFree};
+
+        let _guard = crate::shadow::BY_ADDRESS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _one = crate::watch::one_asking_test();
         let len = 2 * crate::watch::RAW_COPY_WATCH_LIMIT;
         let src = memory(len) as usize;

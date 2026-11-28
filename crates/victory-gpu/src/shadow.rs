@@ -384,6 +384,8 @@ impl CopiedPages {
     }
 }
 
+pub(crate) type DirectRuns = Vec<(usize, Vec<u8>)>;
+
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
     /// Title memory's pages of 4 KiB (from the one `start` lies in on), a bit
@@ -470,7 +472,7 @@ pub(crate) struct Shadow {
     /// PC-RAM [`by_address`] copy (`!carded()`). Drained by [`direct_dirty`] in
     /// `Host::card_before` and copied via `CopyBufferRegion` so the CPU never
     /// writes directly into live GPU-readable shared memory while flights run.
-    direct_pending: Option<Mutex<Vec<(usize, Vec<u8>)>>>,
+    direct_pending: Option<Mutex<DirectRuns>>,
     /// A window in card memory the CPU maps ([`window_mapped_for`]).
     mapped: bool,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
@@ -647,6 +649,11 @@ static BY_ADDRESS_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
 /// Bytes reserved against `VICTORY_MEMORY_CARD_MB` for VRAM [`by_address`] copies.
 static BY_ADDRESS_USED: AtomicU64 = AtomicU64::new(0);
 
+// Serializes tests that observe or change arena/window accounting and dirty runs.
+// Take this before the host submission lock when both are needed.
+#[cfg(test)]
+pub(crate) static BY_ADDRESS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Local-VRAM buffer breakdown for the HUD: `[card_buffers_and_windows, bvh_arenas]`.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn vram_breakdown() -> [u64; 2] {
@@ -750,7 +757,7 @@ static DIRECT_ARENAS: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new(
 /// Coalesces chronological `(offset, bytes)` writes into strictly sorted,
 /// non-overlapping runs (later writes overwrite earlier writes on overlap) so
 /// D3D12 `CopyBufferRegion` calls never target overlapping destination ranges.
-fn coalesce_direct_runs(runs: Vec<(usize, Vec<u8>)>) -> Vec<(usize, Vec<u8>)> {
+fn coalesce_direct_runs(runs: DirectRuns) -> DirectRuns {
     if runs.len() <= 1 {
         return runs;
     }
@@ -791,7 +798,7 @@ fn coalesce_direct_runs(runs: Vec<(usize, Vec<u8>)>) -> Vec<(usize, Vec<u8>)> {
 /// Drains staged byte runs for every live spilled single-buffer PC-RAM
 /// [`by_address`] copy so `Host::card_before` uploads them via GPU-ordered
 /// `CopyBufferRegion` ahead of the next submission.
-pub(crate) fn direct_dirty() -> Vec<(Arc<Shadow>, Vec<(usize, Vec<u8>)>)> {
+pub(crate) fn direct_dirty() -> Vec<(Arc<Shadow>, DirectRuns)> {
     let mut arenas = DIRECT_ARENAS.lock().unwrap_or_else(|e| e.into_inner());
     let mut out = Vec::new();
     arenas.retain(|weak| {
@@ -7590,6 +7597,8 @@ mod copied_and_take_tests {
 
     #[test]
     fn lock_free_card_dirty_and_sent_mirrors_match_transitions() {
+        let _guard = BY_ADDRESS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _submissions = host().map(crate::host::Host::lock_submissions_for_test);
         let mut title = vec![0x11u8; PAGE];
         let mut side = vec![0x11u8; PAGE];
         let start = title.as_ptr() as usize;
@@ -7903,6 +7912,7 @@ mod copied_and_take_tests {
         use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
         use windows::core::Interface;
 
+        let _guard = BY_ADDRESS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(host) = host() else {
             eprintln!("no host GPU; skipped");
             return;
@@ -7910,6 +7920,7 @@ mod copied_and_take_tests {
         if !cards() || !host.card_ready() {
             return;
         }
+        let _submissions = host.lock_submissions_for_test();
         let len = 64 * 1024u64;
         let mut backing = vec![0xAAu8; len as usize];
         let before_bvh = BY_ADDRESS_CARD_BYTES.load(Ordering::Relaxed);
@@ -7917,6 +7928,7 @@ mod copied_and_take_tests {
         let before_used = BY_ADDRESS_USED.load(Ordering::Relaxed);
         let shadow = by_address_inner(backing.as_ptr() as u64, len, true, true)
             .expect("single-buffer PC-RAM fallback allocates");
+        assert!(!shadow.by_address_card);
         assert!(!shadow.carded(), "spilled PC-RAM arena must not allocate duplicate staging");
         assert!(shadow.card_sides().is_none(), "no Card/staging handle on PC-RAM spill");
         assert!(crate::memory::is_in_pc(&shadow.buffer), "buffer must report PC system memory");
@@ -8031,6 +8043,7 @@ mod copied_and_take_tests {
 
     #[test]
     fn by_address_vram_arena_tracks_and_releases_card_bytes() {
+        let _guard = BY_ADDRESS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(host) = host() else {
             eprintln!("no host GPU; skipped");
             return;
@@ -8038,6 +8051,7 @@ mod copied_and_take_tests {
         if !cards() || !host.card_ready() {
             return;
         }
+        let _submissions = host.lock_submissions_for_test();
         let len = 64 * 1024u64;
         let backing = vec![0u8; len as usize];
         let before_bvh = BY_ADDRESS_CARD_BYTES.load(Ordering::Relaxed);
@@ -8045,6 +8059,7 @@ mod copied_and_take_tests {
         let before_used = BY_ADDRESS_USED.load(Ordering::Relaxed);
         let shadow = by_address_arena(backing.as_ptr() as u64, len).expect("arena allocates");
         if shadow.carded() {
+            assert!(shadow.by_address_card);
             assert!(!crate::memory::is_in_pc(&shadow.buffer), "VRAM arena must not report PC RAM");
             assert_eq!(BY_ADDRESS_CARD_BYTES.load(Ordering::Relaxed), before_bvh + len);
             assert_eq!(

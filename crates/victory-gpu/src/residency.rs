@@ -1,4 +1,4 @@
-﻿//! Host-memory admission for speculative texture work and reusable upload storage.
+//! Host-memory admission for speculative texture work and reusable upload storage.
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
@@ -8,7 +8,7 @@ const GIB: u64 = 1 << 30;
 static PRESSURED: AtomicBool = AtomicBool::new(false);
 static HEADROOM: AtomicU64 = AtomicU64::new(u64::MAX);
 
-fn memory_status() -> Option<MEMORYSTATUSEX> {
+pub(crate) fn memory_status() -> Option<MEMORYSTATUSEX> {
     // SAFETY: the API initializes the fields of a correctly sized structure.
     let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;

@@ -58,6 +58,7 @@ pub(crate) struct Host {
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
     adapter: Option<IDXGIAdapter3>,
+    autotune_ram_budget_mb: Option<u64>,
     /// 1-descriptor shader-visible fallback heaps bound when a command list
     /// omits a view or sampler heap while using directly-indexed root signatures.
     fallback_view: OnceLock<Option<ID3D12DescriptorHeap>>,
@@ -564,7 +565,7 @@ fn sweep() {
     if let Some(host) = host { host.trim_title_stock(memory); }
     crate::pool::room(memory);
     crate::pipeline::trim_library();
-    crate::shadow::let_go_idle();
+    crate::shadow::let_go_idle(host.and_then(|h| h.autotune_ram_budget_mb));
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
 }
@@ -1406,8 +1407,9 @@ pub(crate) fn host() -> Option<&'static Host> {
 fn create() -> windows::core::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
-        // The debug layer only in builds with diagnostics.
-        let debug = cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_DEBUG");
+        // Unit tests also exercise the hardware debug and WARP switches.
+        let diagnostics = cfg!(any(feature = "diagnostics", test));
+        let debug = diagnostics && crate::switch::on("VICTORY_D3D12_DEBUG");
         if debug {
             let mut layer: Option<ID3D12Debug> = None;
             match D3D12GetDebugInterface(&mut layer) {
@@ -1456,7 +1458,7 @@ fn create() -> windows::core::Result<Host> {
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP") {
+        if diagnostics && crate::switch::on("VICTORY_D3D12_WARP") {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
@@ -1524,9 +1526,12 @@ fn create() -> windows::core::Result<Host> {
                 ..Default::default()
             })?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
-        let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
-            .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
-            .ok();
+        let factory = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)).ok();
+        let adapter = factory.as_ref().and_then(|factory| {
+            factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()).ok()
+        });
+        let autotune_ram_budget_mb = crate::autotune::startup(&device, factory.as_ref(), adapter.as_ref());
+        drop(factory);
         if let Some(desc) = adapter.as_ref().and_then(|a| a.GetDesc1().ok()) {
             let name = String::from_utf16_lossy(&desc.Description);
             tracing::info!(
@@ -1554,6 +1559,7 @@ fn create() -> windows::core::Result<Host> {
             presenter: Mutex::new(None),
             title_stock: Default::default(),
             adapter,
+            autotune_ram_budget_mb,
             fallback_view: OnceLock::new(),
             fallback_sampler: OnceLock::new(),
             texture_readbacks: ReadbackPool::new(),
@@ -1591,6 +1597,9 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
         Ok(adapter)
     }
 }
+
+#[cfg(test)]
+mod autotune_tests;
 
 #[cfg(test)]
 mod tests {

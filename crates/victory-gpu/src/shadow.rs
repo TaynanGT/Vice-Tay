@@ -1607,7 +1607,7 @@ mod after_landing_tests {
 
 #[cfg(test)]
 mod precise_tests {
-    use super::{CardWrote, precise_runs, put_title_changes};
+    use super::{CardWrote, precise_runs, put_title_changes, widen_to_dwords};
 
     fn bytes(runs: &[(usize, usize)], n: usize) -> Vec<bool> {
         let mut map = vec![false; n];
@@ -1715,6 +1715,56 @@ mod precise_tests {
         assert_eq!(wrote.note(2, 256 / 4, 0, &now, &held), 3);
         assert_eq!(wrote.note(9, 256 / 4, 0, &held, &held), 0);
         assert!(!wrote.owns(5), "a jump of epochs forgets both");
+    }
+
+    /// The one-pass dword map: at any offset and length (dwords split at
+    /// both ends, pieces over map words), exactly the dwords with a byte
+    /// that differs are owned, and the count is the bytes that differ.
+    #[test]
+    fn the_dword_map_holds_exactly_the_dwords_that_differ() {
+        for seed in 0..400u64 {
+            let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+            let mut next = |m: u64| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x % m) as usize
+            };
+            let copy = 2048;
+            let at = next(600);
+            let n = next((copy - at) as u64 + 1);
+            let held: Vec<u8> = (0..n).map(|_| next(256) as u8).collect();
+            let mut now = held.clone();
+            for _ in 0..next(10) {
+                if n == 0 {
+                    break;
+                }
+                let (a, m) = (next(n as u64), 1 + next(70));
+                (a..(a + m).min(n)).for_each(|i| now[i] ^= 1 + next(255) as u8);
+            }
+            let wrote = CardWrote::default();
+            let differ = (0..n).filter(|&i| now[i] != held[i]).count() as u64;
+            assert_eq!(wrote.note(0, copy / 4, at, &now, &held), differ, "seed {seed}");
+            for off in 0..copy {
+                let dword = off / 4;
+                let want = (0..n).any(|i| (at + i) / 4 == dword && now[i] != held[i]);
+                assert_eq!(wrote.owns(off), want, "seed {seed} offset {off} (at {at}, n {n})");
+            }
+        }
+    }
+
+    /// Widened runs cover whole dwords of the copy within the part, cover
+    /// every byte they did, and are in order and apart.
+    #[test]
+    fn widened_runs_are_whole_dwords_within_the_part() {
+        let mut runs = vec![(1, 1), (3, 2), (9, 1), (20, 4), (31, 1)];
+        // The part begins at copy offset 2: copy dwords begin at part
+        // offsets 2, 6, 10, ...; it is 32 bytes long.
+        assert_eq!(widen_to_dwords(&mut runs, 2, 32), 5);
+        assert_eq!(runs, vec![(0, 10), (18, 8), (30, 2)]);
+        let mut aligned = vec![(0, 4), (8, 8)];
+        assert_eq!(widen_to_dwords(&mut aligned, 0, 64), 0);
+        assert_eq!(aligned, vec![(0, 4), (8, 8)]);
     }
 }
 
@@ -3040,7 +3090,13 @@ const MP_UD_PUT: usize = 15;
 const MP_UD_LEFT: usize = 16;
 const MP_UD_CARD: usize = 17;
 const MP_UNWATCHED_PAGES: usize = 18;
-static PRECISE: [AtomicU64; 19] = [const { AtomicU64::new(0) }; 19];
+/// ns of [`Shadow::merge_precise`] waiting for the copy's locks, and in all.
+const MP_LOCK_NS: usize = 19;
+const MP_NS: usize = 20;
+/// Runs widened to whole dwords of a copy in the card's memory (they go up
+/// as pairs of one dispatch, not as copies of their own).
+const MP_WIDENED: usize = 21;
+static PRECISE: [AtomicU64; 22] = [const { AtomicU64::new(0) }; 22];
 
 /// The most bytes of a copy in the PC's memory with stores not declared
 /// that [`merge_precise`] keeps title memory's bytes for
@@ -3084,6 +3140,40 @@ fn precise_runs(
         }
     }
     (put, out)
+}
+
+/// What [`Shadow::merge_precise`] made of one page part (on any thread).
+enum PreciseDone {
+    /// Nothing of it in the range.
+    Skip,
+    /// Title memory not there.
+    Unread,
+    /// Over the runs the submission sends up: left for the landing.
+    Budget { lo: usize, hi: usize, n: usize },
+    /// Compared and put in: `runs` (offsets of the copy) go up for a copy in
+    /// the card's memory; `out_bytes` of the title's changes stay out.
+    Done { lo: usize, hi: usize, n: usize, page: usize, runs: Vec<(usize, usize)>, count: usize, bytes: usize, out_bytes: usize, widened: usize },
+}
+
+/// Runs `(offset, bytes)` of a page part beginning at offset `at` of the
+/// copy, `n` bytes long, made whole dwords of the copy (within the part),
+/// joined where they then meet. Returns how many runs grew.
+fn widen_to_dwords(runs: &mut Vec<(usize, usize)>, at: usize, n: usize) -> usize {
+    let mut widened = 0;
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
+    for &(r, m) in runs.iter() {
+        let lo = ((at + r) & !3).max(at) - at;
+        let hi = ((at + r + m + 3) & !3).min(at + n) - at;
+        if lo != r || hi != r + m {
+            widened += 1;
+        }
+        match out.last_mut() {
+            Some(last) if last.0 + last.1 >= lo => last.1 = last.1.max(hi - last.0),
+            _ => out.push((lo, hi - lo)),
+        }
+    }
+    *runs = out;
+    widened
 }
 
 /// Of a copy with stores not declared, in the PC's memory: `title` (title
@@ -3130,13 +3220,55 @@ impl CardWrote {
             }
         }
         let map = self.map((self.epoch.load(Ordering::Relaxed) % 2) as usize, dwords);
-        let mut noted = 0;
-        for (first, n) in changed_runs(now, held) {
-            let (lo, hi) = ((at + first) / 4, (at + first + n).div_ceil(4));
-            for dword in lo..hi.min(dwords) {
-                map[dword / 64].fetch_or(1 << (dword % 64), Ordering::Relaxed);
+        let n = now.len().min(held.len());
+        let (now, held) = (&now[..n], &held[..n]);
+        // One pass, a mask of up to 64 dwords at a time and one atomic or
+        // per map word that gains a bit: a byte loop and an atomic per dword
+        // cost run 840 about 90 ms of the landing threads a frame (~45 MB
+        // noted), and the submitting thread waited behind those landings.
+        let mut noted = 0u64;
+        let put = |dword: usize, mask: u64| {
+            if mask != 0 && dword < dwords {
+                let w = &map[dword / 64];
+                if w.load(Ordering::Relaxed) & mask != mask {
+                    w.fetch_or(mask, Ordering::Relaxed);
+                }
             }
-            noted += n as u64;
+        };
+        // Bytes before the first whole dword of the copy (all in one dword).
+        let head = ((4 - at % 4) % 4).min(n);
+        if head > 0 && now[..head] != held[..head] {
+            noted += (0..head).filter(|&i| now[i] != held[i]).count() as u64;
+            put(at / 4, 1 << (at / 4 % 64));
+        }
+        let first = (at + head) / 4;
+        let whole = (n - head) / 4;
+        let mut d = 0;
+        while d < whole {
+            let dword = first + d;
+            if dword >= dwords {
+                break;
+            }
+            // Up to the end of this map word.
+            let k = (64 - dword % 64).min(whole - d);
+            let (a, b) = (&now[head + d * 4..head + (d + k) * 4], &held[head + d * 4..head + (d + k) * 4]);
+            if a != b {
+                let mut mask = 0u64;
+                for (j, (x, y)) in a.chunks_exact(4).zip(b.chunks_exact(4)).enumerate() {
+                    let diff = u32::from_ne_bytes([x[0], x[1], x[2], x[3]]) ^ u32::from_ne_bytes([y[0], y[1], y[2], y[3]]);
+                    mask |= ((diff != 0) as u64) << j;
+                    // (The bytes that differ: what the line counts.)
+                    noted += diff.to_ne_bytes().iter().filter(|&&b| b != 0).count() as u64;
+                }
+                put(dword, mask << (dword % 64));
+            }
+            d += k;
+        }
+        // The bytes after the last whole dword (all in one dword).
+        let tail = head + whole * 4;
+        if tail < n && now[tail..] != held[tail..] {
+            noted += (tail..n).filter(|&i| now[i] != held[i]).count() as u64;
+            put((at + tail) / 4, 1 << ((at + tail) / 4 % 64));
         }
         noted
     }
@@ -3462,7 +3594,7 @@ pub(crate) fn after_landing_line(frames: f64) {
          no reference, {:.1} pages over the runs a submission sends up, {:.1} pages not there; {:.2} MB a frame the landings found \
          the card wrote (noted by dword); copies with stores not declared: {:.0} made protected in the PC's memory since the last line \
          ({:.0} too big, refreshed as before), {:.3} MB the title changed put in, {:.2} MB left as the card has them; {:.1} refreshes of such copies \
-         in the card's memory taken by their changes",
+         in the card's memory taken by their changes; {:.2} ms a frame on the submitting thread, {:.2} of it waiting for the copies'          locks (pages on threads with VICTORY_UNDER_WIDE); {:.1} runs of copies in the card's memory widened to whole dwords",
         f(MP_PAGES),
         mb(MP_COMPARED),
         f(MP_UNWATCHED_PAGES),
@@ -3483,6 +3615,9 @@ pub(crate) fn after_landing_line(frames: f64) {
         mb(MP_UD_PUT),
         mb(MP_UD_LEFT),
         f(MP_UD_CARD),
+        s[MP_NS] as f64 / 1e6 / frames,
+        s[MP_LOCK_NS] as f64 / 1e6 / frames,
+        f(MP_WIDENED),
     );
 }
 
@@ -5566,6 +5701,7 @@ impl Shadow {
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
             static CARD: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
+        let began = std::time::Instant::now();
         let busy = joined(busy);
         AFTER_LANDING[AL_COPIES].fetch_add(1, Ordering::Relaxed);
         AFTER_LANDING[AL_RANGES].fetch_add(busy.len() as u64, Ordering::Relaxed);
@@ -5602,8 +5738,10 @@ impl Shadow {
             // The locks of [`Shadow::merge_under_writes`], for its reasons:
             // no landing puts the card's bytes into title memory and the
             // reference between the read and the put.
+            let waiting = std::time::Instant::now();
             let merging = self.merging.write().unwrap_or_else(|e| e.into_inner());
             let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+            PRECISE[MP_LOCK_NS].fetch_add(waiting.elapsed().as_nanos() as u64, Ordering::Relaxed);
             let held = if self.card.is_some() {
                 self.data as usize
             } else {
@@ -5614,53 +5752,63 @@ impl Shadow {
                 continue;
             }
             let owned_any = self.card_wrote.any();
-            let (mut taken, mut card_runs) = (Vec::new(), Vec::new());
-            TITLE.with_borrow_mut(|title| {
-                CARD.with_borrow_mut(|card| {
-                    title.resize(PAGE, 0);
-                    card.resize(PAGE, 0);
-                    for &page in &pages {
-                        let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
-                        if lo >= hi {
-                            continue;
-                        }
+            let on_card = self.card.is_some();
+            // Runs of a few whole words go up as pairs of one dispatch; only
+            // the others are copies of their own and count against the
+            // budget, as in [`Shadow::merge_page_under_writes`]. A byte run
+            // (a float's low bytes) was a copy each: run 840 sent ~8,900 a
+            // frame and left ~95 pages a frame over the budget for the
+            // landing.
+            let words = on_card && crate::host::words_under();
+            let left = std::sync::atomic::AtomicI64::new(*runs_left as i64);
+            let done: Vec<Mutex<PreciseDone>> = pages.iter().map(|_| Mutex::new(PreciseDone::Skip)).collect();
+            let one = |i: usize| {
+                let page = pages[i];
+                let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
+                if lo >= hi {
+                    return;
+                }
+                let outcome = TITLE.with_borrow_mut(|title| {
+                    CARD.with_borrow_mut(|card| {
+                        title.resize(PAGE, 0);
+                        card.resize(PAGE, 0);
                         let (n, at) = (hi - lo, lo - start);
                         let title = &mut title[..n];
                         if !crate::host::read_into(lo as *const u8, title) {
-                            PRECISE[MP_UNREAD].fetch_add(1, Ordering::Relaxed);
-                            continue;
+                            return PreciseDone::Unread;
                         }
                         let title = &*title;
-                        PRECISE[MP_PAGES].fetch_add(1, Ordering::Relaxed);
-                        PRECISE[MP_COMPARED].fetch_add(n as u64, Ordering::Relaxed);
                         // SAFETY: the reference holds the copy's bytes at the
                         // copy's offsets, and these are in a declared range;
-                        // the locks held keep out what else writes them.
+                        // the locks held keep out what else writes them, and
+                        // no two pages are the same.
                         let held = unsafe { std::slice::from_raw_parts_mut((held as *mut u8).add(at), n) };
                         // A copy in the PC's memory: what the card's side
                         // holds now, read once (the card may be writing it;
                         // each byte read is one it held at some moment).
-                        let seen = self.card.is_none().then(|| {
+                        let seen = (!on_card).then(|| {
                             // SAFETY: inside the copy's mapping, into scratch
                             // memory of ours of the same length.
                             unsafe { std::ptr::copy_nonoverlapping(self.data.add(at), card.as_mut_ptr(), n) };
                             &card[..n]
                         });
-                        let (put, out) = precise_runs(title, held, seen, |i| owned_any && self.card_wrote.owns(at + i));
-                        if self.card.is_some() && put.len() > *runs_left {
-                            PRECISE[MP_BUDGET].fetch_add(1, Ordering::Relaxed);
-                            #[cfg(feature = "diagnostics")]
-                            if wedge::on() {
-                                self.wedge_note(wedge::K_BUDGET, lo, (hi - lo) as u64);
+                        let (mut put, out) = precise_runs(title, held, seen, |i| owned_any && self.card_wrote.owns(at + i));
+                        // In the card's memory the card's bytes are known by
+                        // dword only (no byte of a put run's dwords is
+                        // owned), and shaders store whole dwords: the run's
+                        // dwords go up whole, the bytes the title left as
+                        // the reference holds them.
+                        let changed: usize = put.iter().map(|r| r.1).sum();
+                        let widened = if words { widen_to_dwords(&mut put, at, n) } else { 0 };
+                        if on_card {
+                            let own = put.iter().filter(|&&(r, m)| !words || !crate::host::goes_as_words(at + r, m)).count() as i64;
+                            if own > 0 && left.fetch_sub(own, Ordering::Relaxed) < own {
+                                left.fetch_add(own, Ordering::Relaxed);
+                                return PreciseDone::Budget { lo, hi, n };
                             }
-                            parts.push((lo, hi));
-                            continue;
                         }
-                        let mut bytes = 0;
                         for &(r, m) in &put {
-                            if self.card.is_some() {
-                                card_runs.push((at + r, at + r + m));
-                            } else {
+                            if !on_card {
                                 // SAFETY: inside the copy's mapping. The card
                                 // may be writing the copy beside these
                                 // bytes; they are written here and nothing
@@ -5668,16 +5816,49 @@ impl Shadow {
                                 unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m) };
                             }
                             held[r..r + m].copy_from_slice(&title[r..r + m]);
-                            bytes += m;
                         }
-                        if self.card.is_some() {
-                            *runs_left -= put.len();
+                        let (bytes, out_bytes) = (changed, out.iter().map(|r| r.1).sum::<usize>());
+                        let runs = if on_card { put.iter().map(|&(r, m)| (at + r, at + r + m)).collect() } else { Vec::new() };
+                        PreciseDone::Done { lo, hi, n, page, runs, count: put.len(), bytes, out_bytes, widened }
+                    })
+                });
+                *done[i].lock().unwrap_or_else(|e| e.into_inner()) = outcome;
+            };
+            // On the threads [`Shadow::merge_under_writes`] uses (single:
+            // `VICTORY_UNDER_WIDE=0`): the locks are held meanwhile, and
+            // landings of this copy wait for them.
+            if pages.len() > 2 && under_wide() {
+                crate::land::each_under(pages.len(), &one);
+            } else {
+                (0..pages.len()).for_each(one);
+            }
+            *runs_left = left.into_inner().max(0) as usize;
+            let (mut taken, mut card_runs) = (Vec::new(), Vec::new());
+            for slot in done {
+                match slot.into_inner().unwrap_or_else(|e| e.into_inner()) {
+                    PreciseDone::Skip => {}
+                    PreciseDone::Unread => {
+                        PRECISE[MP_UNREAD].fetch_add(1, Ordering::Relaxed);
+                    }
+                    PreciseDone::Budget { lo, hi, n } => {
+                        PRECISE[MP_PAGES].fetch_add(1, Ordering::Relaxed);
+                        PRECISE[MP_COMPARED].fetch_add(n as u64, Ordering::Relaxed);
+                        PRECISE[MP_BUDGET].fetch_add(1, Ordering::Relaxed);
+                        #[cfg(feature = "diagnostics")]
+                        if wedge::on() {
+                            self.wedge_note(wedge::K_BUDGET, lo, (hi - lo) as u64);
                         }
-                        let out_bytes: usize = out.iter().map(|r| r.1).sum();
-                        PRECISE[MP_RUNS].fetch_add(put.len() as u64, Ordering::Relaxed);
+                        parts.push((lo, hi));
+                    }
+                    PreciseDone::Done { lo, hi, n, page, mut runs, count, bytes, out_bytes, widened } => {
+                        PRECISE[MP_PAGES].fetch_add(1, Ordering::Relaxed);
+                        PRECISE[MP_COMPARED].fetch_add(n as u64, Ordering::Relaxed);
+                        PRECISE[MP_RUNS].fetch_add(count as u64, Ordering::Relaxed);
                         PRECISE[MP_BYTES].fetch_add(bytes as u64, Ordering::Relaxed);
-                        PRECISE[MP_UNCHANGED].fetch_add((n - bytes - out_bytes) as u64, Ordering::Relaxed);
-                        if out.is_empty() {
+                        PRECISE[MP_UNCHANGED].fetch_add(n.saturating_sub(bytes + out_bytes) as u64, Ordering::Relaxed);
+                        PRECISE[MP_WIDENED].fetch_add(widened as u64, Ordering::Relaxed);
+                        card_runs.append(&mut runs);
+                        if out_bytes == 0 {
                             // Taken, if the range holds all of the page that
                             // is in the copy (as the merge notes it).
                             if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
@@ -5694,8 +5875,8 @@ impl Shadow {
                             parts.push((lo, hi));
                         }
                     }
-                })
-            });
+                }
+            }
             self.card_changed_runs(card_runs.into_iter());
             drop(before);
             drop(merging);
@@ -5708,6 +5889,7 @@ impl Shadow {
         }
         AFTER_LANDING[AL_DIFFER_BYTES].fetch_add(owned_bytes, Ordering::Relaxed);
         self.note_deferred(parts);
+        PRECISE[MP_NS].fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
     /// Parts of pages (each in one page and in a range a flight not landed

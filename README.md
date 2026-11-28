@@ -85,7 +85,7 @@ In the 30-minute playtest, checkpoint retries worked after the boat ran aground.
 
 Use [`Play-VIctory.cmd`](Play-VIctory.cmd) to pass the same options from Command Prompt. Double-click it to enter the executable's path at a prompt. The launcher defaults to full screen, the Series X profile and an automatic GPU preset. **F11** or **Alt+Enter** toggles full screen during play.
 
-For titles that use BCPack, set `VICTORY_BCPACK_TABLES` to the path of a local copy of the [format tables](docs/asset-policy.md#bcpack) you are authorised to use.
+For titles that use BCPack, set `VICTORY_BCPACK_TABLES` to the path of a local copy of the [format tables](docs/asset-policy.md#bcpack) you are authorised to use. Without them the title still runs, but its BCPack textures show as square block noise; `scripts/play.ps1` warns at launch.
 
 If the title reaches the menu but stops at world load, verify your title files before changing graphics settings. Compare the full file hashes against a trusted manifest for the exact release you own, using the algorithm listed in that manifest. An archive with missing or zero-filled data can still have the expected size. Re-copy any mismatched files from your verified source and check the hashes again before launching.
 

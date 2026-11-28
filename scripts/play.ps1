@@ -279,6 +279,12 @@ $paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DAT
 $inherited = @(Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $paths })
 foreach ($entry in $inherited) { Remove-Item "Env:$($entry.Name)" }
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
+# Without the BCPack tables the title still runs, but its BCPack textures (faces, clothes, walls) show as block noise.
+if (-not $env:VICTORY_BCPACK_TABLES) {
+    Write-Warning "VICTORY_BCPACK_TABLES is not set: textures that use BCPack will show as square block noise. Set it to your local format tables (docs/asset-policy.md#bcpack)."
+} elseif (-not (Test-Path -LiteralPath $env:VICTORY_BCPACK_TABLES -PathType Leaf)) {
+    Write-Warning "VICTORY_BCPACK_TABLES points to $env:VICTORY_BCPACK_TABLES, which is not a file: textures that use BCPack will show as square block noise."
+}
 $discarded = $inherited | Where-Object {
     $_.Name -notin $More.Keys -and -not $_.Value.Equals([Environment]::GetEnvironmentVariable($_.Name))
 } | Sort-Object Name

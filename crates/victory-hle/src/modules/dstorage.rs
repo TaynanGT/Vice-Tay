@@ -1502,7 +1502,9 @@ fn bcpack_tables() -> Result<&'static Tables, HRESULT> {
     match TABLES.get_or_init(load_bcpack_tables) {
         Ok(tables) => Ok(tables),
         Err(why) if !WARNED.swap(true, Ordering::Relaxed) => {
-            tracing::warn!("dstorage: BCPack requests fail: {why} (more at debug)");
+            tracing::warn!(
+                "dstorage: BCPack requests fail, so the textures they hold show as square block noise: {why} (more at debug)"
+            );
             Err(E_NOTIMPL)
         }
         Err(_) => {

@@ -2196,6 +2196,14 @@ fn placeholder(block: usize) -> bool {
     if PLACEHOLDERS.any(block, block + 1) {
         return true;
     }
+    const PLACEHOLDER_RESERVATION: u32 = 1 << 8;
+    region_type(block * BLOCK).is_some_and(|t| t & PLACEHOLDER_RESERVATION != 0)
+}
+
+/// The region type flags of the memory at `at`
+/// (`NtQueryVirtualMemory(MemoryRegionInformationEx)`); `None` where the
+/// system does not answer that class (Wine/Proton).
+fn region_type(at: usize) -> Option<u32> {
     /// `MEMORY_REGION_INFORMATION` (ntddk).
     #[repr(C)]
     #[derive(Default)]
@@ -2221,20 +2229,31 @@ fn placeholder(block: usize) -> bool {
     }
     // (Class 3 answers with the kind of memory in that word, not the flags.)
     const MEMORY_REGION_INFORMATION_EX: u32 = 7;
-    const PLACEHOLDER_RESERVATION: u32 = 1 << 8;
     let mut region = Region::default();
     // SAFETY: the answer's room and its size.
     let status = unsafe {
         NtQueryVirtualMemory(
             windows_sys::Win32::System::Threading::GetCurrentProcess(),
-            (block * BLOCK) as *const _,
+            at as *const _,
             MEMORY_REGION_INFORMATION_EX,
             (&raw mut region).cast(),
             size_of::<Region>(),
             std::ptr::null_mut(),
         )
     };
-    status >= 0 && region.region_type & PLACEHOLDER_RESERVATION != 0
+    (status >= 0).then_some(region.region_type)
+}
+
+/// Whether the system tells placeholders apart ([`region_type`]). Tests of
+/// what [`placeholder`] finds by itself need it; under Wine the runtime's
+/// own notes ([`title_memory_placeholder`]) are all there is.
+#[cfg(test)]
+fn placeholders_answered() -> bool {
+    let answered = region_type(&raw const PLACEHOLDERS as usize).is_some();
+    if !answered {
+        eprintln!("skipped: the system does not answer MemoryRegionInformationEx (Wine)");
+    }
+    answered
 }
 
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
@@ -4357,6 +4376,9 @@ mod tests {
     /// the runtime has begun to change; after that it is again.
     #[test]
     fn what_is_left_alone_is_no_known_hole() {
+        if !super::placeholders_answered() {
+            return;
+        }
         let p = placeholder(3);
         let known = |block: usize| published(p + block * BLOCK, p + (block + 1) * BLOCK);
         let ask = || writes(p, p + 3 * BLOCK, true).expect("as a view");
@@ -5790,6 +5812,9 @@ mod many_askers_tests {
     /// allocated there. A hole that is no placeholder's is asked about.
     #[test]
     fn holes_are_known_until_the_runtime_tells() {
+        if !super::placeholders_answered() {
+            return;
+        }
         let _one = crate::watch::one_asking_test();
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
         const BLOCKS: usize = 8;
@@ -5876,6 +5901,9 @@ mod many_askers_tests {
     /// whoever asks after it, and blocks are known by their bits meanwhile.
     #[test]
     fn no_mapping_is_lost_between_askers() {
+        if !super::placeholders_answered() {
+            return;
+        }
         let _one = crate::watch::one_asking_test();
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use windows_sys::Win32::System::Threading::GetCurrentProcess;

@@ -19,6 +19,10 @@ Vice-Tay builds on [VIctory](https://github.com/Marvisak/VIctory) to run an Xbox
 
 The goal is **30 rendered FPS in the open world with correct visuals**.
 
+For individual frame times and repeatable comparisons, see the
+[buffered frame capture and benchmark guide](docs/frame-benchmark.md).
+Capture is opt-in and works independently of the performance panel.
+
 ### Series S boat test at 4K
 
 On November 27, 2026, I repeated the same boat route with two local builds. Both used DLSS Quality (2560 × 1440 → 3840 × 2160) and AMD 2× frame generation. Each result averages about 39 seconds of telemetry.

@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "launch_environment": "C:\\Bench\\frozen-launch.json",
+  "data_seed": "C:\\Bench\\seeds\\data",
+  "cache_seed": "C:\\Bench\\seeds\\cache",
+  "output_root": "C:\\Bench\\results\\scene-a-001",
+  "repeats": 3,
+  "ready_timeout_seconds": 180,
+  "warmup_seconds": 30,
+  "measure_seconds": 60,
+  "close_timeout_seconds": 20,
+  "frame_budget_ms": 33.333333,
+  "startup_keys": [
+    { "at_seconds": 5, "keys": ["Enter 0.2"] }
+  ],
+  "route_keys": [
+    { "at_seconds": 5, "keys": ["W 2.0"] }
+  ]
+}

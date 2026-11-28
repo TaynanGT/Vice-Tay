@@ -1197,6 +1197,24 @@ static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
 static COPY_BACK: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
+fn submission_time(index: usize, us: u64) {
+    SUBMISSION_US[index].fetch_add(us, Ordering::Relaxed);
+    crate::frame_capture::add(
+        if index == 0 { crate::frame_capture::Work::PrepareUs } else { crate::frame_capture::Work::GpuWaitUs },
+        us,
+    );
+}
+
+fn readback_time(us: u64) {
+    COPY_BACK[0].fetch_add(us, Ordering::Relaxed);
+    crate::frame_capture::add(crate::frame_capture::Work::ReadbackUs, us);
+}
+
+fn readback_bytes(bytes: u64) {
+    COPY_BACK[1].fetch_add(bytes, Ordering::Relaxed);
+    crate::frame_capture::add(crate::frame_capture::Work::ReadbackBytes, bytes);
+}
+
 /// The card's clock, for the frame line of every run, in microseconds since
 /// the last one: how long the card had nothing of ours queued; how much of
 /// that while the thread that holds the submission lock was working (the
@@ -4902,7 +4920,7 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     let us = waiting.elapsed().as_micros() as u64;
     LATE_STATS[12].fetch_add(us, Ordering::Relaxed);
     LATE_WAITED[why.min(10)].fetch_add(us, Ordering::Relaxed);
-    SUBMISSION_US[1].fetch_add(us, Ordering::Relaxed);
+    submission_time(1, us);
     #[cfg(feature = "diagnostics")]
     blamed(why, us);
 }
@@ -5092,7 +5110,7 @@ impl RelayBack {
         }
         land::spent(land::stat::BACK, merging);
         for ((_, from, to), written) in self.work.iter().zip(written) {
-            COPY_BACK[1].fetch_add(written, Ordering::Relaxed);
+            readback_bytes(written);
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(*from, to - from, written as usize);
             let _ = (from, to);
@@ -5575,7 +5593,7 @@ fn hand_back(back: &[Declared]) {
         crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
         for ((shadow, from, to), found) in work.iter().zip(found) {
             let written = shadow.copy_back_with(*from, to - from, Some(found));
-            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            readback_bytes(written as u64);
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(*from, to - from, written);
         }
@@ -5607,7 +5625,7 @@ fn hand_back(back: &[Declared]) {
         }
         for (from, to) in spans {
             let written = shadow.copy_back(from, to - from);
-            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            readback_bytes(written as u64);
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(from, to - from, written);
         }
@@ -6513,7 +6531,7 @@ impl Host {
             }
         }
         land::spent(land::stat::CARD, merging);
-        COPY_BACK[1].fetch_add(written, Ordering::Relaxed);
+        readback_bytes(written);
         if let Some(f) = fetch.as_mut() {
             if let Some(check) = &check {
                 check.done(&mut f.suspects);
@@ -6607,7 +6625,7 @@ impl Host {
                     }
                 }
                 crate::land::spent(crate::land::stat::DONE, finishing);
-                COPY_BACK[0].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
+                readback_time(landing.elapsed().as_micros() as u64);
                 RELAY_STATS[0].fetch_add(1, Ordering::Relaxed);
                 RELAY_STATS[1].fetch_add(flights.len() as u64, Ordering::Relaxed);
             }
@@ -6827,7 +6845,7 @@ impl Host {
             }
         }
         for (r, written) in plan.ranges.iter().zip(written) {
-            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            readback_bytes(written as u64);
             let (from, to) = r.declared;
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(from, to - from, written);
@@ -7108,7 +7126,7 @@ impl Host {
                 let gpu = waiting.elapsed();
                 LATE_STATS[12].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 LATE_WAITED[why.min(10)].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
-                SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
+                submission_time(1, gpu.as_micros() as u64);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::card_waited(gpu.as_micros() as u64, || {
                     format!("{flights} submissions sent ahead, settled together")
@@ -7152,7 +7170,7 @@ impl Host {
                 if Self::landed_touches_shader_heap(&flights_ref) {
                     crate::port_journal::prep_wrote();
                 }
-                COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+                readback_time(copying.elapsed().as_micros() as u64);
             }
             // In the order given: what tells the title the card is done.
             let mut last = 0;
@@ -7572,7 +7590,7 @@ impl Host {
                 texture_back_ranges.extend(list.deferred().readback_ranges());
             }
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
-            SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
+            submission_time(0, (prepared - started).saturating_sub(settled).as_micros() as u64);
             submitting(0, 0);
             #[cfg(feature = "diagnostics")]
             crate::copystat::submission_ends(lock);
@@ -7678,8 +7696,8 @@ impl Host {
         FINISHED.store(this_submission, Ordering::Release);
         bury(this_submission);
         let gpu = prepared.elapsed();
-        SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
-        SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
+        submission_time(0, (prepared - started).as_micros() as u64);
+        submission_time(1, gpu.as_micros() as u64);
         #[cfg(feature = "diagnostics")]
         crate::copystat::card_waited(gpu.as_micros() as u64, || {
             let pipelines: std::collections::BTreeSet<String> = runs
@@ -7731,7 +7749,7 @@ impl Host {
             add(C::NothingBack, 1);
             add(C::NothingBackUs, gpu.as_micros() as u64);
         }
-        COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        readback_time(copying.elapsed().as_micros() as u64);
         let mut texture_scratch = crate::texback::Scratch::default();
         for list in runs {
             // Read backs first: a value written at the bottom of the pipe
@@ -11080,6 +11098,7 @@ fn meter_lines(lines: impl FnOnce() + Send + 'static) {
 }
 
 struct Meter {
+    frame_capture: Option<crate::frame_capture::Stream>,
     last_present: windows::core::HRESULT,
     since: std::time::Instant,
     frames: u32,
@@ -11095,6 +11114,7 @@ impl Meter {
     fn new() -> Self {
         let now = std::time::Instant::now();
         Meter {
+            frame_capture: crate::frame_capture::Stream::new(),
             last_present: windows::Win32::Foundation::S_OK,
             since: now,
             frames: 0,
@@ -11826,6 +11846,22 @@ impl Host {
             } else {
                 p.swap_chain.Present(0, DXGI_PRESENT(0))
             };
+            if status == windows::Win32::Foundation::S_OK
+                && let Some(capture) = &p.meter.frame_capture
+            {
+                let (generated, count) = crate::framegen::capture_counts();
+                capture.present(crate::frame_capture::Counters {
+                    draws: crate::draw::drawn(),
+                    dispatches: crate::draw::dispatched(),
+                    pipelines_pending: crate::pipeline::making(),
+                    shader_cache_misses: crate::shader_cache::counts().1,
+                    textures_uploaded: crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
+                    texture_upload_bytes: crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed),
+                    generated_frames_total: generated,
+                    swapchain_present_count: if p.framegen { count } else { None },
+                    frame_generation: p.framegen,
+                });
+            }
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
             if status == windows::Win32::Foundation::S_OK {

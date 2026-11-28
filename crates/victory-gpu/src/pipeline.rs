@@ -517,6 +517,16 @@ pub(super) fn skip_hashes() -> &'static [String] {
     })
 }
 
+/// Diagnostics: a title pipeline's shader hashes (stage:hash, joined by
+/// `+`), as `VICTORY_SKIP_PIPELINES` takes them; "" for none.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn shader_hashes(this: This) -> String {
+    if this.is_null() {
+        return String::new();
+    }
+    pipeline(this).shaders.iter().map(|s| format!("{}:{}", s.stage, s.hash)).collect::<Vec<_>>().join("+")
+}
+
 #[cfg(windows)]
 pub(super) fn skipped_in_list<'a>(
     shaders: &'a [std::sync::Arc<Shader>],

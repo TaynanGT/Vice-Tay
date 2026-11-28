@@ -1223,6 +1223,8 @@ impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
         self.pipeline = pipeline as usize;
+        #[cfg(feature = "diagnostics")]
+        crate::shadow::wedge::set_pipeline(self.pipeline);
     }
 
     /// The title's topology; console-only ones become host lists (see
@@ -1247,6 +1249,8 @@ impl State {
 
     pub(crate) fn set_pipeline(&mut self, pipeline: This) {
         self.pipeline = pipeline as usize;
+        #[cfg(feature = "diagnostics")]
+        crate::shadow::wedge::set_pipeline(self.pipeline);
     }
 
     /// A host compute library bound its own pipeline, root signature and heaps.

@@ -5277,6 +5277,7 @@ mod mapping_fence;
 mod prelude_pool;
 mod title_stock;
 mod card_steps;
+pub(crate) mod heap_pace;
 pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
 mod panel;
@@ -7261,6 +7262,11 @@ impl Host {
         crate::copystat::submission_begins();
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
+        // Prepared only behind the card's end of the frame sent before
+        // (`VICTORY_HEAP_SYNC_PACE=1`).
+        if late {
+            heap_pace::before_submission();
+        }
         let mut stage = crate::timeline::span("submit: the submission lock");
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let was_working = working(true);
@@ -11180,8 +11186,10 @@ impl Meter {
                 "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame; {refused:.2} indirect records a frame ran empty for want of their list's budget (2^27), the largest cost of one {biggest} (0: under 2^22)"
             );
             crate::shadow::exact_line(frames);
+            crate::shadow::after_landing_line(frames);
             crate::descriptor::sync_line(frames);
             late_line(frames);
+            heap_pace::line(frames);
             crate::queue::behind_line(frames);
             card_clock_line(frames, ms);
             upq::line(frames);
@@ -11785,6 +11793,8 @@ impl Host {
                 }
                 None => (0, self.execute(&[copy])),
             };
+            // The frame's end on the card (`VICTORY_HEAP_SYNC_PACE`).
+            heap_pace::sent(fence);
             #[cfg(feature = "diagnostics")]
             p.panel.submitted(panel_copy.as_ref(), fence);
             #[cfg(feature = "diagnostics")]

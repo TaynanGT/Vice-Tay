@@ -8,6 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const HEADER: &str = "schema_version,process_id,stream_id,frame_index,timestamp_unix_us,elapsed_ns,interval_valid,frame_ms,draws,dispatches,prepare_ms,gpu_wait_ms,readback_ms,readback_bytes,pipelines_pending,shader_cache_misses,textures_uploaded,texture_upload_bytes,generated_frames_total,swapchain_present_count,frame_generation";
 
 fn main() -> std::io::Result<()> {
+    assert!(env::var_os("VICE_BENCHMARK_PARENT_SENTINEL").is_none(), "parent credentials boundary was not preserved");
     let csv = PathBuf::from(env::var("VICTORY_FRAME_CSV").expect("VICTORY_FRAME_CSV"));
     let mailbox = PathBuf::from(env::var("VICTORY_KEYS_FILE").expect("VICTORY_KEYS_FILE"));
     let run_dir = csv.parent().unwrap();

@@ -201,8 +201,18 @@ for ($runNumber = 1; $runNumber -le [int]$plan.repeats; $runNumber++) {
         Assert ($currentConfigHash -eq $launch.config_sha256) 'Frozen configuration changed before launch.'
         $mailbox = Join-Path $runDir 'keys.txt'; $csv = Join-Path $runDir 'frames.csv'
         $ready = Join-Path $runDir 'ready.marker'
-        $launchEnvironment = [Environment]::GetEnvironmentVariables()
-        foreach ($key in @($launchEnvironment.Keys | Where-Object { $_ -like 'VICTORY_*' -or $_ -like '=*' })) { $launchEnvironment.Remove($key) }
+        # Match the local offline launch boundary: never forward API keys or
+        # unrelated parent-process credentials into title code.
+        $launchEnvironment = [Collections.Hashtable]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($variableName in @('SystemRoot','WINDIR','COMSPEC','SystemDrive','ProgramData','ProgramFiles','ProgramFiles(x86)','CommonProgramFiles','CommonProgramFiles(x86)','PROCESSOR_ARCHITECTURE','NUMBER_OF_PROCESSORS','USERPROFILE','LOCALAPPDATA','APPDATA')) {
+            $variableValue = [Environment]::GetEnvironmentVariable($variableName)
+            if ($variableValue) { $launchEnvironment[$variableName] = $variableValue }
+        }
+        $launchEnvironment['PATH'] = "$env:SystemRoot\System32;$env:SystemRoot;$PSHOME"
+        $tempDir = Join-Path $runDir 'temp'
+        New-Item -ItemType Directory -Path $tempDir -ErrorAction Stop | Out-Null
+        $launchEnvironment['TEMP'] = $tempDir
+        $launchEnvironment['TMP'] = $tempDir
         foreach ($property in $launch.environment.PSObject.Properties) {
             Assert ($property.Name -match '^VICTORY_[A-Z0-9_]+$') "Invalid environment key: $($property.Name)"
             $launchEnvironment[$property.Name] = [string]$property.Value

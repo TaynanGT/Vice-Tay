@@ -1,4 +1,5 @@
 $ErrorActionPreference = 'Stop'
+$env:VICE_BENCHMARK_PARENT_SENTINEL = 'must not reach synthetic title'
 function Assert($ok, $message) { if (-not $ok) { throw $message } }
 $repo = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $scratch = Join-Path ([IO.Path]::GetTempPath()) ("vice-tay-runner-tests-" + [guid]::NewGuid().ToString('N'))

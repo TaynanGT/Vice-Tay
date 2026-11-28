@@ -1,5 +1,9 @@
 # Buffered frame benchmark
 
+Benchmark children receive frozen VIctory settings and a basic Windows
+environment, with temporary files kept in their run directory. Other caller
+environment variables, including API keys, are not forwarded.
+
 To capture a normal session, create an output directory outside the checkout and
 pass `-More @{VICTORY_FRAME_CSV='C:\Bench\frames.csv'}` to
 `scripts/play.ps1`. The CSV path must be absolute and new; its parent must

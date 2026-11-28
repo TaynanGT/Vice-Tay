@@ -1607,7 +1607,72 @@ mod after_landing_tests {
 
 #[cfg(test)]
 mod precise_tests {
-    use super::{CardWrote, precise_runs, put_title_changes, widen_to_dwords};
+    use super::{CardWrote, precise_runs, put_title_changes, refresh_part, widen_to_dwords};
+
+    /// A refresh by the title's changes (`VICTORY_MERGE_AFTER_LANDING=3`) of
+    /// a part at any offset and length, against a dword model: the card's
+    /// memory holds stores nobody declared (not in the CPU side); the runs go
+    /// into the CPU side and up to the card. A dword the title did not
+    /// change keeps the card's bytes, stored or not; a dword marked owned
+    /// keeps the card's and the CPU side's bytes; a dword the title changed
+    /// and not owned takes the title's bytes on both sides (whole with
+    /// `words`, only the changed bytes without). (The refresh itself passes
+    /// nothing as owned: the title's changes there are newer.)
+    #[test]
+    fn a_refresh_by_changes_keeps_the_cards_stores_where_the_title_left_them() {
+        for seed in 0..400u64 {
+            let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+            let mut next = |m: u64| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x % m) as usize
+            };
+            let (at, n) = (next(9), 1 + next(300));
+            let words = seed % 2 == 0;
+            let held: Vec<u8> = (0..n).map(|_| next(4) as u8).collect();
+            let (mut title, mut card) = (held.clone(), held.clone());
+            for _ in 0..next(10) {
+                let (a, m) = (next(n as u64), 1 + next(12));
+                (a..(a + m).min(n)).for_each(|i| title[i] = title[i].wrapping_add(1 + next(3) as u8));
+            }
+            for _ in 0..next(8) {
+                let (a, m) = (next(n as u64), 1 + next(12));
+                (a..(a + m).min(n)).for_each(|i| card[i] ^= 0x80);
+            }
+            let owned_dwords: Vec<bool> = (0..(at + n) / 4 + 1).map(|_| next(6) == 0).collect();
+            let owned = |i: usize| owned_dwords[(at + i) / 4];
+            let (put, changed, out, _) = refresh_part(at, &title, &held, words, owned);
+            let (mut side, before) = (held.clone(), card.clone());
+            for &(r, m) in &put {
+                side[r..r + m].copy_from_slice(&title[r..r + m]);
+                card[r..r + m].copy_from_slice(&side[r..r + m]);
+            }
+            let (mut want_changed, mut want_out) = (0, 0);
+            for i in 0..n {
+                // The part's bytes of this byte's dword.
+                let dword: Vec<usize> = (0..n).filter(|&j| (at + j) / 4 == (at + i) / 4).collect();
+                let title_changed_dword = dword.iter().any(|&j| title[j] != held[j]);
+                if title[i] != held[i] {
+                    if owned(i) {
+                        want_out += 1;
+                    } else {
+                        want_changed += 1;
+                    }
+                }
+                if owned(i) || !title_changed_dword {
+                    assert_eq!(card[i], before[i], "seed {seed} byte {i}: the card's byte stays");
+                    assert_eq!(side[i], held[i], "seed {seed} byte {i}: the CPU side's byte stays");
+                } else if words || title[i] != held[i] {
+                    assert_eq!(card[i], title[i], "seed {seed} byte {i}: the title's byte goes up");
+                    assert_eq!(side[i], title[i], "seed {seed} byte {i}");
+                } else {
+                    assert_eq!(card[i], before[i], "seed {seed} byte {i}: by bytes, the card's byte stays");
+                }
+            }
+            assert_eq!((changed, out), (want_changed, want_out), "seed {seed}");
+        }
+    }
 
     fn bytes(runs: &[(usize, usize)], n: usize) -> Vec<bool> {
         let mut map = vec![false; n];
@@ -3037,13 +3102,37 @@ pub(crate) fn merge_precise() -> bool {
     after_landing_level() >= 2
 }
 
-/// `VICTORY_MERGE_AFTER_LANDING`: 0, 1 or 2.
+/// `VICTORY_MERGE_AFTER_LANDING=3`: [`merge_precise`], and a refresh of a
+/// copy in the card's memory a flight not landed writes puts in only the
+/// bytes the title changed, outside the flights' declared ranges too
+/// ([`Shadow::refresh_precise`]).
+///
+/// Why: with `=2` a refresh still put whole pages (4 KiB parts) of title
+/// memory up in the gaps between a flight's declared ranges, mostly of the
+/// world heap's copy in the card's memory (7.6-9 such refreshes a frame,
+/// 3-4.5 MB). Where shaders store outside what they declared, or the
+/// declared ranges are short of what they write, that puts title memory's
+/// older bytes over the card's. With it such a refresh compares each
+/// written page with the copy's CPU side (the reference of `=2`: title
+/// memory as last known) and puts in only what differs, widened to whole
+/// dwords. The gaps lie outside every flight not landed, so a title change
+/// there is newer than the card's and goes in at once, also at dwords a
+/// landing found the card writes (holding those back crashed the title in
+/// testing); a page whose changes would go over [`REFRESH_RUNS`] runs goes
+/// whole, as before. No CPU wait. Copies in the PC's memory have no
+/// reference outside the declared ranges: they are refreshed as before.
+pub(crate) fn refresh_precise() -> bool {
+    after_landing_level() >= 3
+}
+
+/// `VICTORY_MERGE_AFTER_LANDING`: 0, 1, 2 or 3.
 fn after_landing_level() -> u8 {
     static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *LEVEL.get_or_init(|| {
         let level = match std::env::var("VICTORY_MERGE_AFTER_LANDING").as_deref().map(str::trim) {
             Ok("1") => 1,
             Ok("2") => 2,
+            Ok("3") => 3,
             _ => 0,
         };
         if level == 1 {
@@ -3056,6 +3145,11 @@ fn after_landing_level() -> u8 {
                 "VICTORY_MERGE_AFTER_LANDING=2: in ranges of copies a flight not landed may write only the bytes the title changed \
                  go in, at once; those at bytes the card writes wait for a refresh after the landing; copies with stores not declared \
                  take only the bytes the title changed"
+            );
+        } else if level == 3 {
+            tracing::info!(
+                "VICTORY_MERGE_AFTER_LANDING=3: as =2, and refreshes of copies in the card's memory a flight not landed writes put in \
+                 only the bytes the title changed (whole dwords), outside the declared ranges too"
             );
         }
         level
@@ -3097,6 +3191,32 @@ const MP_NS: usize = 20;
 /// as pairs of one dispatch, not as copies of their own).
 const MP_WIDENED: usize = 21;
 static PRECISE: [AtomicU64; 22] = [const { AtomicU64::new(0) }; 22];
+
+/// Counters of [`refresh_precise`] since the last line, by index:
+/// refreshes taken by their changes, pages compared and their bytes, runs
+/// and bytes put in, bytes skipped (the title did not change them), pages
+/// over the run budget (put whole), pages not there, ranges (and bytes)
+/// refreshed as before (memory not watched or not answered, over
+/// [`PRECISE_UNWATCHED_MOST`]), refreshes of copies in the PC's memory as
+/// before, ns in all.
+const RP_REFRESHES: usize = 0;
+const RP_PAGES: usize = 1;
+const RP_COMPARED: usize = 2;
+const RP_RUNS: usize = 3;
+const RP_PUT: usize = 4;
+const RP_SKIPPED: usize = 5;
+const RP_BUDGET: usize = 6;
+const RP_UNREAD: usize = 7;
+const RP_OLD_RANGES: usize = 8;
+const RP_OLD_BYTES: usize = 9;
+const RP_PC: usize = 10;
+const RP_NS: usize = 11;
+static REFRESHED: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+
+/// Runs a refresh of [`refresh_precise`] sends up as copies of their own,
+/// at most (those of a few whole dwords go as pairs of one dispatch and
+/// are not counted); a page over it is put whole, as before.
+const REFRESH_RUNS: i64 = 512;
 
 /// The most bytes of a copy in the PC's memory with stores not declared
 /// that [`merge_precise`] keeps title memory's bytes for
@@ -3174,6 +3294,23 @@ fn widen_to_dwords(runs: &mut Vec<(usize, usize)>, at: usize, n: usize) -> usize
     }
     *runs = out;
     widened
+}
+
+/// One page part of [`Shadow::refresh_precise`], at offset `at` of a copy
+/// in the card's memory: `title` (title memory now) against `held` (its
+/// CPU side, title memory as last known). The runs (offsets in the part)
+/// to put from `title` into `held` and send up: the bytes the title
+/// changed, but none in a dword `owned(i)` (the refresh passes none); with
+/// `words` whole dwords of the copy (none of a run's dwords is owned, and
+/// the rest of such a dword `title` and `held` hold alike). No other byte.
+/// Also the bytes the title changed and put, those left out, and how many
+/// runs grew to whole dwords.
+fn refresh_part(at: usize, title: &[u8], held: &[u8], words: bool, owned: impl Fn(usize) -> bool) -> (Vec<(usize, usize)>, usize, usize, usize) {
+    let (mut put, out) = precise_runs(title, held, None, owned);
+    let changed = put.iter().map(|r| r.1).sum();
+    let out_bytes = out.iter().map(|r| r.1).sum();
+    let widened = if words { widen_to_dwords(&mut put, at, title.len()) } else { 0 };
+    (put, changed, out_bytes, widened)
 }
 
 /// Of a copy with stores not declared, in the PC's memory: `title` (title
@@ -3594,7 +3731,7 @@ pub(crate) fn after_landing_line(frames: f64) {
          no reference, {:.1} pages over the runs a submission sends up, {:.1} pages not there; {:.2} MB a frame the landings found \
          the card wrote (noted by dword); copies with stores not declared: {:.0} made protected in the PC's memory since the last line \
          ({:.0} too big, refreshed as before), {:.3} MB the title changed put in, {:.2} MB left as the card has them; {:.1} refreshes of such copies \
-         in the card's memory taken by their changes; {:.2} ms a frame on the submitting thread, {:.2} of it waiting for the copies'          locks (pages on threads with VICTORY_UNDER_WIDE); {:.1} runs of copies in the card's memory widened to whole dwords",
+         in the card's memory taken by their changes; {:.2} ms a frame on the submitting thread, {:.2} of it waiting for the copies'          locks (pages on threads with VICTORY_UNDER_WIDE); {:.1} runs of copies in the card's memory widened to whole dwords{}",
         f(MP_PAGES),
         mb(MP_COMPARED),
         f(MP_UNWATCHED_PAGES),
@@ -3618,7 +3755,36 @@ pub(crate) fn after_landing_line(frames: f64) {
         s[MP_NS] as f64 / 1e6 / frames,
         s[MP_LOCK_NS] as f64 / 1e6 / frames,
         f(MP_WIDENED),
+        refresh_precise_part(frames),
     );
+}
+
+/// The part of the `=2` line for [`refresh_precise`] (empty without it).
+fn refresh_precise_part(frames: f64) -> String {
+    if !refresh_precise() {
+        return String::new();
+    }
+    let s = REFRESHED.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
+    let f = |i: usize| s[i] as f64 / frames;
+    let mb = |i: usize| s[i] as f64 / (1u64 << 20) as f64 / frames;
+    format!(
+        "; refreshes of copies in the card's memory a flight not landed writes, by the title's changes (=3): {:.1} ({:.1} pages, \
+         {:.2} MB compared), {:.1} runs, {:.3} MB put in, {:.2} MB skipped (the title did not change them), {:.1} pages over \
+         {REFRESH_RUNS} runs put whole, {:.1} pages not there, {:.1} ranges ({:.2} MB) not watched or not answered refreshed as \
+         before, {:.2} ms a frame; {:.1} refreshes of such copies in the PC's memory as before",
+        f(RP_REFRESHES),
+        f(RP_PAGES),
+        mb(RP_COMPARED),
+        f(RP_RUNS),
+        mb(RP_PUT),
+        mb(RP_SKIPPED),
+        f(RP_BUDGET),
+        f(RP_UNREAD),
+        f(RP_OLD_RANGES),
+        mb(RP_OLD_BYTES),
+        s[RP_NS] as f64 / 1e6 / frames,
+        f(RP_PC),
+    )
 }
 
 /// Why [`Shadow::merge_under_writes`] last left the caller to wait.
@@ -6190,6 +6356,15 @@ impl Shadow {
             .copied()
             .filter(|&(a, e)| a < to && e > from)
             .collect();
+        // A flight not landed writes the copy: of one in the card's memory
+        // only the bytes the title changed go in, around the flights'
+        // ranges as well (`VICTORY_MERGE_AFTER_LANDING=3`).
+        if refresh_precise() {
+            if self.card.is_some() {
+                return self.refresh_precise(outside(from, to, busy));
+            }
+            REFRESHED[RP_PC].fetch_add(1, Ordering::Relaxed);
+        }
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
@@ -6208,6 +6383,151 @@ impl Shadow {
             return bytes;
         }
         self.update_free(from, to)
+    }
+
+    /// [`Shadow::update_around`] with [`refresh_precise`], of a copy in the
+    /// card's memory a flight not landed writes: `gaps` (title addresses,
+    /// apart, outside the flights' ranges). Of each page the title wrote
+    /// since the copy took it, title memory is compared with the CPU side
+    /// and only the bytes the title changed go in and up ([`refresh_part`]);
+    /// a byte the title did not change is left as the card holds it, even
+    /// where shaders stored without declaring it. A page whose changes go
+    /// over [`REFRESH_RUNS`] runs is put whole, as before. A gap of memory
+    /// not watched (or not answered) is compared page by page up to
+    /// [`PRECISE_UNWATCHED_MOST`], refreshed as before above that. Returns
+    /// the bytes put in.
+    fn refresh_precise(&self, gaps: Vec<(usize, usize)>) -> usize {
+        let began = std::time::Instant::now();
+        REFRESHED[RP_REFRESHES].fetch_add(1, Ordering::Relaxed);
+        let mut bytes = 0;
+        for (a, e) in gaps {
+            if a >= e {
+                continue;
+            }
+            if let Some(put) = self.refresh_precise_range(a, e) {
+                bytes += put;
+                continue;
+            }
+            REFRESHED[RP_OLD_RANGES].fetch_add(1, Ordering::Relaxed);
+            REFRESHED[RP_OLD_BYTES].fetch_add((e - a) as u64, Ordering::Relaxed);
+            bytes += self.update_free(a, e);
+        }
+        REFRESHED[RP_NS].fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        bytes
+    }
+
+    /// [`Shadow::refresh_precise`] of one gap `[a, e)`. `None`: nothing says
+    /// which pages the title wrote and the gap is too long to compare; the
+    /// caller refreshes it as before (nothing was asked or touched).
+    fn refresh_precise_range(&self, a: usize, e: usize) -> Option<usize> {
+        thread_local! {
+            static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let base = start / PAGE;
+        let asked = if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            None
+        } else {
+            crate::watch::writes(a, e, true)
+        };
+        if asked.is_none() && e - a > PRECISE_UNWATCHED_MOST {
+            // (As the refresh does when the asking gives no answer.)
+            if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
+                self.watched.store(NOT_WATCHED, Ordering::Relaxed);
+            }
+            return None;
+        }
+        // The page state locked until the bytes are in, as the refresh holds
+        // it ([`Shadow::copy_stale`]).
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let (now, pages) = match &asked {
+            Some((now, written)) => (Some(*now), copied.stale_pages_in(base, a, e, written)),
+            None => (None, (a / PAGE..e.div_ceil(PAGE)).filter(|&page| page >= base).collect()),
+        };
+        if pages.is_empty() {
+            return Some(0);
+        }
+        let words = crate::host::words_under();
+        let left = std::sync::atomic::AtomicI64::new(REFRESH_RUNS);
+        let done: Vec<Mutex<PreciseDone>> = pages.iter().map(|_| Mutex::new(PreciseDone::Skip)).collect();
+        let one = |i: usize| {
+            let page = pages[i];
+            let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
+            if lo >= hi {
+                return;
+            }
+            let outcome = TITLE.with_borrow_mut(|title| {
+                title.resize(PAGE, 0);
+                let (n, at) = (hi - lo, lo - start);
+                let title = &mut title[..n];
+                if !crate::host::read_into(lo as *const u8, title) {
+                    return PreciseDone::Unread;
+                }
+                // SAFETY: inside the mapping of the copy's CPU side, outside
+                // every range a flight not landed may write (no landing puts
+                // bytes there) and held by the page state's lock against
+                // other refreshes; no two pages are the same.
+                let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                // (Outside every flight not landed the card's writes have
+                // landed: the title's changes there are newer, none is held
+                // back at the card's dwords.)
+                let (mut put, changed, _, widened) = refresh_part(at, title, held, words, |_| false);
+                let own = put.iter().filter(|&&(r, m)| !words || !crate::host::goes_as_words(at + r, m)).count() as i64;
+                let mut over = false;
+                if own > 0 && left.fetch_sub(own, Ordering::Relaxed) < own {
+                    left.fetch_add(own, Ordering::Relaxed);
+                    // Over the runs: the page part whole, as before (one copy).
+                    REFRESHED[RP_BUDGET].fetch_add(1, Ordering::Relaxed);
+                    over = true;
+                    put = vec![(0, n)];
+                }
+                for &(r, m) in &put {
+                    held[r..r + m].copy_from_slice(&title[r..r + m]);
+                }
+                let bytes = if over { n } else { changed };
+                let runs = put.iter().map(|&(r, m)| (at + r, at + r + m)).collect();
+                PreciseDone::Done { lo, hi, n, page, runs, count: put.len(), bytes, out_bytes: 0, widened }
+            });
+            *done[i].lock().unwrap_or_else(|e| e.into_inner()) = outcome;
+        };
+        if pages.len() > 2 && under_wide() {
+            crate::land::each_under(pages.len(), &one);
+        } else {
+            (0..pages.len()).for_each(one);
+        }
+        let (mut card_runs, mut bytes): (Vec<(usize, usize)>, usize) = (Vec::new(), 0);
+        for slot in done {
+            match slot.into_inner().unwrap_or_else(|e| e.into_inner()) {
+                PreciseDone::Skip | PreciseDone::Budget { .. } => {}
+                PreciseDone::Unread => {
+                    REFRESHED[RP_UNREAD].fetch_add(1, Ordering::Relaxed);
+                }
+                PreciseDone::Done { n, page, mut runs, count, bytes: put, widened, .. } => {
+                    REFRESHED[RP_PAGES].fetch_add(1, Ordering::Relaxed);
+                    REFRESHED[RP_COMPARED].fetch_add(n as u64, Ordering::Relaxed);
+                    REFRESHED[RP_RUNS].fetch_add(count as u64, Ordering::Relaxed);
+                    REFRESHED[RP_PUT].fetch_add(put as u64, Ordering::Relaxed);
+                    REFRESHED[RP_SKIPPED].fetch_add(n.saturating_sub(put) as u64, Ordering::Relaxed);
+                    PRECISE[MP_WIDENED].fetch_add(widened as u64, Ordering::Relaxed);
+                    bytes += put;
+                    card_runs.append(&mut runs);
+                    if let Some(now) = now
+                        && (page * PAGE).max(start) >= a
+                        && ((page + 1) * PAGE).min(end) <= e
+                    {
+                        // Taken, if the gap holds all of the page that is in
+                        // the copy (as the refresh notes it).
+                        copied.set(page - base, now);
+                    }
+                }
+            }
+        }
+        for &(from, to) in &card_runs {
+            self.changed(from, to);
+        }
+        self.card_changed_runs(card_runs.into_iter());
+        drop(copied);
+        Some(bytes)
     }
 
     /// Whether [`Shadow::update`] of `[address, address + len)` would copy

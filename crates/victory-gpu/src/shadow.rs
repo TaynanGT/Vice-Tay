@@ -3775,18 +3775,15 @@ pub(crate) fn window_use() -> [u64; 8] {
     out
 }
 
-/// Optional byte cap for loose title-window copies, in MiB. Unset or `0`
-/// keeps today's sweep. A positive value caps the copies only in the Watch
-/// and High RAM bands; Calm is unchanged. The cap is on every loose copy's
-/// bytes, held or idle (#450); only idle ones can go to meet it.
-fn window_budget() -> Option<u64> {
-    static MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    *MB.get_or_init(|| {
-        std::env::var("VICTORY_WINDOW_BUDGET_MB")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .filter(|&v| v > 0)
-            .map(|v| v.saturating_mul(1 << 20))
+/// Optional byte cap for loose title-window copies. `VICTORY_WINDOW_BUDGET_MB`
+/// overrides the opt-in startup profile; `0` disables its cap. A positive
+/// value caps copies only in the Watch and High RAM bands; Calm is unchanged.
+/// The cap counts every copy's bytes (#450); only idle ones can go to meet it.
+fn window_budget(profile_mb: Option<u64>) -> Option<u64> {
+    static BUDGET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let explicit = std::env::var_os("VICTORY_WINDOW_BUDGET_MB");
+        crate::autotune::window_budget_bytes(explicit.as_deref(), profile_mb)
     })
 }
 
@@ -3848,11 +3845,11 @@ static WINDOW_BAND: std::sync::Mutex<crate::host::RamBand> =
 ///
 /// The next read of that memory makes a new copy and copies the window
 /// again. Called before a submission starts, by the thread that submits.
-pub(crate) fn let_go_idle() {
+pub(crate) fn let_go_idle(profile_budget_mb: Option<u64>) {
     const IDLE_FRAMES: u64 = 4;
     // Before the windows: their table may be empty while the pool is not.
     let_go_idle_snapshots();
-    let budget = window_budget();
+    let budget = window_budget(profile_budget_mb);
     // Without a budget (or in Calm) copies idle this long go; under a
     // budget they still do, and others idle for less go to meet it.
     let due_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());

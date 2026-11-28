@@ -210,6 +210,29 @@ DLSS also runs under Proton. Set `PROTON_ENABLE_NVAPI=1` and point `VICTORY_DLSS
 
 </details>
 
+### Startup hardware profile (Windows, opt-in)
+
+Set `VICTORY_AUTOTUNE=1` before launching, or set `VICTORY_AUTOTUNE_FILE` to a
+nonempty path to opt in and select the profile directly. Otherwise no startup
+probe or profile writes run. Without an explicit path, VIctory looks for
+`victory.toml` in the working directory, then beside the executable. If neither
+exists it creates one in the working directory. Existing files, including
+`[paths]`, are never rewritten. To generate a profile when you already have a
+paths file, point `VICTORY_AUTOTUNE_FILE` at a new file in an existing directory.
+`VICTORY_CONFIG` still selects the paths file independently.
+
+In `[autotune]`, `ram_budget_mb` is a soft budget for loose copies under RAM
+pressure, not a total process limit. Only idle copies are evicted.
+`VICTORY_WINDOW_BUDGET_MB` wins over the file (including `0` to disable the
+cap); omitted keys use the probed defaults.
+`vram_tier` and `hybrid_cpu` describe the snapshot and do not change rendering
+or thread affinity. The generated comments record DXGI budgets and adapter
+LUIDs, ReBAR capability, UMA, and CPU core classes, L3 domains and NUMA nodes.
+A primary-display LUID mismatch is a warning, not an adapter-selection rule.
+`uma_fast_path` is always generated as `false`, even for cache-coherent UMA.
+An explicit request (`VICTORY_UMA_FAST_PATH=1` or `uma_fast_path = true` in the
+file) is logged but cannot activate an acceleration path in this build.
+
 ## Known problems
 
 - **RDNA2 world-load resets on Windows 11.** The AMD launcher profile defaults to relay mode 0 on the RX 6700 XT with drivers 32.0.21045.26001 or 32.0.32029.2010 on LTSC, and on the RX 6900 XT with driver 32.0.21045.29003 on all Windows 11 editions. The launcher accepts an explicit relay mode through its settings override. See the test reports in [#138](https://github.com/TaynanGT/Vice-Tay/issues/138).

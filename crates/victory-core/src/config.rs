@@ -39,6 +39,9 @@ pub struct Config {
 struct FileConfig {
     #[serde(default)]
     paths: FilePaths,
+    // The path loader must not validate or apply the opt-in GPU settings.
+    #[serde(rename = "autotune")]
+    _autotune: Option<serde::de::IgnoredAny>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -249,6 +252,15 @@ mod tests {
         let text = include_str!("../../../victory.example.toml");
         let parsed: FileConfig = toml::from_str(text).unwrap();
         assert!(parsed.paths.game_dir.is_some());
+    }
+
+    #[test]
+    fn autotune_table_coexists_with_paths_without_path_loader_validation() {
+        let parsed: FileConfig = toml::from_str(
+            "[paths]\ngame_dir = 'D:/title'\n[autotune]\nram_budget_mb = 'not a budget'\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.paths.game_dir, Some(PathBuf::from("D:/title")));
     }
 
     #[test]

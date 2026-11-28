@@ -5,11 +5,13 @@
 # -Windowed     a window instead of the whole screen (full screen is the default)
 # -NoPanel      without the performance panel (on by default, F3 hides it while playing)
 # -SkipShaders  start even when the shader cache is cold (otherwise every shader is translated first)
+# -WarmPipelines  before launch, warm pipelines used in previous runs
 # -Console      series-x (the default) or series-s: the console the title takes this PC for
 # -FrameGen     AMD frame generation
 # -Fsr / -Dlss  PC upscaling in Series S (quality, balanced or performance)
 # -Fsr4K        PC FidelityFX at 3840x2160 (quality, balanced or performance)
 # -Dlss4K       NVIDIA DLSS at 3840x2160 (quality, balanced or performance); FSR if it cannot start
+# -FrameIntervalMs  use a frame interval in milliseconds (0 removes the limit)
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -Machine      auto (the default: by GPU vendor; on NVIDIA, worker counts sized to the CPU and,
 #               for a card of 10 to 19 GB, title buffers in the card's memory),
@@ -28,12 +30,14 @@ param(
     [switch]$Windowed,
     [switch]$NoPanel,
     [switch]$SkipShaders,
+    [switch]$WarmPipelines,
     [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x',
     [switch]$FrameGen,
     [ValidateSet('quality', 'balanced', 'performance')][string]$Fsr,
     [ValidateSet('quality', 'balanced', 'performance')][string]$Dlss,
     [ValidateSet('quality', 'balanced', 'performance')][string]$Fsr4K,
     [ValidateSet('quality', 'balanced', 'performance')][string]$Dlss4K,
+    [ValidateRange(0.0, 1000.0)][double]$FrameIntervalMs,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [ValidateSet('auto', '7900xtx', '4070', '4070tisuper', '4090', '3060', 'laptop')][string]$Machine = 'auto',
     [hashtable]$More = @{}
@@ -117,7 +121,7 @@ if ($Machine -eq '7900xtx') {
     # RTX 4090, Ryzen 9 9950X3D (16 cores of one kind, two caches), 48 GB.
     # NVIDIA sets its clocks by the driver's power mode: no spinner on the compute queue.
     $record, $update, $land = 12, 8, 6
-    if ($autoNvidia) {
+    if ($autoNvidia -or $Machine -eq 'laptop') {
         $coreCount = (Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue |
             Measure-Object -Property NumberOfCores -Sum).Sum
         if (-not $coreCount) {
@@ -142,8 +146,13 @@ if ($Machine -eq '7900xtx') {
         # into refused the whole submission to the card steps; in list order it is
         # taken (submit thread 104.7 -> 50.9 ms a frame, 12.1 -> 14.3 fps here).
         $settings.VICTORY_PLACED_ORDER = '1'
+        # A fill behind a copy at its place reads the copy's source on the card. Without
+        # it, a submission whose CPU-side fill depends on such a copy waits for the
+        # flights: in play on an RTX 5080, 0.7 submissions a frame refused and waited
+        # against 0.13, and frames 1.7 ms shorter (docs/rtx5080-16gb.md).
+        $settings.VICTORY_PLACED_FILL_REDIRECT = '1'
     }
-    if ($autoNvidia) {
+    if ($autoNvidia -or $Machine -eq 'laptop') {
         $autoAdds = Get-AutoNvidiaSettings $cardGb $coreCount ([bool]$Safe)
         foreach ($k in $autoAdds.Keys) { $settings[$k] = $autoAdds[$k] }
     }
@@ -187,8 +196,8 @@ if ($Machine -eq '4070tisuper') {
 }
 if ($Machine -eq 'laptop') {
     # i7-13700H, RTX 3050 6 GB Laptop GPU, 16 GB (docs/laptop-16gb.md); asked for explicitly,
-    # the measurements cover that one machine. On top of the NVIDIA settings above, which the
-    # measured runs had: what makes the world load fit in 16 GB. These stay under -Safe too,
+    # the measurements cover that one machine. On top of the NVIDIA settings above,
+    # what makes the world load fit in 16 GB. These stay under -Safe too,
     # since without them the world load runs out of RAM.
     # Game files read past Windows' file cache, title buffers in its private memory used in
     # place, windows outside buffers cut on 64 KiB with their tails, and up to 3 GB of them in
@@ -226,11 +235,17 @@ if (-not $Windowed) { $settings.VICTORY_FULLSCREEN = '1' }
 # corner, so clips and screenshots show what the build runs at and on what PC.
 if (-not $NoPanel) { $settings.VICTORY_PANEL = '1' }
 if ($FrameGen) { $settings.VICTORY_FRAMEGEN = '1' }
-if ($Fsr -or $Dlss) { $settings.Remove('VICTORY_UPSCALER') }
+if ($Fsr -or $Dlss) {
+    $settings.Remove('VICTORY_UPSCALER')
+    $settings.Remove('VICTORY_RENDER_SCALE')
+}
 if ($Fsr) { $settings.VICTORY_FSR = $Fsr.ToLowerInvariant() }
 if ($Dlss) { $settings.VICTORY_DLSS = $Dlss.ToLowerInvariant() }
 if ($Fsr4K) { $settings.VICTORY_FSR_4K = $Fsr4K.ToLowerInvariant() }
 if ($Dlss4K) { $settings.VICTORY_DLSS_4K = $Dlss4K.ToLowerInvariant() }
+if ($PSBoundParameters.ContainsKey('FrameIntervalMs')) {
+    $settings.VICTORY_FRAME_INTERVAL_MS = $FrameIntervalMs.ToString([Globalization.CultureInfo]::InvariantCulture)
+}
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
 $profile = if ($autoNvidia) { 'automatic NVIDIA profile' } else { $Machine }
@@ -260,7 +275,7 @@ try {
     Write-Warning "Could not read the Vice-Tay executable checksum: $($_.Exception.Message)"
 }
 # (Other settings left over in this window go; where your files are stays.)
-$paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_FIDELITYFX_DIR', 'VICTORY_FFX_FG_DIR', 'VICTORY_DLSS_DIR'
+$paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_FIDELITYFX_DIR', 'VICTORY_FFX_FG_DIR', 'VICTORY_DLSS_DIR', 'VICTORY_BCPACK_TABLES'
 $inherited = @(Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $paths })
 foreach ($entry in $inherited) { Remove-Item "Env:$($entry.Name)" }
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
@@ -301,5 +316,11 @@ try {
             }
         }
     }
+    if ($WarmPipelines) {
+        & $victory warm --used
+        if ($LASTEXITCODE -ne 0) { Write-Host "victory warm ended with exit code $LASTEXITCODE; starting anyway." }
+    }
     & $victory run $Exe --console $Console --execute
+    $runtimeExitCode = $LASTEXITCODE
 } finally { Pop-Location }
+exit $runtimeExitCode

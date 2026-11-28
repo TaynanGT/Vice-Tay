@@ -156,6 +156,34 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
     ok.then_some(m.ullAvailPhys)
 }
 
+/// The bytes of the card's memory left free for other processes:
+/// `VICTORY_VRAM_HEADROOM_MB` (0, the default: none; at most 8,192).
+/// [`Host::video_memory`] gives every rule that asks the card's room the
+/// system's budget less this, so the shares of it those rules take (80 to
+/// 97 %, and the eviction of [`vram_keep`]) come out of what is left.
+///
+/// Under Proton the budget is about this process's use plus all the card's
+/// free memory, and nothing moves this process's memory out to make room
+/// for the desktop compositor as WDDM does: a card used to its whole budget
+/// has nothing left for the compositor's next buffer.
+pub(crate) fn vram_headroom() -> u64 {
+    static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        vram_headroom_from(std::env::var("VICTORY_VRAM_HEADROOM_MB").ok().as_deref())
+    })
+}
+
+/// [`vram_headroom`] from the variable's value, if it is set.
+fn vram_headroom_from(mb: Option<&str>) -> u64 {
+    mb.and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(0, |mb| mb.min(8192) << 20)
+}
+
+/// The card's `budget` with `headroom` bytes of it left to other processes.
+fn budget_less_headroom(budget: u64, headroom: u64) -> u64 {
+    budget.saturating_sub(headroom)
+}
+
 /// How long host copies of textures the title fills must have been idle to
 /// be let go, in milliseconds, and how many bytes of them go at most (the
 /// longest idle first): derived from [`crate::resource::room_percent`] so
@@ -11971,7 +11999,8 @@ impl Host {
     /// The card's memory as the system accounts it to this process, in
     /// bytes: the budget and the use of the card's own memory, then of the
     /// PC's memory shared with the card (where the system moves what does
-    /// not fit on the card).
+    /// not fit on the card). The card's budget is given less
+    /// [`vram_headroom`]; [`Self::video_memory_groups`] gives it whole.
     pub(crate) fn video_memory(&self) -> Option<[u64; 4]> {
         let adapter = self.adapter.as_ref()?;
         let mut own = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
@@ -12005,7 +12034,12 @@ impl Host {
             );
             self.log_video_memory("right after that change");
         }
-        Some([own.Budget, own.CurrentUsage, shared.Budget, shared.CurrentUsage])
+        Some([
+            budget_less_headroom(own.Budget, vram_headroom()),
+            own.CurrentUsage,
+            shared.Budget,
+            shared.CurrentUsage,
+        ])
     }
 
     /// Both of the system's memory groups for this process, in bytes: for
@@ -12048,6 +12082,16 @@ impl Host {
             shared[2] >> 20,
             shared[3] >> 20
         );
+        let headroom = vram_headroom();
+        if headroom > 0 {
+            tracing::info!(
+                "video memory {}: {} MB of the card's left free for other processes (VICTORY_VRAM_HEADROOM_MB), so our rules count a budget of {} MB of the system's {} MB",
+                when,
+                headroom >> 20,
+                budget_less_headroom(own[0], headroom) >> 20,
+                own[0] >> 20
+            );
+        }
     }
 
     /// A buffer in system memory that the CPU maps (write-back, so reading
@@ -13449,6 +13493,57 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // Missing or zero budget falls back to normal
         assert_eq!(vram_idle_ms(None), 5_000);
         assert_eq!(vram_idle_ms(Some([0, 100, 0, 0])), 5_000);
+    }
+
+    #[test]
+    fn the_vram_headroom_is_read_in_mib_and_is_off_unless_set() {
+        use super::vram_headroom_from;
+        let mib = 1u64 << 20;
+        assert_eq!(vram_headroom_from(None), 0);
+        assert_eq!(vram_headroom_from(Some("1024")), 1024 * mib);
+        assert_eq!(vram_headroom_from(Some(" 1536 ")), 1536 * mib);
+        assert_eq!(vram_headroom_from(Some("0")), 0);
+        assert_eq!(vram_headroom_from(Some("lots")), 0);
+        assert_eq!(vram_headroom_from(Some("-5")), 0);
+        // At most 8 GiB, as `VICTORY_CARD_ROOM_FOR_TARGETS_MB`.
+        assert_eq!(vram_headroom_from(Some("100000")), 8192 * mib);
+    }
+
+    #[test]
+    fn the_card_budget_leaves_the_headroom_free() {
+        use super::budget_less_headroom;
+        let mib = 1u64 << 20;
+        // Off: the system's budget as it is.
+        assert_eq!(budget_less_headroom(5823 * mib, 0), 5823 * mib);
+        // The budget is about ours plus what is free, so 1 GiB less
+        // keeps about 1 GiB of the card free for other processes.
+        assert_eq!(budget_less_headroom(5823 * mib, 1024 * mib), 4799 * mib);
+        // Never below none.
+        assert_eq!(budget_less_headroom(512 * mib, 1024 * mib), 0);
+    }
+
+    #[test]
+    fn a_full_card_is_trimmed_below_the_headroom() {
+        use super::{budget_less_headroom, vram_keep_for};
+        let mib = 1u64 << 20;
+        // An 8 GB RTX 4070 Laptop under Proton (2026-11-27): 5,823 MB in
+        // use of a budget of 5,823, nothing of the card free for the
+        // compositor.
+        let (budget, used) = (5823 * mib, 5823 * mib);
+        // Without headroom, eviction aims at 75 % of a budget that counts
+        // the free card memory as ours.
+        let (ms, without) = vram_keep_for(budget, used, 80);
+        assert_eq!(ms, 1_500);
+        // With 1 GiB kept free it aims at 75 % of what is left: about
+        // 768 MB more let go.
+        let (ms, with) = vram_keep_for(budget_less_headroom(budget, 1024 * mib), used, 80);
+        assert_eq!(ms, 1_500);
+        assert!(
+            with >= without + 767 * mib,
+            "{} MB against {} MB",
+            with >> 20,
+            without >> 20
+        );
     }
 
     #[test]

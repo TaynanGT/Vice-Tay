@@ -94,17 +94,22 @@ How each of these was found, with the numbers:
   frame line counts the slots tables take, the refusals whose free slots were
   in pieces, and the tables that waited for flights to land for slots or were
   refused again and dropped (diagnostics builds).
-- **Stretched-triangle spikes ("wedges")**: set `VICTORY_MERGE_AFTER_LANDING=2`
+- **Stretched-triangle spikes ("wedges")**: set `VICTORY_MERGE_AFTER_LANDING=3`
   (off by default for now). The cause: when the title wrote a page of a buffer
   that a compute pass not yet landed also writes (skinning output), the merge
   put the title's old bytes into that range, and at the landing they won over
   the card's results. With `=2` only the bytes the title really changed go in,
-  and none the card writes; those wait for the landing. `=1` puts nothing in
-  until the landing (simpler, short flashes possible). No wait for the card; on
-  an RTX 2080 Ti `=2` costs about 0.3-0.5 fps. A few wedges are still left (a
-  dozen or two in a long free run). The frame line counts what was merged and
-  what was left for the landing; `VICTORY_WEDGE_TRACE=1` (diagnostics builds)
-  logs the copies and pipelines behind what is left.
+  and none the card writes; those wait for the landing. `=3` does the same for
+  the rest of such a buffer in the card's memory (outside the ranges the pass
+  declared): a refresh there puts in only the bytes the title changed, not
+  whole 4 KiB pages, so stores shaders made without declaring them are kept.
+  With `=2` a few wedges were still left (a dozen or two in a long free run);
+  with `=3` none were seen in a 2.5-minute free run on an RTX 2080 Ti (one run,
+  so "rarer or gone", not proven). `=1` puts nothing in until the landing
+  (simpler, short flashes possible). No wait for the card; `=2` costs about
+  0.3-0.5 fps. The frame line counts what was merged and what was left for the
+  landing; `VICTORY_WEDGE_TRACE=1` (diagnostics builds) logs the copies and
+  pipelines behind what is left.
 - **Heap pacing** (`VICTORY_HEAP_SYNC_PACE=1`, off by default), the first
   workaround for the wedges and no longer needed for them: our side prepares a
   submission only when the card has run the last frame we sent. The title is

@@ -557,8 +557,9 @@ fn fp32_expected(op: u32, ident: u32, values: [u32; 4], active: u32, lds: bool) 
 }
 
 #[test]
-#[ignore = "requires NVIDIA Wave32 hardware and VICTORY_WAVE_PAIRS_FP32=non-ieee-rne-ftz"]
+#[ignore = "requires NVIDIA Wave32 hardware, VICTORY_WAVE_PAIRS=1 and VICTORY_WAVE_PAIRS_FP32=non-ieee-rne-ftz"]
 fn nvidia_paired_fp32_ordered_sum() {
+    assert!(std::env::var_os("VICTORY_WAVE_PAIRS").is_some_and(|v| v == "1"));
     let other = [
         1.0f32.to_bits(),
         (-16_777_216.0f32).to_bits(),
@@ -621,8 +622,9 @@ fn nvidia_paired_fp32_ordered_sum() {
 }
 
 #[test]
-#[ignore = "requires NVIDIA Wave32 hardware and VICTORY_WAVE_PAIRS_FP32=non-ieee-rne-ftz"]
+#[ignore = "requires NVIDIA Wave32 hardware, VICTORY_WAVE_PAIRS=1 and VICTORY_WAVE_PAIRS_FP32=non-ieee-rne-ftz"]
 fn nvidia_paired_fp32_min_max() {
+    assert!(std::env::var_os("VICTORY_WAVE_PAIRS").is_some_and(|v| v == "1"));
     for (op, ident) in [(15, 0x7f80_0000), (16, 0xff80_0000)] {
         for other in [
             [0, 0x8000_0000, 0x8000_0001],

@@ -160,8 +160,6 @@ fork's constant.
 | `VICTORY_AMBIENT=constant:<level>` | the same light everywhere |
 | `VICTORY_AMBIENT_SHADE=<strength>,<metres>` | the creases (1,0.6) |
 | `VICTORY_AMBIENT_AIR=<multiple>` | what the air scatters is bounded by a multiple of the light around (off: the brown veil in the day room stays with it, light-14) |
-| `VICTORY_AMBIENT_COLOR_BOUND=1` | In the non-RT diffuse resolve, cap each colour channel left in probe memory using the nearby surface radiance. This can attenuate legitimate saturated indirect light. Off by default. |
-| `VICTORY_AMBIENT_COARSE=1` | Gather the ambient estimate at 80 × 46 points. This reduces the work per gather and can soften localized lighting. Off by default. |
 
 It is off while the builder runs.
 

@@ -179,7 +179,7 @@ pub(crate) struct HostHeap {
     kept: Box<[Mutex<Option<ID3D12Resource>>]>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<u8>)>,
+    next: Mutex<(u32, Vec<bool>)>,
     /// How many dynamic slots are free (changed under `next`'s lock): with
     /// fewer than a table needs, the search is not made. Once the world
     /// had taken them all, every later table of the frame searched every
@@ -1919,7 +1919,7 @@ impl HostHeap {
             waiting: Mutex::default(),
             away: Mutex::default(),
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
-            next: Mutex::new((0, vec![0; extra as usize])),
+            next: Mutex::new((0, vec![false; extra as usize])),
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
@@ -2025,23 +2025,6 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     unsafe { host.device.CreateSampler(&desc, at) };
 }
 
-/// Find the first contiguous free range without walking each occupied slot
-/// under the heap lock. Allocations and releases store only zero and one.
-fn free_run(slots: &[u8], n: usize) -> Option<usize> {
-    let mut at = 0;
-    while slots.len() - at >= n {
-        if slots[at] != 0 {
-            at += memchr::memchr(0, &slots[at..])?;
-        }
-        let window = slots.get(at..at + n)?;
-        match memchr::memrchr(1, window) {
-            None => return Some(at),
-            Some(last_taken) => at += last_taken + 1,
-        }
-    }
-    None
-}
-
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
@@ -2063,12 +2046,22 @@ impl HostHeap {
         let cursor = *next as usize;
         let end = self.dynamic as usize;
         let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
-        let found = if enough {
-            free_run(&taken[cursor..], n).map(|at| cursor + at)
-                .or_else(|| free_run(&taken[..second_end], n))
-        } else {
-            None
-        };
+        let starts = (cursor..end).chain(0..second_end);
+        let mut run = 0;
+        let mut found = None;
+        let mut last = usize::MAX;
+        for at in starts.take(if enough { usize::MAX } else { 0 }) {
+            // A run cannot wrap past the end.
+            if at != last.wrapping_add(1) {
+                run = 0;
+            }
+            last = at;
+            run = if taken[at] { 0 } else { run + 1 };
+            if run == n {
+                found = Some(at + 1 - n);
+                break;
+            }
+        }
         let Some(first) = found else {
             if enough {
                 self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
@@ -2092,7 +2085,7 @@ impl HostHeap {
             add(C::DynamicNs, started.elapsed().as_nanos() as u64);
             add(C::DynamicSlots, n as u64);
         }
-        taken[first..first + n].fill(1);
+        taken[first..first + n].fill(true);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % end) as u32;
         Some(self.count + first as u32)
@@ -3176,10 +3169,10 @@ impl HostHeap {
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let end = (at + n).min(self.dynamic) as usize;
         if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            let given = memchr::memchr_iter(1, slots).count() as u32;
+            let given = slots.iter().filter(|taken| **taken).count() as u32;
             self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
             self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
-            slots.fill(0);
+            slots.fill(false);
         }
     }
 

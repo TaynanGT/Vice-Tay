@@ -1497,9 +1497,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// and `ranged` (the asking after which a range that holds this one was
 /// taken whole, or 0) does not hold, as [`writes`] would answer with nothing
 /// asked: the submission's asking covers the range, or its blocks are known
-/// by their bits. The caller holds the copy's lock and has already checked
-/// its populated-page bitmap (or has a nonzero whole-range stamp).
-pub(crate) fn unchanged_since_copy(start: usize, end: usize, base: usize, copied: &[u64], ranged: u64) -> bool {
+/// by their bits. `false` if something would have to be asked.
+pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64], ranged: u64) -> bool {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     // The bits first, then the journal, as in `writes`.
     let known = published(start, end);
@@ -1514,7 +1513,8 @@ pub(crate) fn unchanged_since_copy(start: usize, end: usize, base: usize, copied
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
         return false;
     };
-    j.notes.each(first, last, |page, write| write <= taken[page - first].max(ranged))
+    (ranged != 0 || taken.iter().all(|&at| at != 0))
+        && j.notes.each(first, last, |page, write| write <= taken[page - first].max(ranged))
 }
 
 impl Tracked {
@@ -2880,7 +2880,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // takes the block out of the set, and it is looked at as any other.
     let unsure: Vec<usize> = {
         let of = |g: &Guards| -> Option<Vec<usize>> {
-            if (first == last || g.clean.0.all(first, last)) && !BESIDE.any(first, last) {
+            if g.clean.range(first..last).count() == last - first && !BESIDE.any(first, last) {
                 return None;
             }
             Some(g.absent.range(first..last).filter(|block| !g.held.contains(*block)).collect())

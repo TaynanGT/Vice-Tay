@@ -281,38 +281,50 @@ pub(crate) fn target_format(format: u32) -> u32 {
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::*;
-        static REFUSED: std::sync::OnceLock<[bool; 3]> = std::sync::OnceLock::new();
-        let refused = REFUSED.get_or_init(|| {
+        static TARGETS: std::sync::OnceLock<[u32; 3]> = std::sync::OnceLock::new();
+        let targets = TARGETS.get_or_init(|| {
             STAND_INS.map(|(f, to)| {
                 let Some(host) = crate::host::host() else {
-                    return false;
+                    return f;
                 };
-                let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
-                    Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(f as i32),
-                    ..Default::default()
+                let can_render_and_write = |format: u32| {
+                    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(format as i32),
+                        ..Default::default()
+                    };
+                    // SAFETY: a plain query into our own structure.
+                    let asked = unsafe {
+                        host.device.CheckFeatureSupport(
+                            D3D12_FEATURE_FORMAT_SUPPORT,
+                            (&raw mut support).cast(),
+                            size_of_val(&support) as u32,
+                        )
+                    };
+                    let both = D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0
+                        | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
+                    asked.is_ok() && support.Support1.0 & both == both
                 };
-                // SAFETY: a plain query into our own structure.
-                let asked = unsafe {
-                    host.device.CheckFeatureSupport(
-                        D3D12_FEATURE_FORMAT_SUPPORT,
-                        (&raw mut support).cast(),
-                        size_of_val(&support) as u32,
-                    )
-                };
-                let both = D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0
-                    | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
-                let refused = asked.is_err() || support.Support1.0 & both != both;
-                if refused {
-                    tracing::info!(format = f, stand_in = to, "the host does not render to this format: a stand-in is used");
+                if can_render_and_write(f) {
+                    return f;
                 }
-                refused
+                // From cool_fox / Neptune-VE via VIctoryUnified. Both formats
+                // have 32-bit texels, with less mantissa in R11G11B10_FLOAT.
+                let stand_in = if f == 67
+                    && std::env::var("VICTORY_E5_TARGETS").is_ok_and(|v| v.eq_ignore_ascii_case("r11g11b10"))
+                    && can_render_and_write(26)
+                {
+                    26
+                } else {
+                    to
+                };
+                tracing::info!(format = f, stand_in, "the host does not render to this format: a stand-in is used");
+                stand_in
             })
         });
-        if refused[i] {
-            return STAND_INS[i].1;
-        }
+        return targets[i];
     }
-    format
+    #[cfg(not(windows))]
+    { let _ = i; format }
 }
 
 /// Whether the host copy of the title texture `this` is in a stand-in

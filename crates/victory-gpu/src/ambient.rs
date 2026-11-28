@@ -29,6 +29,7 @@
 //! - `constant:<level>`: the constant, as beloooo's fork has it.
 //!
 //! `VICTORY_AMBIENT_SHADE=<strength>,<radius in metres>` sets the creases.
+//! `VICTORY_AMBIENT_MOST=<multiple>` caps residual diffuse light without ray tracing.
 //!
 //! The air of a room is lit by the same probes: without rays they hold the
 //! sky's light indoors too, a brown veil at sunset. `VICTORY_AMBIENT_AIR`
@@ -172,7 +173,16 @@ pub(crate) fn on() -> bool {
 fn bounds() -> (f32, f32) {
     match rt_band() {
         Some(b) if crate::pipeline::builder_runs() => (b.least, b.most),
-        _ => (1.0, 4.0),
+        _ => {
+            // From VIctory-NVIDIA via VIctoryUnified.
+            static MOST: OnceLock<f32> = OnceLock::new();
+            (1.0, *MOST.get_or_init(|| {
+                std::env::var("VICTORY_AMBIENT_MOST").ok()
+                    .and_then(|value| value.trim().parse::<f32>().ok())
+                    .filter(|value| value.is_finite() && *value >= 1.0)
+                    .unwrap_or(4.0)
+            }))
+        }
     }
 }
 
@@ -465,6 +475,8 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
     float far = float(at.z) / float(d);
     float cap = air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far);
     float3 c = scattered[at];
+    // From VIctory-NVIDIA via VIctoryUnified: invalid scattering poisons the whole view ray.
+    if (any(isnan(c)) || any(isinf(c))) { scattered[at] = 0; return; }
     float has = dot(c, LUMA);
     if (has > cap) scattered[at] = c * (cap / has);
 }

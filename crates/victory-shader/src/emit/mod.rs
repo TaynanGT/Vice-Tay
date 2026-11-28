@@ -687,7 +687,17 @@ pub fn emit(
         Err(ShaderError::Unsupported { what, .. }) => lower::needs_every_lane(what),
         Err(_) => false,
     };
-    let pairs_on = wave_pairs_on() && !listed;
+    // VIctoryUnified tries the exact paired form before rewriting the program
+    // or treating the two halves as independent waves. Reuse our paired lowering.
+    let prefer_pairs = std::env::var_os("VICTORY_WAVE64_PAIRED").is_some_and(|v| v == "1");
+    let pairs_on = (wave_pairs_on() || prefer_pairs) && !listed;
+    let tried_first = wave32_compute && pairs_on && prefer_pairs && stuck;
+    if tried_first {
+        if let Ok((shader, Some(32))) = paired(c, native, p) {
+            return Ok(shader);
+        }
+        lower::take_needs();
+    }
     if wave32_compute
         && pairs_on
         && !stuck
@@ -822,7 +832,7 @@ pub fn emit(
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
             if !exact {
-                if pairs_on {
+                if pairs_on && !tried_first {
                     let again = paired(c, native, p);
                     report("paired Wave64", &again);
                     if done(&again) {

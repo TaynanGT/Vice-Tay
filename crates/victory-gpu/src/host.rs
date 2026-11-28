@@ -4395,6 +4395,16 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 },
+                // Via VIctoryUnified (fxceless/victory-fork c75cb22): CPU rectangle
+                // expansion needs the completed vertex data from prior submissions.
+                &Step::Host(_, (from, to)) if from < to && touches(written, from, to) => {
+                    if count {
+                        LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
+                        #[cfg(feature = "diagnostics")]
+                        blame("host work reading title memory", written, from, to - from);
+                    }
+                    return Some(WHY_READ);
+                }
                 Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(..) => {}
             }
         }
@@ -5299,6 +5309,18 @@ pub(crate) use stamps::{timeline_ready, timeline_restart, timeline_stamps};
 #[cfg(test)]
 mod late_tests {
     use super::{continues, join_ranges, touches};
+
+    #[test]
+    fn host_vertex_read_waits_for_overlapping_gpu_writes() {
+        use super::{WHY_READ, blocked_by, host};
+
+        let host = host().expect("D3D12 device required for the vertex read test");
+        let consumer = host.new_list().unwrap();
+        consumer.defer_host_read(0x1000, 16, || {});
+        assert_eq!(blocked_by(&[(0x100f, 0x1011)], &[&consumer], false), Some(WHY_READ));
+        assert_eq!(blocked_by(&[(0x1010, 0x1020)], &[&consumer], false), None);
+        consumer.close();
+    }
 
     #[test]
     fn a_late_texture_readback_blocks_a_following_cpu_copy() {

@@ -58,6 +58,19 @@ The experimental build reached a median of 27.80 rendered FPS across the sampled
 
 </details>
 
+### RTX 4080 SUPER test PC
+
+GeForce RTX 4080 SUPER (16 GB), Ryzen 9 7950X3D (16 cores, 32 threads), and 64 GB RAM. The November 27 comparison used the same camera outside the Key Lento shop in Series S mode, with DLSS Quality (720p to 1080p), ray tracing off, and frame generation off. Each result is the median of 11 reporting intervals.
+
+| Metric | Rollback `0089488` | Texture update `c480544` |
+| --- | ---: | ---: |
+| Rendered FPS | 16.0 | 16.4 |
+| Frame time | 62.4 ms | 60.8 ms |
+| Submission preparation | 45.0 ms | 42.7 ms |
+| Texture upload preparation | 1.5 ms | 0.9 ms |
+
+These measurements cover a fixed outdoor view and predate the optional Unified settings. The test did not establish whether hardware contributes to the reported graphics artifacts.
+
 In the 30-minute playtest, checkpoint retries worked after the boat ran aground. The HUD, minimap, mission prompts and pause menu were usable along the route.
 
 ## Getting started
@@ -99,10 +112,14 @@ If the title reaches the menu but stops at world load, verify your title files b
 | `-Safe` | Launch with the conservative settings when investigating a graphics or stability issue. |
 | `-Windowed` / `-NoPanel` | Start in a window or hide the diagnostics overlay at launch. |
 | `-RayTracing` | Enable the structures needed for the title's ray-traced indirect lighting. |
+| `-FullBright` | Use fixed ambient light and disable ray tracing and ambient shading. Direct lighting, shadows, and exposure still apply. |
+| `-UnifiedGraphics` | Try paired Wave64 translation, console half-float rounding, and VIctoryUnified’s lighting settings. Uses R11G11B10 for lighting targets where the host supports it, saving render-target memory at lower precision. |
 | `-Fsr4K quality` / `-Dlss4K quality` | Upscale to 3840 × 2160 with PC FSR or DLSS on Series X. |
 | `-FrameIntervalMs 16.67` | Set the frame interval in milliseconds. Use `0` to remove the limit or omit the option to keep the title's setting. |
 | `-WarmPipelines` | Warm pipelines used in previous runs before starting the title. |
 | `-Build release` | Use the executable built with `cargo build --locked --release -p victory`. The overlay requires a diagnostics build. |
+
+The Unified options adapt the paired Wave64 selection and lighting work from [VIctoryUnified](https://github.com/Keel62155/VIctoryUnified/tree/74f4035), with the airborne lighting fix from VIctory-NVIDIA and the render-target format from cool_fox and Neptune-VE. The CPU vertex-read fix comes from fxceless/victory-fork via Unified and applies to regular launches too.
 
 <details>
 <summary>PC upscaling and Series S frame generation</summary>
